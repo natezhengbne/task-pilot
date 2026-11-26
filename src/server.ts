@@ -17,6 +17,8 @@ const server = Bun.serve({
   hostname: host,
   port,
   fetch: app.fetch,
+  // Remediation endpoints (Copilot patch, npm install, verify) can run for several minutes.
+  idleTimeout: 0,
 });
 
 process.stderr.write(

@@ -202,13 +202,30 @@
     },
     {
       "parameters": {
-        "jsCode": "const form = $('1. Upload Vulnerability Report').first().json;\nconst planResp = $('🔍 4. Plan Remediation Targets').first().json;\nconst plans = planResp.plans || [];\nconst maxRetries = Number(form['Max Retries']) > 0 ? Number(form['Max Retries']) : 3;\nconst creditBudget = Number(form['Credit Budget']) > 0 ? Number(form['Credit Budget']) : 30;\nconst verifyDownstream = form['Verify Downstream'] === 'Yes';\nconst phase = form.Phase || 'Phase 3 - Full Remediation + Draft PR';\n\nreturn plans.map((plan) => ({\n  json: {\n    runId: planResp.runId,\n    phase,\n    maxRetries,\n    creditBudget,\n    verifyDownstream,\n    plan,\n  },\n}));"
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/workspaces/prepare' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $('🔍 4. Plan Remediation Targets').first().json.runId, plans: $('🔍 4. Plan Remediation Targets').first().json.plans || [], reuseExisting: true, installDeps: true }) }}",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "http-prepare-ws-batch",
+      "name": "📦 6. Clone & Install Workspaces",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [160, 560]
+    },
+    {
+      "parameters": {
+        "jsCode": "const form = $('1. Upload Vulnerability Report').first().json;\nconst batch = $input.first().json;\nconst workspaces = batch.workspaces || [];\nconst maxRetries = Number(form['Max Retries']) > 0 ? Number(form['Max Retries']) : 3;\nconst creditBudget = Number(form['Credit Budget']) > 0 ? Number(form['Credit Budget']) : 30;\nconst verifyDownstream = form['Verify Downstream'] === 'Yes';\nconst phase = form.Phase || 'Phase 3 - Full Remediation + Draft PR';\n\nreturn workspaces.map((ws) => ({\n  json: {\n    runId: ws.runId || batch.runId,\n    phase,\n    maxRetries,\n    creditBudget,\n    verifyDownstream,\n    plan: ws.plan,\n    targetRepo: ws.targetRepo,\n    baseBranch: ws.baseBranch,\n    remediationBranch: ws.remediationBranch,\n    workspacePath: ws.workspacePath,\n    cacheHit: Boolean(ws.cacheHit),\n    depsInstalled: Boolean(ws.depsInstalled),\n  },\n}));"
       },
       "id": "code-expand-plans",
-      "name": "6. Expand Plans per Repo",
+      "name": "7. Expand Prepared Workspaces",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [160, 560]
+      "position": [420, 560]
     },
     {
       "parameters": {
@@ -216,31 +233,14 @@
         "options": {}
       },
       "id": "loop-repos-1",
-      "name": "7. Loop Over Repos",
+      "name": "8. Loop Over Repos",
       "type": "n8n-nodes-base.splitInBatches",
       "typeVersion": 3,
-      "position": [420, 560]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/workspace/prepare' }}",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, plan: $json.plan }) }}",
-        "options": {
-          "timeout": 120000
-        }
-      },
-      "id": "http-prepare-ws",
-      "name": "📦 8. Prepare Workspace & Branch",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
       "position": [680, 560]
     },
     {
       "parameters": {
-        "jsCode": "const loopItem = $('7. Loop Over Repos').first().json;\nconst ws = $input.first().json;\n\nreturn [{\n  json: {\n    runId: ws.runId,\n    phase: loopItem.phase,\n    maxRetries: loopItem.maxRetries,\n    creditBudget: loopItem.creditBudget,\n    verifyDownstream: loopItem.verifyDownstream,\n    plan: ws.plan,\n    targetRepo: ws.targetRepo,\n    baseBranch: ws.baseBranch,\n    remediationBranch: ws.remediationBranch,\n    workspacePath: ws.workspacePath,\n    attempt: 1,\n    creditsUsed: 0,\n    previousError: null,\n  },\n}];"
+        "jsCode": "const ws = $input.first().json;\n\nreturn [{\n  json: {\n    runId: ws.runId,\n    phase: ws.phase,\n    maxRetries: ws.maxRetries,\n    creditBudget: ws.creditBudget,\n    verifyDownstream: ws.verifyDownstream,\n    plan: ws.plan,\n    targetRepo: ws.targetRepo,\n    baseBranch: ws.baseBranch,\n    remediationBranch: ws.remediationBranch,\n    workspacePath: ws.workspacePath,\n    attempt: 1,\n    creditsUsed: 0,\n    previousError: null,\n  },\n}];"
       },
       "id": "code-init-retry",
       "name": "9. Init Attempt State",
@@ -256,7 +256,7 @@
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ runId: $json.runId, workspacePath: $json.workspacePath, plan: $json.plan, attempt: $json.attempt, maxRetries: $json.maxRetries, creditBudget: $json.creditBudget, creditsUsed: $json.creditsUsed, previousError: $json.previousError }) }}",
         "options": {
-          "timeout": 320000
+          "timeout": 660000
         }
       },
       "id": "http-copilot-patch",
@@ -426,22 +426,22 @@
     },
     "🩺 5a. Preflight Check": {
       "main": [
-        [{ "node": "6. Expand Plans per Repo", "type": "main", "index": 0 }]
+        [{ "node": "📦 6. Clone & Install Workspaces", "type": "main", "index": 0 }]
       ]
     },
-    "6. Expand Plans per Repo": {
+    "📦 6. Clone & Install Workspaces": {
       "main": [
-        [{ "node": "7. Loop Over Repos", "type": "main", "index": 0 }]
+        [{ "node": "7. Expand Prepared Workspaces", "type": "main", "index": 0 }]
       ]
     },
-    "7. Loop Over Repos": {
+    "7. Expand Prepared Workspaces": {
+      "main": [
+        [{ "node": "8. Loop Over Repos", "type": "main", "index": 0 }]
+      ]
+    },
+    "8. Loop Over Repos": {
       "main": [
         [{ "node": "15. Remediation Summary", "type": "main", "index": 0 }],
-        [{ "node": "📦 8. Prepare Workspace & Branch", "type": "main", "index": 0 }]
-      ]
-    },
-    "📦 8. Prepare Workspace & Branch": {
-      "main": [
         [{ "node": "9. Init Attempt State", "type": "main", "index": 0 }]
       ]
     },
@@ -479,12 +479,12 @@
     },
     "🔀 13. Create Draft PR / Report": {
       "main": [
-        [{ "node": "7. Loop Over Repos", "type": "main", "index": 0 }]
+        [{ "node": "8. Loop Over Repos", "type": "main", "index": 0 }]
       ]
     },
     "14. Record Failed Remediation": {
       "main": [
-        [{ "node": "7. Loop Over Repos", "type": "main", "index": 0 }]
+        [{ "node": "8. Loop Over Repos", "type": "main", "index": 0 }]
       ]
     }
   },

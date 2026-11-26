@@ -163,6 +163,44 @@ export function getCopilotBinary(): string {
   return process.env.TASKPILOT_COPILOT_BIN?.trim() || "copilot";
 }
 
+export function getDefaultCopilotTimeoutMs(): number {
+  const raw = process.env.TASKPILOT_COPILOT_TIMEOUT_MS?.trim();
+  if (raw) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return 600_000;
+}
+
+function createLineLogger(prefix: string): {
+  push: (chunk: string) => void;
+  flush: () => void;
+} {
+  let buffer = "";
+  return {
+    push(chunk: string) {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trimEnd();
+        if (trimmed) {
+          process.stderr.write(`${prefix} ${trimmed}\n`);
+        }
+      }
+    },
+    flush() {
+      const trimmed = buffer.trim();
+      if (trimmed) {
+        process.stderr.write(`${prefix} ${trimmed}\n`);
+      }
+      buffer = "";
+    },
+  };
+}
+
 export async function checkCopilotCliStatus(
   exec: CommandRunner = runCommand,
 ): Promise<CopilotCliStatus> {
@@ -198,7 +236,7 @@ export function parseCreditsFromOutput(
   defaultCost = 1,
 ): number {
   const match = output.match(
-    /(?:premium requests?|credits?)\s*(?:used|consumed|spent)?\s*[:=]\s*(\d+(?:\.\d+)?)/i,
+    /(?:premium requests?|ai credits?|credits?)\s*(?:used|consumed|spent)?\s*(?:[:=]|\s)\s*(\d+(?:\.\d+)?)/i,
   );
   if (match?.[1]) {
     const parsed = Number(match[1]);
@@ -224,7 +262,7 @@ export async function runCopilotRemediationPatch(
   const creditsPerAttempt = Math.max(1, Math.floor(input.creditsPerAttempt ?? 1));
   const dryRun = Boolean(input.dryRun);
   const persist = input.persist ?? true;
-  const timeoutMs = input.timeoutMs ?? 300_000;
+  const timeoutMs = input.timeoutMs ?? getDefaultCopilotTimeoutMs();
 
   if (!dryRun && !existsSync(input.workspacePath)) {
     throw new Error(`Workspace path does not exist: ${input.workspacePath}`);
@@ -341,8 +379,12 @@ export async function runCopilotRemediationPatch(
   }
 
   process.stderr.write(
-    `[copilot] --> ${input.plan.targetRepo} attempt ${attempt}/${maxRetries} (credits ${priorCredits}/${creditBudget})\n`,
+    `[copilot] --> ${input.plan.targetRepo} attempt ${attempt}/${maxRetries} (credits ${priorCredits}/${creditBudget}, timeout ${Math.round(timeoutMs / 1000)}s)\n`,
   );
+
+  const streamLogs = process.env.NODE_ENV !== "test";
+  const stdoutLogger = streamLogs ? createLineLogger("[copilot|out]") : undefined;
+  const stderrLogger = streamLogs ? createLineLogger("[copilot|err]") : undefined;
 
   const start = performance.now();
   let res;
@@ -350,9 +392,15 @@ export async function runCopilotRemediationPatch(
     res = await exec(cmd, {
       cwd: input.workspacePath,
       timeoutMs,
+      ...(stdoutLogger ? { onStdout: (chunk) => stdoutLogger.push(chunk) } : {}),
+      ...(stderrLogger ? { onStderr: (chunk) => stderrLogger.push(chunk) } : {}),
     });
   } catch (err) {
-    const durationMs = Math.round(performance.now() - start);
+    stdoutLogger?.flush();
+    stderrLogger?.flush();
+    stdoutLogger?.flush();
+  stderrLogger?.flush();
+  const durationMs = Math.round(performance.now() - start);
     const msg = err instanceof Error ? err.message : String(err);
     const error = `Failed to launch Copilot CLI '${binary}': ${msg}.`;
     const hint =
@@ -392,6 +440,8 @@ export async function runCopilotRemediationPatch(
       ...(artifacts ? { artifacts } : {}),
     };
   }
+  stdoutLogger?.flush();
+  stderrLogger?.flush();
   const durationMs = Math.round(performance.now() - start);
 
   const combinedOutput = [res.stdout.trim(), res.stderr.trim()]

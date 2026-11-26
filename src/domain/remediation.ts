@@ -124,7 +124,7 @@ export function buildCopilotRemediationPrompt(
   lines.push(
     "2. Prefer upgrading direct dependencies cleanly when possible; if a package is strictly transitive and cannot be upgraded via a parent bump without a breaking rewrite, use npm `overrides` carefully and regenerate `package-lock.json`.",
   );
-  lines.push("3. Ensure `package-lock.json` is updated and consistent with `package.json` (run `npm install` or `npm update`).");
+  lines.push("3. `node_modules` is already pre-installed in this cached workspace; do NOT delete `node_modules`. Ensure `package-lock.json` is updated and consistent with `package.json` by running an incremental `npm install` or `npm update`.");
   lines.push("4. Keep changes minimal and strictly scoped to resolving these CVEs. Do NOT disable, skip, or delete existing tests or linters.");
 
   if (options.detectedScripts && options.detectedScripts.length > 0) {

@@ -16,8 +16,10 @@ import {
 } from "../../services/remediation/verify.ts";
 import {
   prepareRemediationWorkspace,
+  prepareRemediationWorkspacesBatch,
   type CommandRunner,
   type PrepareWorkspaceInput,
+  type PrepareWorkspacesBatchInput,
 } from "../../services/remediation/workspace.ts";
 import { runCommand } from "../../shared/exec.ts";
 import { createRunId } from "../../shared/runs.ts";
@@ -67,7 +69,8 @@ export function createRemediationRoute(
 
   /**
    * POST /api/remediation/workspace/prepare
-   * Phase 2 Step 1: Clones `plan.targetRepo` and creates a temporary remediation branch.
+   * Phase 2 Step 1 (single repo): Prepares a persistent cached workspace in `.workspaces/`,
+   * checks out the remediation branch, and runs `npm install`.
    */
   route.post("/workspace/prepare", async (c) => {
     const body = await parseJsonObject(await c.req.text());
@@ -89,7 +92,15 @@ export function createRemediationRoute(
           : undefined,
       reuseExisting:
         typeof body.reuseExisting === "boolean" ? body.reuseExisting : undefined,
+      installDeps:
+        typeof body.installDeps === "boolean" ? body.installDeps : undefined,
+      workspacesRoot:
+        typeof body.workspacesRoot === "string" ? body.workspacesRoot : undefined,
       timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
+      installTimeoutMs:
+        typeof body.installTimeoutMs === "number"
+          ? body.installTimeoutMs
+          : undefined,
     };
 
     const result = await prepareRemediationWorkspace(input, exec);
@@ -97,6 +108,51 @@ export function createRemediationRoute(
       ok: true,
       ...result,
       plan,
+    });
+  });
+
+  /**
+   * POST /api/remediation/workspaces/prepare
+   * Phase 2 Step 1 (batch): Clones/updates all target repositories in `.workspaces/`,
+   * checks out each remediation branch, and installs dependencies (`npm install`) into the
+   * persistent runtime cache so subsequent Copilot & verify steps run quickly.
+   */
+  route.post("/workspaces/prepare", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    if (!Array.isArray(body.plans)) {
+      return c.json(
+        { ok: false, error: "Invalid JSON body: `plans` must be an array." },
+        400,
+      );
+    }
+    const plans = body.plans.map((p) => assertPlan(p));
+    const runId =
+      typeof body.runId === "string" && body.runId.trim()
+        ? body.runId.trim()
+        : createRunId("rem");
+
+    const input: PrepareWorkspacesBatchInput = {
+      runId,
+      plans,
+      branchPrefix:
+        typeof body.branchPrefix === "string" ? body.branchPrefix : undefined,
+      reuseExisting:
+        typeof body.reuseExisting === "boolean" ? body.reuseExisting : undefined,
+      installDeps:
+        typeof body.installDeps === "boolean" ? body.installDeps : undefined,
+      workspacesRoot:
+        typeof body.workspacesRoot === "string" ? body.workspacesRoot : undefined,
+      timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
+      installTimeoutMs:
+        typeof body.installTimeoutMs === "number"
+          ? body.installTimeoutMs
+          : undefined,
+    };
+
+    const result = await prepareRemediationWorkspacesBatch(input, exec);
+    return c.json({
+      ok: true,
+      ...result,
     });
   });
 

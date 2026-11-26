@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RemediationPlan } from "../../src/domain/remediation-plan.ts";
@@ -383,5 +383,82 @@ describe("http/remediation", () => {
     expect(body.prUrl).toBeNull();
     expect(body.title).toContain("shell-quote");
     expect(body.body).toContain("CVE-2026-102422");
+  });
+
+  test("POST /api/remediation/workspaces/prepare clones & installs on first run, then reuses cached workspace", async () => {
+    const cacheRoot = await mkdtemp(join(tmpdir(), "task-pilot-ws-cache-"));
+    try {
+      const commands: string[][] = [];
+      const mockExec: CommandRunner = async (cmd) => {
+        commands.push(cmd);
+        // Simulate `gh repo clone <repo> <dir>` creating .git and package.json
+        if (cmd[0] === "gh" && cmd[1] === "repo" && cmd[2] === "clone") {
+          const targetDir = cmd[4]!;
+          await mkdir(join(targetDir, ".git"), { recursive: true });
+          await Bun.write(
+            join(targetDir, "package.json"),
+            JSON.stringify({ name: "@acme-org/shared-utils", scripts: { test: "echo ok" } }),
+          );
+        }
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      };
+
+      const app = createApp({ exec: mockExec, enableLogging: false });
+
+      // 1st run: cold clone + npm install
+      const firstRes = await app.request("/api/remediation/workspaces/prepare", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "run-1",
+          plans: [samplePlan],
+          workspacesRoot: cacheRoot,
+        }),
+      });
+      expect(firstRes.status).toBe(200);
+      const firstBody = (await firstRes.json()) as {
+        ok: boolean;
+        preparedCount: number;
+        cacheHits: number;
+        workspaces: Array<{
+          targetRepo: string;
+          cacheHit: boolean;
+          depsInstalled: boolean;
+          workspacePath: string;
+        }>;
+      };
+      expect(firstBody.ok).toBe(true);
+      expect(firstBody.preparedCount).toBe(1);
+      expect(firstBody.cacheHits).toBe(0);
+      expect(firstBody.workspaces[0]?.cacheHit).toBe(false);
+      expect(firstBody.workspaces[0]?.depsInstalled).toBe(true);
+      expect(commands.some((c) => c[0] === "gh" && c[1] === "repo" && c[2] === "clone")).toBe(true);
+      expect(commands.some((c) => c[0] === "npm" && c[1] === "install")).toBe(true);
+
+      // 2nd run: cache hit (no gh repo clone, preserves node_modules, fetches + incremental npm install)
+      commands.length = 0;
+      const secondRes = await app.request("/api/remediation/workspaces/prepare", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "run-2",
+          plans: [samplePlan],
+          workspacesRoot: cacheRoot,
+        }),
+      });
+      expect(secondRes.status).toBe(200);
+      const secondBody = (await secondRes.json()) as typeof firstBody;
+      expect(secondBody.ok).toBe(true);
+      expect(secondBody.cacheHits).toBe(1);
+      expect(secondBody.workspaces[0]?.cacheHit).toBe(true);
+      expect(secondBody.workspaces[0]?.depsInstalled).toBe(true);
+      expect(secondBody.workspaces[0]?.workspacePath).toBe(firstBody.workspaces[0]?.workspacePath);
+      expect(commands.some((c) => c[0] === "gh" && c[1] === "repo" && c[2] === "clone")).toBe(false);
+      expect(commands.some((c) => c[0] === "git" && c[1] === "clean" && c.includes("node_modules"))).toBe(true);
+      expect(commands.some((c) => c[0] === "git" && c[1] === "fetch")).toBe(true);
+      expect(commands.some((c) => c[0] === "npm" && c[1] === "install")).toBe(true);
+    } finally {
+      await rm(cacheRoot, { recursive: true, force: true });
+    }
   });
 });
