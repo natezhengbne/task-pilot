@@ -1,0 +1,20 @@
+services:
+  n8n:
+    image: ${N8N_IMAGE:-docker.n8n.io/n8nio/n8n:latest}
+    container_name: ${N8N_CONTAINER_NAME:-taskpilot-n8n}
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - taskpilot_n8n_data:/home/node/.n8n
+    environment:
+      - N8N_PORT=${N8N_PORT:-5678}
+      - TASKPILOT_API_URL=${TASKPILOT_API_URL:-http://localhost:3456}
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_SECURE_COOKIE=false
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+
+volumes:
+  taskpilot_n8n_data:
+    name: taskpilot_n8n_data

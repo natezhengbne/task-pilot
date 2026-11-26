@@ -11,6 +11,10 @@ if (-not $env:TASKPILOT_API_URL) {
   $env:TASKPILOT_API_URL = "http://127.0.0.1:3456"
 }
 $env:N8N_BLOCK_ENV_ACCESS_IN_NODE = "false"
+$env:N8N_SECURE_COOKIE = "false"
+$env:N8N_DIAGNOSTICS_ENABLED = "false"
+$env:N8N_VERSION_NOTIFICATIONS_ENABLED = "false"
+$env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
 
 Write-Host "Starting n8n (latest) natively on Windows (for local dev; workflow is v3-compatible)..."
 Write-Host "  n8n Data        : $n8nDataDir"

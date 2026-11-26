@@ -48,11 +48,11 @@ bun run dev
 .\scripts\start-n8n.ps1
 
 # Option B (Recommended if npm install is slow on Windows): Windows Bun + WSL Docker n8n
-# Terminal 1: Start TaskPilot HTTP API on 0.0.0.0:3456 so WSL Docker can reach it
-bun run dev:wsl
+# Terminal 1: Start TaskPilot HTTP API
+bun run dev
 
-# Terminal 2: Start n8n inside WSL Docker (auto-maps host.docker.internal -> Windows host)
-.\scripts\start-n8n-wsl-docker.ps1
+# Terminal 2 (in WSL): Start n8n in Docker via Docker Compose (defaults to http://localhost:3456)
+./scripts/start-n8n-docker.sh   # or: docker compose up -d
 ```
 
 Import `n8n/wiz-remediation.workflow.json` into n8n (`http://localhost:5678`). It is a single-file, vertically layered 3-phase workflow (Row 1: Phase 1 upload/ingest/plan, Row 2: Phase 2 per-repo workspace + Copilot patch/verify retry loop, Row 3: Phase 3 Draft PR / report & final summary).

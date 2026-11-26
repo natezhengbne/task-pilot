@@ -4,7 +4,7 @@
     {
       "parameters": {
         "formTitle": "TaskPilot Vulnerability Remediation",
-        "formDescription": "Upload a vulnerability export (e.g. Wiz GraphQL JSON). Choose Phase 1 (Analysis only), Phase 2 (Copilot remediation + verification), or Phase 3 (Full remediation + Draft PR).",
+        "formDescription": "Upload a vulnerability export (e.g. Wiz GraphQL JSON). Phase is optional and defaults to Phase 3 (Full remediation + Draft PR).",
         "formFields": {
           "values": [
             {
@@ -48,12 +48,12 @@
               "fieldType": "dropdown",
               "fieldOptions": {
                 "values": [
-                  { "option": "Phase 1 - Analysis Only" },
+                  { "option": "Phase 3 - Full Remediation + Draft PR" },
                   { "option": "Phase 2 - Copilot Remediation (Verify Only)" },
-                  { "option": "Phase 3 - Full Remediation + Draft PR" }
+                  { "option": "Phase 1 - Analysis Only" }
                 ]
               },
-              "requiredField": true
+              "requiredField": false
             },
             {
               "fieldLabel": "Max Retries",
@@ -109,7 +109,9 @@
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ source: $('1. Upload Vulnerability Report').item.json.Source || 'wiz-graphql', runId: 'n8n-' + $execution.id, policy: { minSeverity: $('1. Upload Vulnerability Report').item.json['Min Severity'] || 'HIGH', ...($('1. Upload Vulnerability Report').item.json['Owned Scopes'] ? { ownedScopes: $('1. Upload Vulnerability Report').item.json['Owned Scopes'].split(',').map(s => s.trim()).filter(Boolean) } : {}) }, payload: $json.reportPayload }) }}",
-        "options": {}
+        "options": {
+          "timeout": 3000
+        }
       },
       "id": "http-ingest-1",
       "name": "📥 3. Ingest Vulnerabilities",
@@ -143,7 +145,7 @@
           "conditions": [
             {
               "id": "cond-phase",
-              "leftValue": "={{ $('1. Upload Vulnerability Report').item.json.Phase || 'Phase 1 - Analysis Only' }}",
+              "leftValue": "={{ $('1. Upload Vulnerability Report').item.json.Phase || 'Phase 3 - Full Remediation + Draft PR' }}",
               "rightValue": "Phase 1 - Analysis Only",
               "operator": {
                 "type": "string",
@@ -185,7 +187,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const form = $('1. Upload Vulnerability Report').first().json;\nconst planResp = $input.first().json;\nconst plans = planResp.plans || [];\nconst maxRetries = Number(form['Max Retries']) > 0 ? Number(form['Max Retries']) : 3;\nconst creditBudget = Number(form['Credit Budget']) > 0 ? Number(form['Credit Budget']) : 30;\nconst verifyDownstream = form['Verify Downstream'] === 'Yes';\nconst phase = form.Phase || 'Phase 2 - Copilot Remediation (Verify Only)';\n\nreturn plans.map((plan) => ({\n  json: {\n    runId: planResp.runId,\n    phase,\n    maxRetries,\n    creditBudget,\n    verifyDownstream,\n    plan,\n  },\n}));"
+        "jsCode": "const form = $('1. Upload Vulnerability Report').first().json;\nconst planResp = $input.first().json;\nconst plans = planResp.plans || [];\nconst maxRetries = Number(form['Max Retries']) > 0 ? Number(form['Max Retries']) : 3;\nconst creditBudget = Number(form['Credit Budget']) > 0 ? Number(form['Credit Budget']) : 30;\nconst verifyDownstream = form['Verify Downstream'] === 'Yes';\nconst phase = form.Phase || 'Phase 3 - Full Remediation + Draft PR';\n\nreturn plans.map((plan) => ({\n  json: {\n    runId: planResp.runId,\n    phase,\n    maxRetries,\n    creditBudget,\n    verifyDownstream,\n    plan,\n  },\n}));"
       },
       "id": "code-expand-plans",
       "name": "6. Expand Plans per Repo",
