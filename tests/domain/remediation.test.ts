@@ -72,6 +72,17 @@ describe("domain/remediation", () => {
     expect(prompt).toContain("Previous Verification Failure (Attempt 1 of 3)");
     expect(prompt).toContain("FAIL tests/quote.test.ts");
     expect(prompt).toContain("`npm run typecheck`");
+    expect(prompt).toContain("Do NOT run `npm install` before editing `package.json`");
+    expect(prompt).toContain("npm install --package-lock-only --no-audit --no-fund");
+  });
+
+  test("builds Copilot prompt with pre-installed guidance when depsInstalled is true", () => {
+    const prompt = buildCopilotRemediationPrompt(samplePlan, {
+      depsInstalled: true,
+    });
+
+    expect(prompt).toContain("`node_modules` is already pre-installed");
+    expect(prompt).not.toContain("Do NOT run `npm install` before editing `package.json`");
   });
 
   test("builds Draft PR title and Markdown body with verification details", () => {

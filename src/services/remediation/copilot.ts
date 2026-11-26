@@ -34,6 +34,7 @@ export interface RunCopilotPatchInput {
   creditsUsed?: number;
   creditsPerAttempt?: number;
   previousError?: string | null;
+  depsInstalled?: boolean;
   model?: string;
   extraInstructions?: string;
   timeoutMs?: number;
@@ -277,6 +278,7 @@ export async function runCopilotRemediationPatch(
     maxRetries,
     previousError: input.previousError,
     detectedScripts: pkgInfo.detectedScripts,
+    depsInstalled: input.depsInstalled,
     extraInstructions: input.extraInstructions,
   });
 

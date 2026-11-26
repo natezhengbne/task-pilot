@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { RunsStore, RunStatus } from "../../db/runs-store.ts";
 import type { RemediationPlan } from "../../domain/remediation-plan.ts";
 import type { RemediationVerificationResult } from "../../domain/remediation.ts";
 import {
@@ -26,6 +27,7 @@ import { createRunId } from "../../shared/runs.ts";
 
 export interface RemediationRouteDeps {
   exec?: CommandRunner;
+  runsStore?: RunsStore;
 }
 
 async function parseJsonObject(
@@ -66,11 +68,13 @@ export function createRemediationRoute(
 ): Hono {
   const route = new Hono();
   const exec = deps.exec ?? runCommand;
+  const runsStore = deps.runsStore;
 
   /**
    * POST /api/remediation/workspace/prepare
-   * Phase 2 Step 1 (single repo): Prepares a persistent cached workspace in `.workspaces/`,
-   * checks out the remediation branch, and runs `npm install`.
+   * Phase 2 Step 1 (single repo): Prepares a persistent cached workspace in `.workspaces/`
+   * and checks out the remediation branch. Defers `npm install` by default (`installDeps: false`)
+   * so patching happens before installing dependencies.
    */
   route.post("/workspace/prepare", async (c) => {
     const body = await parseJsonObject(await c.req.text());
@@ -103,19 +107,65 @@ export function createRemediationRoute(
           : undefined,
     };
 
-    const result = await prepareRemediationWorkspace(input, exec);
-    return c.json({
-      ok: true,
-      ...result,
+    const startMs = performance.now();
+    runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
+      status: "preparing",
+      currentStage: "prepare",
+      clearError: true,
     });
+    runsStore?.recordEvent(runId, {
+      targetRepo: plan.targetRepo,
+      stage: "prepare",
+      status: "started",
+      message: `Preparing workspace for ${plan.targetRepo}@${input.baseBranch ?? plan.branch ?? "main"}`,
+    });
+
+    try {
+      const result = await prepareRemediationWorkspace(input, exec);
+      runsStore?.updateRepo(runId, plan.targetRepo, {
+        plan,
+        status: "prepared",
+        remediationBranch: result.remediationBranch,
+        cacheHit: result.cacheHit,
+        currentStage: "prepare",
+      });
+      runsStore?.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage: "prepare",
+        status: "succeeded",
+        durationMs: Math.round(performance.now() - startMs),
+        message: `Workspace ready (${result.cacheHit ? "cache hit" : "fresh clone"}, branch ${result.remediationBranch})`,
+      });
+      return c.json({
+        ok: true,
+        ...result,
+        plan,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      runsStore?.updateRepo(runId, plan.targetRepo, {
+        plan,
+        status: "failed",
+        lastError: msg,
+        currentStage: "prepare",
+      });
+      runsStore?.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage: "prepare",
+        status: "failed",
+        durationMs: Math.round(performance.now() - startMs),
+        message: `Workspace preparation failed: ${msg}`,
+      });
+      throw err;
+    }
   });
 
   /**
    * POST /api/remediation/workspaces/prepare
-   * Phase 2 Step 1 (batch): Clones/updates all target repositories in `.workspaces/`,
-   * checks out each remediation branch, and installs dependencies (`npm install`) into the
-   * persistent runtime cache so subsequent Copilot & verify steps run quickly.
+   * Phase 2 Step 1 (batch): Clones/updates all target repositories in `.workspaces/`
+   * and checks out each remediation branch. Defers `npm install` by default (`installDeps: false`)
+   * so registries blocking Critical vulnerable packages do not fail preparation before patching.
    */
   route.post("/workspaces/prepare", async (c) => {
     const body = await parseJsonObject(await c.req.text());
@@ -149,7 +199,69 @@ export function createRemediationRoute(
           : undefined,
     };
 
-    const result = await prepareRemediationWorkspacesBatch(input, exec);
+    if (runsStore && plans.length > 0) {
+      for (const plan of plans) {
+        runsStore.updateRepo(runId, plan.targetRepo, {
+          plan,
+          currentStage: "prepare",
+        });
+      }
+    }
+
+    const repoStartTimes = new Map<string, number>();
+    const result = await prepareRemediationWorkspacesBatch(input, exec, {
+      onRepoStart: (plan, index, total) => {
+        repoStartTimes.set(plan.targetRepo, performance.now());
+        runsStore?.updateRepo(runId, plan.targetRepo, {
+          plan,
+          status: "preparing",
+          currentStage: "prepare",
+          clearError: true,
+        });
+        runsStore?.recordEvent(runId, {
+          targetRepo: plan.targetRepo,
+          stage: "prepare",
+          status: "started",
+          message: `[${index + 1}/${total}] Preparing workspace for ${plan.targetRepo}`,
+        });
+      },
+      onRepoDone: (prepared, index, total) => {
+        const started = repoStartTimes.get(prepared.targetRepo);
+        const durationMs = started ? Math.round(performance.now() - started) : null;
+        runsStore?.updateRepo(runId, prepared.targetRepo, {
+          plan: prepared.plan,
+          status: "prepared",
+          remediationBranch: prepared.remediationBranch,
+          cacheHit: prepared.cacheHit,
+          currentStage: "prepare",
+        });
+        runsStore?.recordEvent(runId, {
+          targetRepo: prepared.targetRepo,
+          stage: "prepare",
+          status: "succeeded",
+          durationMs,
+          message: `[${index + 1}/${total}] Workspace ready (${prepared.cacheHit ? "cache hit" : "fresh clone"}, branch ${prepared.remediationBranch})`,
+        });
+      },
+      onRepoError: (plan, err, index, total) => {
+        const started = repoStartTimes.get(plan.targetRepo);
+        const durationMs = started ? Math.round(performance.now() - started) : null;
+        const msg = err instanceof Error ? err.message : String(err);
+        runsStore?.updateRepo(runId, plan.targetRepo, {
+          plan,
+          status: "failed",
+          lastError: msg,
+          currentStage: "prepare",
+        });
+        runsStore?.recordEvent(runId, {
+          targetRepo: plan.targetRepo,
+          stage: "prepare",
+          status: "failed",
+          durationMs,
+          message: `[${index + 1}/${total}] Prepare failed: ${msg}`,
+        });
+      },
+    });
     return c.json({
       ok: true,
       ...result,
@@ -194,6 +306,8 @@ export function createRemediationRoute(
           : undefined,
       previousError:
         typeof body.previousError === "string" ? body.previousError : null,
+      depsInstalled:
+        typeof body.depsInstalled === "boolean" ? body.depsInstalled : undefined,
       model: typeof body.model === "string" ? body.model : undefined,
       extraInstructions:
         typeof body.extraInstructions === "string"
@@ -204,7 +318,51 @@ export function createRemediationRoute(
       persist: typeof body.persist === "boolean" ? body.persist : true,
     };
 
+    const attempt = input.attempt ?? 1;
+    const startMs = performance.now();
+    runsStore?.updateRepo(runId, plan.targetRepo, {
+      plan,
+      status: "patching",
+      attempt,
+      maxRetries: input.maxRetries ?? null,
+      creditsUsed: input.creditsUsed ?? 0,
+      creditBudget: input.creditBudget ?? null,
+      currentStage: "patch",
+      clearError: true,
+    });
+    runsStore?.recordEvent(runId, {
+      targetRepo: plan.targetRepo,
+      stage: "patch",
+      status: "started",
+      attempt,
+      message: `Copilot patch started (attempt ${attempt}${input.maxRetries ? `/${input.maxRetries}` : ""})`,
+    });
+
     const result = await runCopilotRemediationPatch(input, exec);
+    const durationMs = Math.round(performance.now() - startMs);
+
+    runsStore?.updateRepo(runId, plan.targetRepo, {
+      plan,
+      status: "patching",
+      attempt: result.attempt,
+      maxRetries: result.maxRetries,
+      creditsUsed: result.creditsUsed,
+      creditBudget: result.creditBudget,
+      lastError: result.ok ? null : (result.error ?? result.code ?? "Copilot patch failed"),
+      clearError: result.ok,
+      currentStage: "patch",
+    });
+    runsStore?.recordEvent(runId, {
+      targetRepo: plan.targetRepo,
+      stage: "patch",
+      status: result.ok ? "succeeded" : "failed",
+      attempt: result.attempt,
+      durationMs,
+      message: result.ok
+        ? `Copilot patch finished (${result.changedFiles.length} file(s) changed, credits ${result.creditsUsed}/${result.creditBudget})`
+        : `Copilot patch failed (${result.code ?? "ERROR"}): ${result.error ?? "unknown error"}`,
+    });
+
     return c.json(result, getCopilotPatchHttpStatus(result));
   });
 
@@ -255,13 +413,61 @@ export function createRemediationRoute(
       persist: typeof body.persist === "boolean" ? body.persist : true,
     };
 
-    const result = await verifyRemediationWorkspace(input, exec);
-    return c.json({
-      ok: true,
-      runId,
-      workspacePath,
-      ...result,
+    const startMs = performance.now();
+    runsStore?.updateRepo(runId, plan.targetRepo, {
+      plan,
+      status: "verifying",
+      currentStage: "verify",
     });
+    runsStore?.recordEvent(runId, {
+      targetRepo: plan.targetRepo,
+      stage: "verify",
+      status: "started",
+      message: `Verifying lockfile & tests for ${plan.targetRepo}`,
+    });
+
+    try {
+      const result = await verifyRemediationWorkspace(input, exec);
+      const durationMs = Math.round(performance.now() - startMs);
+      runsStore?.updateRepo(runId, plan.targetRepo, {
+        plan,
+        status: "verifying",
+        lastError: result.passed ? null : (result.failureSummary ?? "Verification failed"),
+        clearError: result.passed,
+        currentStage: "verify",
+      });
+      runsStore?.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage: "verify",
+        status: result.passed ? "succeeded" : "failed",
+        durationMs,
+        message: result.passed
+          ? `Verification passed (${result.changedFiles.length} file(s) changed, ${result.commands.length} command(s))`
+          : `Verification failed: ${result.failureSummary ?? "checks did not pass"}`,
+      });
+      return c.json({
+        ok: true,
+        runId,
+        workspacePath,
+        ...result,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      runsStore?.updateRepo(runId, plan.targetRepo, {
+        plan,
+        status: "verifying",
+        lastError: msg,
+        currentStage: "verify",
+      });
+      runsStore?.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage: "verify",
+        status: "failed",
+        durationMs: Math.round(performance.now() - startMs),
+        message: `Verification errored: ${msg}`,
+      });
+      throw err;
+    }
   });
 
   /**
@@ -319,8 +525,123 @@ export function createRemediationRoute(
       timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
     };
 
-    const result = await createRemediationDraftPr(input, exec);
-    return c.json(result);
+    const startMs = performance.now();
+    runsStore?.updateRepo(runId, plan.targetRepo, {
+      plan,
+      status: "creating_pr",
+      remediationBranch,
+      dryRun,
+      currentStage: "pr",
+    });
+    runsStore?.recordEvent(runId, {
+      targetRepo: plan.targetRepo,
+      stage: "pr",
+      status: "started",
+      message: dryRun
+        ? `Generating dry-run report for ${plan.targetRepo}`
+        : `Opening Draft PR for ${plan.targetRepo} (${remediationBranch})`,
+    });
+
+    try {
+      const result = await createRemediationDraftPr(input, exec);
+      const durationMs = Math.round(performance.now() - startMs);
+      runsStore?.updateRepo(runId, plan.targetRepo, {
+        plan,
+        status: "completed",
+        remediationBranch: result.remediationBranch,
+        dryRun: result.dryRun,
+        prUrl: result.prUrl,
+        reportPath: result.artifacts?.prReportPath ?? null,
+        clearError: true,
+        currentStage: "pr",
+        autoFinalize: true,
+      });
+      runsStore?.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage: "pr",
+        status: "succeeded",
+        durationMs,
+        message: result.prUrl
+          ? `Draft PR opened: ${result.prUrl}`
+          : `Dry-run report generated (${result.remediationBranch})`,
+      });
+      return c.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      runsStore?.updateRepo(runId, plan.targetRepo, {
+        plan,
+        status: "failed",
+        lastError: msg,
+        currentStage: "pr",
+        autoFinalize: true,
+      });
+      runsStore?.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage: "pr",
+        status: "failed",
+        durationMs: Math.round(performance.now() - startMs),
+        message: `PR creation failed: ${msg}`,
+      });
+      throw err;
+    }
+  });
+
+  /**
+   * POST /api/remediation/finalize
+   * Optional terminal callback for n8n to record a repo-level failure (when retries/credits
+   * are exhausted) or finalize the overall run (e.g. Phase 1 completion / loop end).
+   */
+  route.post("/finalize", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    const runId = typeof body.runId === "string" ? body.runId.trim() : "";
+    if (!runId) {
+      return c.json({ ok: false, error: "Field `runId` is required." }, 400);
+    }
+
+    const targetRepo =
+      typeof body.targetRepo === "string" && body.targetRepo.trim()
+        ? body.targetRepo.trim()
+        : null;
+
+    if (targetRepo) {
+      const reason =
+        typeof body.reason === "string" && body.reason.trim()
+          ? body.reason.trim()
+          : typeof body.failureSummary === "string" && body.failureSummary.trim()
+            ? body.failureSummary.trim()
+            : typeof body.error === "string" && body.error.trim()
+              ? body.error.trim()
+              : "Remediation failed";
+      runsStore?.markRepoFailed(runId, targetRepo, {
+        reason,
+        attempt: typeof body.attempt === "number" ? body.attempt : undefined,
+        creditsUsed:
+          typeof body.creditsUsed === "number" ? body.creditsUsed : undefined,
+        creditBudget:
+          typeof body.creditBudget === "number" ? body.creditBudget : undefined,
+        autoFinalize: true,
+      });
+    } else {
+      const status =
+        body.status === "completed" ||
+        body.status === "partial_failed" ||
+        body.status === "failed"
+          ? (body.status as RunStatus)
+          : undefined;
+      runsStore?.finalizeRun(runId, {
+        status,
+        error: typeof body.error === "string" ? body.error : null,
+        message: typeof body.message === "string" ? body.message : undefined,
+      });
+    }
+
+    const snapshot = runsStore?.getRunSnapshot(runId) ?? null;
+    return c.json({
+      ok: true,
+      runId,
+      dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
+      status: snapshot?.run.status ?? "completed",
+    });
   });
 
   return route;

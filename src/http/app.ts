@@ -1,8 +1,10 @@
 import { Hono } from "hono";
+import { RunsStore } from "../db/runs-store.ts";
 import {
   GitHubClientError,
   type GitHubRepoClient,
 } from "../services/github/client.ts";
+import { createDashboardRoute } from "./routes/dashboard.ts";
 import { createGitHubRoute } from "./routes/github.ts";
 import { createPreflightRoute } from "./routes/preflight.ts";
 import { createRemediationRoute } from "./routes/remediation.ts";
@@ -13,6 +15,8 @@ export interface AppConfig {
   apiToken?: string;
   createGitHubClient?: () => GitHubRepoClient;
   exec?: CommandRunner;
+  runsStore?: RunsStore;
+  runsDbPath?: string;
   /** Enables request/response logging to stderr (defaults to true outside tests). */
   enableLogging?: boolean;
 }
@@ -64,6 +68,12 @@ export function createApp(config: AppConfig = {}): Hono {
   const apiToken = config.apiToken ?? process.env.TASKPILOT_API_TOKEN;
   const enableLogging =
     config.enableLogging ?? process.env.NODE_ENV !== "test";
+  const runsStore =
+    config.runsStore ??
+    new RunsStore(
+      config.runsDbPath ??
+        (process.env.NODE_ENV === "test" ? ":memory:" : undefined),
+    );
 
   if (enableLogging) {
     app.use("*", async (c, next) => {
@@ -85,12 +95,19 @@ export function createApp(config: AppConfig = {}): Hono {
       await next();
 
       const elapsedMs = Math.round(performance.now() - start);
+      const contentType = c.res.headers.get("content-type") ?? "";
       let resSummary = "";
-      try {
-        const resText = await c.res.clone().text();
-        resSummary = ` res=${summarizeBody(resText)}`;
-      } catch {
-        // ignore response clone error
+      if (contentType.includes("text/event-stream")) {
+        resSummary = " res=(sse-stream)";
+      } else if (contentType.includes("text/html")) {
+        resSummary = " res=(html)";
+      } else {
+        try {
+          const resText = await c.res.clone().text();
+          resSummary = ` res=${summarizeBody(resText)}`;
+        } catch {
+          // ignore response clone error
+        }
       }
 
       process.stderr.write(
@@ -99,6 +116,8 @@ export function createApp(config: AppConfig = {}): Hono {
     });
   }
 
+  app.get("/", (c) => c.redirect("/runs"));
+
   app.get("/health", (c) => {
     return c.json({
       ok: true,
@@ -106,6 +125,9 @@ export function createApp(config: AppConfig = {}): Hono {
       timestamp: new Date().toISOString(),
     });
   });
+
+  // Unauthenticated Run Status Dashboard (/runs, /runs/:runId, /runs/:runId/stream)
+  app.route("/runs", createDashboardRoute({ runsStore }));
 
   // Optional Bearer token guard for /api/* when TASKPILOT_API_TOKEN is configured
   app.use("/api/*", async (c, next) => {
@@ -122,11 +144,14 @@ export function createApp(config: AppConfig = {}): Hono {
   app.route("/api/preflight", createPreflightRoute({ exec: config.exec }));
   app.route(
     "/api/remediation",
-    createRemediationRoute({ exec: config.exec }),
+    createRemediationRoute({ exec: config.exec, runsStore }),
   );
   app.route(
     "/api/vulnerabilities",
-    createVulnerabilitiesRoute({ createGitHubClient: config.createGitHubClient }),
+    createVulnerabilitiesRoute({
+      createGitHubClient: config.createGitHubClient,
+      runsStore,
+    }),
   );
 
   app.notFound((c) => {

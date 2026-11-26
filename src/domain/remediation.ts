@@ -44,6 +44,7 @@ export interface CopilotPromptOptions {
   maxRetries?: number;
   previousError?: string | null;
   detectedScripts?: string[];
+  depsInstalled?: boolean;
   extraInstructions?: string;
 }
 
@@ -124,7 +125,15 @@ export function buildCopilotRemediationPrompt(
   lines.push(
     "2. Prefer upgrading direct dependencies cleanly when possible; if a package is strictly transitive and cannot be upgraded via a parent bump without a breaking rewrite, use npm `overrides` carefully and regenerate `package-lock.json`.",
   );
-  lines.push("3. `node_modules` is already pre-installed in this cached workspace; do NOT delete `node_modules`. Ensure `package-lock.json` is updated and consistent with `package.json` by running an incremental `npm install` or `npm update`.");
+  if (options.depsInstalled) {
+    lines.push(
+      "3. `node_modules` is already pre-installed in this cached workspace; do NOT delete `node_modules`. Ensure `package-lock.json` is updated and consistent with `package.json` by running an incremental `npm install` or `npm update`.",
+    );
+  } else {
+    lines.push(
+      "3. Dependencies were intentionally NOT installed before patching (corporate registries such as JFrog Xray/Curation may block Critical vulnerable versions with HTTP 403). Do NOT run `npm install` before editing `package.json`. First update `package.json` to eliminate the vulnerable version(s), then refresh the lockfile with `npm install --package-lock-only --no-audit --no-fund` so no blocked vulnerable versions remain, and finally run `npm install --no-audit --no-fund` (preserve any existing cached `node_modules` unless corrupted). If `npm install` still fails with HTTP 403 on an unrelated package not listed above, report the exact blocked package(s) and version(s) clearly.",
+    );
+  }
   lines.push("4. Keep changes minimal and strictly scoped to resolving these CVEs. Do NOT disable, skip, or delete existing tests or linters.");
 
   if (options.detectedScripts && options.detectedScripts.length > 0) {

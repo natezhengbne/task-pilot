@@ -385,7 +385,7 @@ describe("http/remediation", () => {
     expect(body.body).toContain("CVE-2026-102422");
   });
 
-  test("POST /api/remediation/workspaces/prepare clones & installs on first run, then reuses cached workspace", async () => {
+  test("POST /api/remediation/workspaces/prepare defers npm install by default and reuses cached workspace", async () => {
     const cacheRoot = await mkdtemp(join(tmpdir(), "task-pilot-ws-cache-"));
     try {
       const commands: string[][] = [];
@@ -405,7 +405,7 @@ describe("http/remediation", () => {
 
       const app = createApp({ exec: mockExec, enableLogging: false });
 
-      // 1st run: cold clone + npm install
+      // 1st run: cold clone, defers npm install by default (avoids JFrog 403 on unpatched critical CVEs)
       const firstRes = await app.request("/api/remediation/workspaces/prepare", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -431,11 +431,11 @@ describe("http/remediation", () => {
       expect(firstBody.preparedCount).toBe(1);
       expect(firstBody.cacheHits).toBe(0);
       expect(firstBody.workspaces[0]?.cacheHit).toBe(false);
-      expect(firstBody.workspaces[0]?.depsInstalled).toBe(true);
+      expect(firstBody.workspaces[0]?.depsInstalled).toBe(false);
       expect(commands.some((c) => c[0] === "gh" && c[1] === "repo" && c[2] === "clone")).toBe(true);
-      expect(commands.some((c) => c[0] === "npm" && c[1] === "install")).toBe(true);
+      expect(commands.some((c) => c[0] === "npm" && c[1] === "install")).toBe(false);
 
-      // 2nd run: cache hit (no gh repo clone, preserves node_modules, fetches + incremental npm install)
+      // 2nd run: cache hit (no gh repo clone, preserves node_modules, still defers npm install by default)
       commands.length = 0;
       const secondRes = await app.request("/api/remediation/workspaces/prepare", {
         method: "POST",
@@ -451,11 +451,29 @@ describe("http/remediation", () => {
       expect(secondBody.ok).toBe(true);
       expect(secondBody.cacheHits).toBe(1);
       expect(secondBody.workspaces[0]?.cacheHit).toBe(true);
-      expect(secondBody.workspaces[0]?.depsInstalled).toBe(true);
+      expect(secondBody.workspaces[0]?.depsInstalled).toBe(false);
       expect(secondBody.workspaces[0]?.workspacePath).toBe(firstBody.workspaces[0]?.workspacePath);
       expect(commands.some((c) => c[0] === "gh" && c[1] === "repo" && c[2] === "clone")).toBe(false);
       expect(commands.some((c) => c[0] === "git" && c[1] === "clean" && c.includes("node_modules"))).toBe(true);
       expect(commands.some((c) => c[0] === "git" && c[1] === "fetch")).toBe(true);
+      expect(commands.some((c) => c[0] === "npm" && c[1] === "install")).toBe(false);
+
+      // 3rd run: explicit opt-in installDeps: true runs npm install
+      commands.length = 0;
+      const thirdRes = await app.request("/api/remediation/workspaces/prepare", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "run-3",
+          plans: [samplePlan],
+          workspacesRoot: cacheRoot,
+          installDeps: true,
+        }),
+      });
+      expect(thirdRes.status).toBe(200);
+      const thirdBody = (await thirdRes.json()) as typeof firstBody;
+      expect(thirdBody.ok).toBe(true);
+      expect(thirdBody.workspaces[0]?.depsInstalled).toBe(true);
       expect(commands.some((c) => c[0] === "npm" && c[1] === "install")).toBe(true);
     } finally {
       await rm(cacheRoot, { recursive: true, force: true });

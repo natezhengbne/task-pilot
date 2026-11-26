@@ -20,7 +20,12 @@ export interface PrepareWorkspaceInput {
   remediationBranch?: string;
   /** Reuse persistent cached repo & node_modules in `.workspaces/` (default: true). */
   reuseExisting?: boolean;
-  /** Run `npm install` after checkout to warm/update `node_modules` (default: true). */
+  /**
+   * Run `npm install` right after checkout before remediation edits (default: false).
+   * Deferred by default so corporate registries (e.g. JFrog Xray/Curation) that block
+   * downloading Critical vulnerable versions with HTTP 403 do not fail workspace preparation
+   * before dependencies are upgraded.
+   */
   installDeps?: boolean;
   /** Override the persistent workspace cache root (mainly for tests). */
   workspacesRoot?: string;
@@ -178,8 +183,9 @@ export async function getWorkspaceGitChanges(
  * - Reuses existing clone & `node_modules` when present (`reuseExisting`, default: true).
  * - Resets tracked/untracked files while preserving `node_modules`, fetches latest `baseBranch`,
  *   and checks out a clean `remediationBranch`.
- * - Runs `npm install` when `installDeps` is enabled (default: true) so Copilot & verify
- *   start with warm dependencies.
+ * - Defers `npm install` by default (`installDeps`, default: false) so registries that block
+ *   Critical vulnerable packages (e.g. JFrog Xray 403) do not abort before patching; set
+ *   `installDeps: true` only when pre-patch installation is explicitly desired.
  */
 export async function prepareRemediationWorkspace(
   input: PrepareWorkspaceInput,
@@ -191,7 +197,7 @@ export async function prepareRemediationWorkspace(
     input.remediationBranch?.trim() ||
     buildRemediationBranchName(input.plan, input.branchPrefix);
   const reuseExisting = input.reuseExisting ?? true;
-  const installDeps = input.installDeps ?? true;
+  const installDeps = input.installDeps ?? false;
   const timeoutMs = input.timeoutMs ?? 120_000;
   const installTimeoutMs = input.installTimeoutMs ?? 300_000;
 
@@ -343,13 +349,29 @@ export async function prepareRemediationWorkspace(
   };
 }
 
+export interface PrepareWorkspacesBatchCallbacks {
+  onRepoStart?: (plan: RemediationPlan, index: number, total: number) => void;
+  onRepoDone?: (
+    prepared: PreparedWorkspaceItem,
+    index: number,
+    total: number,
+  ) => void;
+  onRepoError?: (
+    plan: RemediationPlan,
+    error: unknown,
+    index: number,
+    total: number,
+  ) => void;
+}
+
 /**
- * Batch-prepares persistent cached workspaces (clone/fetch + checkout + `npm install`)
- * for all target repositories in `plans`.
+ * Batch-prepares persistent cached workspaces (clone/fetch + checkout, and optional
+ * `npm install` when `installDeps: true`) for all target repositories in `plans`.
  */
 export async function prepareRemediationWorkspacesBatch(
   input: PrepareWorkspacesBatchInput,
   exec: CommandRunner = runCommand,
+  callbacks: PrepareWorkspacesBatchCallbacks = {},
 ): Promise<PrepareWorkspacesBatchResult> {
   const workspaces: PreparedWorkspaceItem[] = [];
   let cacheHits = 0;
@@ -359,26 +381,35 @@ export async function prepareRemediationWorkspacesBatch(
     process.stderr.write(
       `[workspace] [${i + 1}/${input.plans.length}] preparing ${plan.targetRepo}@${plan.branch || "main"}\n`,
     );
-    const prepared = await prepareRemediationWorkspace(
-      {
-        runId: input.runId,
-        plan,
-        branchPrefix: input.branchPrefix,
-        reuseExisting: input.reuseExisting,
-        installDeps: input.installDeps,
-        workspacesRoot: input.workspacesRoot,
-        timeoutMs: input.timeoutMs,
-        installTimeoutMs: input.installTimeoutMs,
-      },
-      exec,
-    );
+    callbacks.onRepoStart?.(plan, i, input.plans.length);
+    let prepared: PrepareWorkspaceResult;
+    try {
+      prepared = await prepareRemediationWorkspace(
+        {
+          runId: input.runId,
+          plan,
+          branchPrefix: input.branchPrefix,
+          reuseExisting: input.reuseExisting,
+          installDeps: input.installDeps,
+          workspacesRoot: input.workspacesRoot,
+          timeoutMs: input.timeoutMs,
+          installTimeoutMs: input.installTimeoutMs,
+        },
+        exec,
+      );
+    } catch (err) {
+      callbacks.onRepoError?.(plan, err, i, input.plans.length);
+      throw err;
+    }
     if (prepared.cacheHit) {
       cacheHits += 1;
     }
-    workspaces.push({
+    const item: PreparedWorkspaceItem = {
       ...prepared,
       plan,
-    });
+    };
+    workspaces.push(item);
+    callbacks.onRepoDone?.(item, i, input.plans.length);
   }
 
   return {

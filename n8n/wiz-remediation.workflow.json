@@ -109,7 +109,7 @@
         "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/vulnerabilities/ingest' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ source: $('1. Upload Vulnerability Report').item.json.Source || 'wiz-graphql', runId: 'n8n-' + $execution.id, policy: { minSeverity: $('1. Upload Vulnerability Report').item.json['Min Severity'] || 'HIGH', ...($('1. Upload Vulnerability Report').item.json['Owned Scopes'] ? { ownedScopes: $('1. Upload Vulnerability Report').item.json['Owned Scopes'].split(',').map(s => s.trim()).filter(Boolean) } : {}) }, payload: $json.reportPayload }) }}",
+        "jsonBody": "={{ JSON.stringify({ source: $('1. Upload Vulnerability Report').item.json.Source || 'wiz-graphql', runId: 'n8n-' + $execution.id, phase: $('1. Upload Vulnerability Report').item.json.Phase || 'Phase 3 - Full Remediation + Draft PR', policy: { minSeverity: $('1. Upload Vulnerability Report').item.json['Min Severity'] || 'HIGH', ...($('1. Upload Vulnerability Report').item.json['Owned Scopes'] ? { ownedScopes: $('1. Upload Vulnerability Report').item.json['Owned Scopes'].split(',').map(s => s.trim()).filter(Boolean) } : {}) }, payload: $json.reportPayload }) }}",
         "options": {
           "timeout": 3000
         }
@@ -206,7 +206,7 @@
         "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/workspaces/prepare' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ runId: $('🔍 4. Plan Remediation Targets').first().json.runId, plans: $('🔍 4. Plan Remediation Targets').first().json.plans || [], reuseExisting: true, installDeps: true }) }}",
+        "jsonBody": "={{ JSON.stringify({ runId: $('🔍 4. Plan Remediation Targets').first().json.runId, plans: $('🔍 4. Plan Remediation Targets').first().json.plans || [], reuseExisting: true, installDeps: false }) }}",
         "options": {
           "timeout": 900000
         }
@@ -240,7 +240,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const ws = $input.first().json;\n\nreturn [{\n  json: {\n    runId: ws.runId,\n    phase: ws.phase,\n    maxRetries: ws.maxRetries,\n    creditBudget: ws.creditBudget,\n    verifyDownstream: ws.verifyDownstream,\n    plan: ws.plan,\n    targetRepo: ws.targetRepo,\n    baseBranch: ws.baseBranch,\n    remediationBranch: ws.remediationBranch,\n    workspacePath: ws.workspacePath,\n    attempt: 1,\n    creditsUsed: 0,\n    previousError: null,\n  },\n}];"
+        "jsCode": "const ws = $input.first().json;\n\nreturn [{\n  json: {\n    runId: ws.runId,\n    phase: ws.phase,\n    maxRetries: ws.maxRetries,\n    creditBudget: ws.creditBudget,\n    verifyDownstream: ws.verifyDownstream,\n    plan: ws.plan,\n    targetRepo: ws.targetRepo,\n    baseBranch: ws.baseBranch,\n    remediationBranch: ws.remediationBranch,\n    workspacePath: ws.workspacePath,\n    depsInstalled: Boolean(ws.depsInstalled),\n    attempt: 1,\n    creditsUsed: 0,\n    previousError: null,\n  },\n}];"
       },
       "id": "code-init-retry",
       "name": "9. Init Attempt State",
@@ -254,7 +254,7 @@
         "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/patch' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, workspacePath: $json.workspacePath, plan: $json.plan, attempt: $json.attempt, maxRetries: $json.maxRetries, creditBudget: $json.creditBudget, creditsUsed: $json.creditsUsed, previousError: $json.previousError }) }}",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, workspacePath: $json.workspacePath, plan: $json.plan, attempt: $json.attempt, maxRetries: $json.maxRetries, creditBudget: $json.creditBudget, creditsUsed: $json.creditsUsed, previousError: $json.previousError, depsInstalled: Boolean($json.depsInstalled) }) }}",
         "options": {
           "timeout": 660000
         }
@@ -378,13 +378,47 @@
     },
     {
       "parameters": {
-        "jsCode": "const state = $('9. Init Attempt State').first().json;\nconst patch = $('🤖 10. Copilot Patch').first().json;\nconst verify = $input.first().json;\n\nreturn [{\n  json: {\n    ok: false,\n    status: 'failed',\n    targetRepo: state.targetRepo,\n    remediationBranch: state.remediationBranch,\n    attempts: patch.attempt,\n    creditsUsed: patch.creditsUsed,\n    creditBudget: patch.creditBudget,\n    reason: 'Verification failed; retry or credit limit reached',\n    failureSummary: verify.failureSummary || patch.error || null,\n  },\n}];"
+        "jsCode": "const state = $('9. Init Attempt State').first().json;\nconst patch = $('🤖 10. Copilot Patch').first().json;\nconst verify = $input.first().json;\n\nreturn [{\n  json: {\n    ok: false,\n    status: 'failed',\n    runId: state.runId,\n    targetRepo: state.targetRepo,\n    remediationBranch: state.remediationBranch,\n    attempts: patch.attempt,\n    creditsUsed: patch.creditsUsed,\n    creditBudget: patch.creditBudget,\n    reason: 'Verification failed; retry or credit limit reached',\n    failureSummary: verify.failureSummary || patch.error || null,\n  },\n}];"
       },
       "id": "code-record-failure",
       "name": "14. Record Failed Remediation",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [1980, 1130]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/finalize' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, targetRepo: $json.targetRepo, reason: $json.failureSummary || $json.reason, attempt: $json.attempts, creditsUsed: $json.creditsUsed, creditBudget: $json.creditBudget }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "http-finalize-repo-fail",
+      "name": "14b. Report Repo Failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1980, 1320]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/finalize' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, message: 'Phase 1 analysis complete' }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "http-finalize-phase1",
+      "name": "5c. Finalize Phase 1 Run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1740, 200]
     },
     {
       "parameters": {
@@ -482,7 +516,17 @@
         [{ "node": "8. Loop Over Repos", "type": "main", "index": 0 }]
       ]
     },
+    "5b. Analysis Summary": {
+      "main": [
+        [{ "node": "5c. Finalize Phase 1 Run", "type": "main", "index": 0 }]
+      ]
+    },
     "14. Record Failed Remediation": {
+      "main": [
+        [{ "node": "14b. Report Repo Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "14b. Report Repo Failure": {
       "main": [
         [{ "node": "8. Loop Over Repos", "type": "main", "index": 0 }]
       ]

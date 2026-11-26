@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { RunsStore } from "../../db/runs-store.ts";
 import { planRemediations } from "../../domain/remediation-plan.ts";
 import {
   ingestVulnerabilities,
@@ -27,6 +28,7 @@ import { createRunId, saveRunArtifact } from "../../shared/runs.ts";
 interface IngestRequestBody {
   source?: string;
   runId?: string;
+  phase?: string;
   persist?: boolean;
   policy?: {
     minSeverity?: string;
@@ -50,6 +52,7 @@ interface PlanRequestBody {
 
 export interface VulnerabilitiesRouteDeps {
   createGitHubClient?: () => GitHubRepoClient;
+  runsStore?: RunsStore;
 }
 
 export function createVulnerabilitiesRoute(
@@ -58,6 +61,7 @@ export function createVulnerabilitiesRoute(
   const route = new Hono();
   const createGitHubClient =
     deps.createGitHubClient ?? (() => new GhCliRepoClient());
+  const runsStore = deps.runsStore;
 
   route.get("/sources", (c) => {
     return c.json({
@@ -118,7 +122,16 @@ export function createVulnerabilitiesRoute(
       ownedScopes: body.policy?.ownedScopes ?? extractOwnedScopes(defaultRules),
     };
 
+    const startMs = performance.now();
     const result = ingestVulnerabilities(adapter, payload, policy);
+    const durationMs = Math.round(performance.now() - startMs);
+
+    runsStore?.recordIngest(runId, {
+      source: adapter.name,
+      totalFindings: result.findings.length,
+      phase: typeof body.phase === "string" ? body.phase : null,
+      durationMs,
+    });
 
     let artifacts: { rawInputPath: string; normalizedOutputPath: string } | undefined;
     if (persist) {
@@ -138,6 +151,7 @@ export function createVulnerabilitiesRoute(
     return c.json({
       ok: true,
       runId,
+      dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
       ...(artifacts ? { artifacts } : {}),
       ...result,
     });
@@ -187,11 +201,15 @@ export function createVulnerabilitiesRoute(
         ? ownershipRulesFromScopes(body.ownedScopes)
         : defaultRules;
 
+    const startMs = performance.now();
+    runsStore?.ensureRun(runId, { currentStage: "plan" });
     const result = await planRemediations(body.findings, {
       ownershipRules,
       github: useGitHub ? createGitHubClient() : undefined,
       strictGitHub,
     });
+    const durationMs = Math.round(performance.now() - startMs);
+    runsStore?.recordPlans(runId, result.plans, { durationMs });
 
     let artifacts: { plansOutputPath: string } | undefined;
     if (persist) {
@@ -206,6 +224,7 @@ export function createVulnerabilitiesRoute(
     return c.json({
       ok: true,
       runId,
+      dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
       ...(artifacts ? { artifacts } : {}),
       ...result,
     });
