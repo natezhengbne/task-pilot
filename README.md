@@ -52,7 +52,7 @@ bun run dev
 bun run dev
 
 # Terminal 2 (in WSL): Start n8n in Docker via Docker Compose (defaults to http://localhost:3456)
-./scripts/start-n8n-docker.sh   # or: docker compose up -d
+./scripts/start-n8n-docker.sh   # or: docker compose -f scripts/docker-compose.yml up -d
 ```
 
 Import `n8n/wiz-remediation.workflow.json` into n8n (`http://localhost:5678`). It is a single-file, vertically layered 3-phase workflow (Row 1: Phase 1 upload/ingest/plan, Row 2: Phase 2 per-repo workspace + Copilot patch/verify retry loop, Row 3: Phase 3 Draft PR / report & final summary).

@@ -2,15 +2,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-cd "${REPO_ROOT}"
-
-docker compose up -d "$@"
+docker compose -f "${SCRIPT_DIR}/docker-compose.yml" up -d "$@"
 
 echo ""
 echo "n8n is running in background:"
 echo "  UI URL : http://localhost:${N8N_PORT:-5678}"
 echo "  API    : ${TASKPILOT_API_URL:-http://localhost:3456}"
-echo "  Logs   : docker compose logs -f n8n"
-echo "  Stop   : docker compose down"
+echo "  Logs   : docker compose -f scripts/docker-compose.yml logs -f n8n"
+echo "  Stop   : docker compose -f scripts/docker-compose.yml down"
