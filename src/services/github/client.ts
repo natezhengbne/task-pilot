@@ -93,12 +93,14 @@ export function classifyGhCliFailure(
   });
 }
 
-export async function checkGhAuthStatus(): Promise<{
+export async function checkGhAuthStatus(
+  exec: typeof runCommand = runCommand,
+): Promise<{
   authenticated: boolean;
   output: string;
 }> {
   try {
-    const res = await runCommand(["gh", "auth", "status"], { timeoutMs: 10_000 });
+    const res = await exec(["gh", "auth", "status"], { timeoutMs: 10_000 });
     const output = (res.stdout || res.stderr).trim();
     return {
       authenticated: res.exitCode === 0 && !res.timedOut,

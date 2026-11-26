@@ -26,7 +26,8 @@ src/
 │   └── routes/
 │       ├── github.ts                  # GET /api/github/status
 │       ├── vulnerabilities.ts         # Phase 1: POST /ingest, POST /plan, GET /sources
-│       └── remediation.ts             # Phase 2 & 3: /preflight, /workspace/prepare, /patch, /verify, /pr
+│       ├── preflight.ts               # Generic runtime preflight: GET/POST /api/preflight
+│       └── remediation.ts             # Phase 2 & 3: /workspace/prepare, /patch, /verify, /pr
 └── shared/                            # Subprocess runner, CLI I/O, .runs/ artifact store
 ```
 

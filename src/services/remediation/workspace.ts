@@ -110,6 +110,12 @@ export async function getWorkspaceGitChanges(
     cwd: workspacePath,
     timeoutMs: 15_000,
   });
+  if (statusRes.timedOut || statusRes.exitCode !== 0) {
+    const detail = (statusRes.stderr || statusRes.stdout).trim();
+    throw new Error(
+      `git status failed in ${workspacePath} (exit ${statusRes.exitCode}${statusRes.timedOut ? ", timed out" : ""}): ${detail || "unknown error"}`,
+    );
+  }
 
   const changedFiles = statusRes.stdout
     .split(/\r?\n/)
@@ -121,6 +127,12 @@ export async function getWorkspaceGitChanges(
     cwd: workspacePath,
     timeoutMs: 15_000,
   });
+  if (diffStatRes.timedOut || diffStatRes.exitCode !== 0) {
+    const detail = (diffStatRes.stderr || diffStatRes.stdout).trim();
+    throw new Error(
+      `git diff --stat failed in ${workspacePath} (exit ${diffStatRes.exitCode}${diffStatRes.timedOut ? ", timed out" : ""}): ${detail || "unknown error"}`,
+    );
+  }
 
   return {
     hasChanges: changedFiles.length > 0,

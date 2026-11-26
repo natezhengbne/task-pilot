@@ -4,6 +4,7 @@ import {
   type GitHubRepoClient,
 } from "../services/github/client.ts";
 import { createGitHubRoute } from "./routes/github.ts";
+import { createPreflightRoute } from "./routes/preflight.ts";
 import { createRemediationRoute } from "./routes/remediation.ts";
 import { createVulnerabilitiesRoute } from "./routes/vulnerabilities.ts";
 import type { CommandRunner } from "../services/remediation/workspace.ts";
@@ -114,6 +115,7 @@ export function createApp(config: AppConfig = {}): Hono {
   });
 
   app.route("/api/github", createGitHubRoute());
+  app.route("/api/preflight", createPreflightRoute({ exec: config.exec }));
   app.route(
     "/api/remediation",
     createRemediationRoute({ exec: config.exec }),

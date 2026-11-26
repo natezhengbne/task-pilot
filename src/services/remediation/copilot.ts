@@ -9,6 +9,14 @@ import {
   type CommandRunner,
 } from "./workspace.ts";
 
+export type CopilotErrorCode =
+  | "COPILOT_CLI_UNAVAILABLE"
+  | "COPILOT_NOT_AUTHENTICATED"
+  | "COPILOT_CLI_TIMEOUT"
+  | "COPILOT_CLI_FAILED"
+  | "BUDGET_EXCEEDED"
+  | "RETRY_LIMIT_REACHED";
+
 export interface CopilotCliStatus {
   available: boolean;
   binary: string;
@@ -54,11 +62,101 @@ export interface RunCopilotPatchResult {
   diffStat: string;
   prompt: string;
   copilotOutput: string;
+  code?: CopilotErrorCode;
   error?: string;
+  hint?: string;
   artifacts?: {
     promptPath: string;
     outputPath: string;
   };
+}
+
+export function classifyCopilotCliFailure(
+  binary: string,
+  output: string,
+  exitCode: number,
+  timedOut: boolean,
+  timeoutMs: number,
+): {
+  code: CopilotErrorCode;
+  httpStatus: 401 | 502 | 503 | 504;
+  error: string;
+  hint: string;
+} {
+  if (timedOut) {
+    return {
+      code: "COPILOT_CLI_TIMEOUT",
+      httpStatus: 504,
+      error: `Copilot CLI timed out after ${timeoutMs}ms.`,
+      hint: "Increase timeoutMs or inspect the workspace for hanging commands.",
+    };
+  }
+
+  const trimmed = output.trim();
+  const lower = trimmed.toLowerCase();
+
+  if (
+    exitCode === 127 ||
+    lower.includes("command not found") ||
+    lower.includes("not recognized as an internal or external command") ||
+    lower.includes("no such file or directory") ||
+    lower.includes("enoent") ||
+    lower.includes("exec format error") ||
+    lower.includes("cannot execute binary file") ||
+    lower.includes("not found in path")
+  ) {
+    return {
+      code: "COPILOT_CLI_UNAVAILABLE",
+      httpStatus: 503,
+      error: `Copilot CLI '${binary}' is unavailable (exit ${exitCode}): ${trimmed.slice(-1000) || "executable not found"}`,
+      hint: "Install GitHub Copilot CLI in this runtime environment (e.g. inside WSL) and ensure 'copilot' is in PATH, or set TASKPILOT_COPILOT_BIN.",
+    };
+  }
+
+  if (
+    lower.includes("not logged in") ||
+    lower.includes("not authenticated") ||
+    lower.includes("authentication required") ||
+    lower.includes("login required") ||
+    lower.includes("unauthorized") ||
+    lower.includes("http 401") ||
+    lower.includes("bad credentials")
+  ) {
+    return {
+      code: "COPILOT_NOT_AUTHENTICATED",
+      httpStatus: 401,
+      error: `Copilot CLI is not authenticated (exit ${exitCode}): ${trimmed.slice(-1000)}`,
+      hint: "Authenticate GitHub Copilot CLI in this runtime environment (e.g. run 'copilot' / 'gh auth login') and retry.",
+    };
+  }
+
+  return {
+    code: "COPILOT_CLI_FAILED",
+    httpStatus: 502,
+    error: `Copilot CLI exited with code ${exitCode}: ${trimmed.slice(-1000) || "(no output)"}`,
+    hint: "Inspect the Copilot CLI output artifact or server logs for details.",
+  };
+}
+
+export function getCopilotPatchHttpStatus(
+  result: RunCopilotPatchResult,
+): 200 | 401 | 429 | 502 | 503 | 504 {
+  if (result.ok) {
+    return 200;
+  }
+  if (result.budgetExceeded || result.retryLimitReached) {
+    return 429;
+  }
+  switch (result.code) {
+    case "COPILOT_CLI_UNAVAILABLE":
+      return 503;
+    case "COPILOT_NOT_AUTHENTICATED":
+      return 401;
+    case "COPILOT_CLI_TIMEOUT":
+      return 504;
+    default:
+      return 502;
+  }
 }
 
 export function getCopilotBinary(): string {
@@ -166,6 +264,7 @@ export async function runCopilotRemediationPatch(
       diffStat: "",
       prompt,
       copilotOutput: "",
+      code: "RETRY_LIMIT_REACHED",
       error: `Retry limit reached (attempt ${attempt} > maxRetries ${maxRetries}).`,
     };
   }
@@ -192,6 +291,7 @@ export async function runCopilotRemediationPatch(
       diffStat: "",
       prompt,
       copilotOutput: "",
+      code: "BUDGET_EXCEEDED",
       error: `Credit budget exhausted (${priorCredits} / ${creditBudget} credits used).`,
     };
   }
@@ -252,10 +352,45 @@ export async function runCopilotRemediationPatch(
       timeoutMs,
     });
   } catch (err) {
+    const durationMs = Math.round(performance.now() - start);
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `Failed to launch Copilot CLI '${binary}': ${msg}. Ensure GitHub Copilot CLI is installed and available in PATH (or set TASKPILOT_COPILOT_BIN).`,
+    const error = `Failed to launch Copilot CLI '${binary}': ${msg}.`;
+    const hint =
+      "Install GitHub Copilot CLI in this runtime environment (e.g. inside WSL) and ensure 'copilot' is in PATH, or set TASKPILOT_COPILOT_BIN.";
+    if (persist) {
+      const promptPath = await saveRunArtifact(input.runId, promptFile, `${prompt}\n`);
+      const outputPath = await saveRunArtifact(input.runId, outputFile, `${error}\n${hint}\n`);
+      artifacts = { promptPath, outputPath };
+    }
+    process.stderr.write(
+      `[copilot] <-- ${input.plan.targetRepo} launch failed (${durationMs}ms): ${msg}\n`,
     );
+    return {
+      ok: false,
+      budgetExceeded: false,
+      retryLimitReached: false,
+      dryRun: false,
+      runId: input.runId,
+      workspacePath: input.workspacePath,
+      attempt,
+      maxRetries,
+      creditsSpentThisAttempt: 0,
+      creditsUsed: priorCredits,
+      creditBudget,
+      creditsRemaining: Math.max(0, creditBudget - priorCredits),
+      exitCode: 127,
+      timedOut: false,
+      durationMs,
+      hasChanges: false,
+      changedFiles: [],
+      diffStat: "",
+      prompt,
+      copilotOutput: msg,
+      code: "COPILOT_CLI_UNAVAILABLE",
+      error,
+      hint,
+      ...(artifacts ? { artifacts } : {}),
+    };
   }
   const durationMs = Math.round(performance.now() - start);
 
@@ -263,7 +398,23 @@ export async function runCopilotRemediationPatch(
     .filter(Boolean)
     .join("\n\n");
 
-  const spent = parseCreditsFromOutput(combinedOutput, creditsPerAttempt);
+  const ok = !res.timedOut && res.exitCode === 0;
+  const failure = ok
+    ? undefined
+    : classifyCopilotCliFailure(
+        binary,
+        combinedOutput,
+        res.exitCode,
+        res.timedOut,
+        timeoutMs,
+      );
+
+  const isEnvError =
+    failure?.code === "COPILOT_CLI_UNAVAILABLE" ||
+    failure?.code === "COPILOT_NOT_AUTHENTICATED";
+  const spent = isEnvError
+    ? 0
+    : parseCreditsFromOutput(combinedOutput, creditsPerAttempt);
   const creditsUsed = priorCredits + spent;
   const creditsRemaining = Math.max(0, creditBudget - creditsUsed);
 
@@ -279,20 +430,13 @@ export async function runCopilotRemediationPatch(
     artifacts = { promptPath, outputPath };
   }
 
-  const ok = !res.timedOut && res.exitCode === 0;
-  const error = res.timedOut
-    ? `Copilot CLI timed out after ${timeoutMs}ms.`
-    : res.exitCode !== 0
-      ? `Copilot CLI exited with code ${res.exitCode}: ${combinedOutput.slice(-1000)}`
-      : undefined;
-
   process.stderr.write(
-    `[copilot] <-- ${input.plan.targetRepo} exit=${res.exitCode} (${durationMs}ms, changedFiles=${gitChanges.changedFiles.length}, credits=${creditsUsed}/${creditBudget})\n`,
+    `[copilot] <-- ${input.plan.targetRepo} exit=${res.exitCode}${failure ? ` code=${failure.code}` : ""} (${durationMs}ms, changedFiles=${gitChanges.changedFiles.length}, credits=${creditsUsed}/${creditBudget})\n`,
   );
 
   return {
     ok,
-    budgetExceeded: creditsUsed >= creditBudget && !ok,
+    budgetExceeded: creditsUsed >= creditBudget && !ok && !isEnvError,
     retryLimitReached: false,
     dryRun: false,
     runId: input.runId,
@@ -311,7 +455,9 @@ export async function runCopilotRemediationPatch(
     diffStat: gitChanges.diffStat,
     prompt,
     copilotOutput: combinedOutput,
-    ...(error ? { error } : {}),
+    ...(failure
+      ? { code: failure.code, error: failure.error, hint: failure.hint }
+      : {}),
     ...(artifacts ? { artifacts } : {}),
   };
 }

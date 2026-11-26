@@ -5,6 +5,7 @@
       "parameters": {
         "formTitle": "TaskPilot Vulnerability Remediation",
         "formDescription": "Upload a vulnerability export (e.g. Wiz GraphQL JSON). Phase is optional and defaults to Phase 3 (Full remediation + Draft PR).",
+        "responseMode": "onReceived",
         "formFields": {
           "values": [
             {
@@ -174,20 +175,34 @@
     },
     {
       "parameters": {
-        "operation": "completion",
-        "completionTitle": "Phase 1 Analysis Complete",
-        "completionMessage": "={{ 'Run ID: ' + $json.runId + '\\nTotal Findings: ' + ($json.summary?.inputFindings ?? 0) + '\\nTarget Repos: ' + ($json.summary?.planCount ?? 0) + '\\n\\n' + ($json.plans || []).map(p => `- ${p.targetRepo} (${p.ownership}, ${p.packageCount} pkgs, ${p.cveCount} CVEs, max ${p.maxSeverity})`).join('\\n') }}",
-        "options": {}
+        "jsCode": "const data = $input.first().json;\nconst plans = data.plans || [];\nconst summary = [\n  'Phase 1 Analysis Complete',\n  `Run ID: ${data.runId}`,\n  `Total Findings: ${data.summary?.inputFindings ?? 0}`,\n  `Target Repos: ${data.summary?.planCount ?? plans.length}`,\n  '',\n  ...plans.map((p) => `- ${p.targetRepo} (${p.ownership}, ${p.packageCount} pkgs, ${p.cveCount} CVEs, max ${p.maxSeverity})`),\n].join('\\n');\n\nreturn [{\n  json: {\n    runId: data.runId,\n    inputFindings: data.summary?.inputFindings ?? 0,\n    planCount: data.summary?.planCount ?? plans.length,\n    summary,\n    plans,\n  },\n}];"
       },
       "id": "form-end-phase1",
-      "name": "5b. Show Analysis Summary",
-      "type": "n8n-nodes-base.form",
-      "typeVersion": 1,
+      "name": "5b. Analysis Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [1480, 200]
     },
     {
       "parameters": {
-        "jsCode": "const form = $('1. Upload Vulnerability Report').first().json;\nconst planResp = $input.first().json;\nconst plans = planResp.plans || [];\nconst maxRetries = Number(form['Max Retries']) > 0 ? Number(form['Max Retries']) : 3;\nconst creditBudget = Number(form['Credit Budget']) > 0 ? Number(form['Credit Budget']) : 30;\nconst verifyDownstream = form['Verify Downstream'] === 'Yes';\nconst phase = form.Phase || 'Phase 3 - Full Remediation + Draft PR';\n\nreturn plans.map((plan) => ({\n  json: {\n    runId: planResp.runId,\n    phase,\n    maxRetries,\n    creditBudget,\n    verifyDownstream,\n    plan,\n  },\n}));"
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/preflight' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ checks: ['gh', 'copilot', 'git', 'npm'] }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "http-preflight-1",
+      "name": "🩺 5a. Preflight Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const form = $('1. Upload Vulnerability Report').first().json;\nconst planResp = $('🔍 4. Plan Remediation Targets').first().json;\nconst plans = planResp.plans || [];\nconst maxRetries = Number(form['Max Retries']) > 0 ? Number(form['Max Retries']) : 3;\nconst creditBudget = Number(form['Credit Budget']) > 0 ? Number(form['Credit Budget']) : 30;\nconst verifyDownstream = form['Verify Downstream'] === 'Yes';\nconst phase = form.Phase || 'Phase 3 - Full Remediation + Draft PR';\n\nreturn plans.map((plan) => ({\n  json: {\n    runId: planResp.runId,\n    phase,\n    maxRetries,\n    creditBudget,\n    verifyDownstream,\n    plan,\n  },\n}));"
       },
       "id": "code-expand-plans",
       "name": "6. Expand Plans per Repo",
@@ -373,15 +388,12 @@
     },
     {
       "parameters": {
-        "operation": "completion",
-        "completionTitle": "Remediation Workflow Complete",
-        "completionMessage": "={{ 'Processed ' + $input.all().length + ' repository remediation(s):\\n\\n' + $input.all().map(i => { const d = i.json; if (d.prUrl) return `- [DRAFT PR] ${d.targetRepo}: ${d.prUrl}`; if (d.dryRun) return `- [VERIFIED / DRY RUN] ${d.targetRepo} (${d.remediationBranch})`; return `- [FAILED] ${d.targetRepo}: ${d.reason || d.error || 'see execution logs'}`; }).join('\\n') }}",
-        "options": {}
+        "jsCode": "const items = $input.all().map((i) => i.json);\nconst lines = items.map((d) => {\n  if (d.prUrl) return `- [DRAFT PR] ${d.targetRepo}: ${d.prUrl}`;\n  if (d.dryRun) return `- [VERIFIED / DRY RUN] ${d.targetRepo} (${d.remediationBranch})`;\n  return `- [FAILED] ${d.targetRepo}: ${d.reason || d.error || 'see execution logs'}`;\n});\nconst summary = `Processed ${items.length} repository remediation(s):\\n\\n${lines.join('\\n')}`;\n\nreturn [{\n  json: {\n    processedCount: items.length,\n    summary,\n    results: items,\n  },\n}];"
       },
       "id": "form-end-remediation",
-      "name": "15. Show Remediation Summary",
-      "type": "n8n-nodes-base.form",
-      "typeVersion": 1,
+      "name": "15. Remediation Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [420, 1130]
     }
   ],
@@ -408,8 +420,13 @@
     },
     "5. Execute Remediation?": {
       "main": [
-        [{ "node": "6. Expand Plans per Repo", "type": "main", "index": 0 }],
-        [{ "node": "5b. Show Analysis Summary", "type": "main", "index": 0 }]
+        [{ "node": "🩺 5a. Preflight Check", "type": "main", "index": 0 }],
+        [{ "node": "5b. Analysis Summary", "type": "main", "index": 0 }]
+      ]
+    },
+    "🩺 5a. Preflight Check": {
+      "main": [
+        [{ "node": "6. Expand Plans per Repo", "type": "main", "index": 0 }]
       ]
     },
     "6. Expand Plans per Repo": {
@@ -419,7 +436,7 @@
     },
     "7. Loop Over Repos": {
       "main": [
-        [{ "node": "15. Show Remediation Summary", "type": "main", "index": 0 }],
+        [{ "node": "15. Remediation Summary", "type": "main", "index": 0 }],
         [{ "node": "📦 8. Prepare Workspace & Branch", "type": "main", "index": 0 }]
       ]
     },

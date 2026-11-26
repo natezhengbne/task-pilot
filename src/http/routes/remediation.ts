@@ -1,9 +1,8 @@
 import { Hono } from "hono";
 import type { RemediationPlan } from "../../domain/remediation-plan.ts";
 import type { RemediationVerificationResult } from "../../domain/remediation.ts";
-import { checkGhAuthStatus } from "../../services/github/client.ts";
 import {
-  checkCopilotCliStatus,
+  getCopilotPatchHttpStatus,
   runCopilotRemediationPatch,
   type RunCopilotPatchInput,
 } from "../../services/remediation/copilot.ts";
@@ -60,55 +59,11 @@ function assertPlan(value: unknown): RemediationPlan {
   return plan as RemediationPlan;
 }
 
-async function checkSimpleToolVersion(
-  cmd: string[],
-  exec: CommandRunner,
-): Promise<{ available: boolean; version: string | null }> {
-  try {
-    const res = await exec(cmd, { timeoutMs: 8_000 });
-    const out = (res.stdout || res.stderr).trim();
-    return {
-      available: res.exitCode === 0 && !res.timedOut,
-      version: out || null,
-    };
-  } catch {
-    return { available: false, version: null };
-  }
-}
-
 export function createRemediationRoute(
   deps: RemediationRouteDeps = {},
 ): Hono {
   const route = new Hono();
   const exec = deps.exec ?? runCommand;
-
-  /**
-   * GET /api/remediation/preflight
-   * Checks host readiness for Phase 2 & 3 (gh auth, copilot CLI, git, npm).
-   */
-  route.get("/preflight", async (c) => {
-    const [gh, copilot, git, npm] = await Promise.all([
-      checkGhAuthStatus(),
-      checkCopilotCliStatus(exec),
-      checkSimpleToolVersion(["git", "--version"], exec),
-      checkSimpleToolVersion(["npm", "--version"], exec),
-    ]);
-
-    const ready = gh.authenticated && copilot.available && git.available && npm.available;
-    return c.json(
-      {
-        ok: ready,
-        ready,
-        tools: {
-          gh,
-          copilot,
-          git,
-          npm,
-        },
-      },
-      ready ? 200 : 503,
-    );
-  });
 
   /**
    * POST /api/remediation/workspace/prepare
@@ -194,7 +149,7 @@ export function createRemediationRoute(
     };
 
     const result = await runCopilotRemediationPatch(input, exec);
-    return c.json(result);
+    return c.json(result, getCopilotPatchHttpStatus(result));
   });
 
   /**
