@@ -1,0 +1,316 @@
+import { Hono } from "hono";
+import type { RemediationPlan } from "../../domain/remediation-plan.ts";
+import type { RemediationVerificationResult } from "../../domain/remediation.ts";
+import { checkGhAuthStatus } from "../../services/github/client.ts";
+import {
+  checkCopilotCliStatus,
+  runCopilotRemediationPatch,
+  type RunCopilotPatchInput,
+} from "../../services/remediation/copilot.ts";
+import {
+  createRemediationDraftPr,
+  type CreateDraftPrInput,
+} from "../../services/remediation/pr.ts";
+import {
+  verifyRemediationWorkspace,
+  type VerifyRemediationInput,
+} from "../../services/remediation/verify.ts";
+import {
+  prepareRemediationWorkspace,
+  type CommandRunner,
+  type PrepareWorkspaceInput,
+} from "../../services/remediation/workspace.ts";
+import { runCommand } from "../../shared/exec.ts";
+import { createRunId } from "../../shared/runs.ts";
+
+export interface RemediationRouteDeps {
+  exec?: CommandRunner;
+}
+
+async function parseJsonObject(
+  rawBody: string,
+): Promise<Record<string, unknown>> {
+  if (!rawBody.trim()) {
+    throw new Error("Invalid JSON body: request body is empty.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Invalid JSON body: ${msg}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Expected a JSON object body.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function assertPlan(value: unknown): RemediationPlan {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Expected a JSON object for field `plan`.");
+  }
+  const plan = value as Partial<RemediationPlan>;
+  if (typeof plan.targetRepo !== "string" || !plan.targetRepo.trim()) {
+    throw new Error("Invalid JSON body: `plan.targetRepo` is required.");
+  }
+  if (!Array.isArray(plan.packages)) {
+    throw new Error("Invalid JSON body: `plan.packages` must be an array.");
+  }
+  return plan as RemediationPlan;
+}
+
+async function checkSimpleToolVersion(
+  cmd: string[],
+  exec: CommandRunner,
+): Promise<{ available: boolean; version: string | null }> {
+  try {
+    const res = await exec(cmd, { timeoutMs: 8_000 });
+    const out = (res.stdout || res.stderr).trim();
+    return {
+      available: res.exitCode === 0 && !res.timedOut,
+      version: out || null,
+    };
+  } catch {
+    return { available: false, version: null };
+  }
+}
+
+export function createRemediationRoute(
+  deps: RemediationRouteDeps = {},
+): Hono {
+  const route = new Hono();
+  const exec = deps.exec ?? runCommand;
+
+  /**
+   * GET /api/remediation/preflight
+   * Checks host readiness for Phase 2 & 3 (gh auth, copilot CLI, git, npm).
+   */
+  route.get("/preflight", async (c) => {
+    const [gh, copilot, git, npm] = await Promise.all([
+      checkGhAuthStatus(),
+      checkCopilotCliStatus(exec),
+      checkSimpleToolVersion(["git", "--version"], exec),
+      checkSimpleToolVersion(["npm", "--version"], exec),
+    ]);
+
+    const ready = gh.authenticated && copilot.available && git.available && npm.available;
+    return c.json(
+      {
+        ok: ready,
+        ready,
+        tools: {
+          gh,
+          copilot,
+          git,
+          npm,
+        },
+      },
+      ready ? 200 : 503,
+    );
+  });
+
+  /**
+   * POST /api/remediation/workspace/prepare
+   * Phase 2 Step 1: Clones `plan.targetRepo` and creates a temporary remediation branch.
+   */
+  route.post("/workspace/prepare", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    const plan = assertPlan(body.plan);
+    const runId =
+      typeof body.runId === "string" && body.runId.trim()
+        ? body.runId.trim()
+        : createRunId("rem");
+
+    const input: PrepareWorkspaceInput = {
+      runId,
+      plan,
+      baseBranch: typeof body.baseBranch === "string" ? body.baseBranch : undefined,
+      branchPrefix:
+        typeof body.branchPrefix === "string" ? body.branchPrefix : undefined,
+      remediationBranch:
+        typeof body.remediationBranch === "string"
+          ? body.remediationBranch
+          : undefined,
+      reuseExisting:
+        typeof body.reuseExisting === "boolean" ? body.reuseExisting : undefined,
+      timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
+    };
+
+    const result = await prepareRemediationWorkspace(input, exec);
+    return c.json({
+      ok: true,
+      ...result,
+      plan,
+    });
+  });
+
+  /**
+   * POST /api/remediation/patch
+   * Phase 2 Step 2: Runs GitHub Copilot CLI inside the workspace with retry & credit limits.
+   */
+  route.post("/patch", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    const plan = assertPlan(body.plan);
+    const workspacePath =
+      typeof body.workspacePath === "string" ? body.workspacePath.trim() : "";
+    const dryRun = Boolean(body.dryRun);
+    if (!workspacePath && !dryRun) {
+      return c.json(
+        { ok: false, error: "Field `workspacePath` is required." },
+        400,
+      );
+    }
+
+    const runId =
+      typeof body.runId === "string" && body.runId.trim()
+        ? body.runId.trim()
+        : createRunId("rem");
+
+    const input: RunCopilotPatchInput = {
+      runId,
+      workspacePath,
+      plan,
+      attempt: typeof body.attempt === "number" ? body.attempt : undefined,
+      maxRetries: typeof body.maxRetries === "number" ? body.maxRetries : undefined,
+      creditBudget:
+        typeof body.creditBudget === "number" ? body.creditBudget : undefined,
+      creditsUsed:
+        typeof body.creditsUsed === "number" ? body.creditsUsed : undefined,
+      creditsPerAttempt:
+        typeof body.creditsPerAttempt === "number"
+          ? body.creditsPerAttempt
+          : undefined,
+      previousError:
+        typeof body.previousError === "string" ? body.previousError : null,
+      model: typeof body.model === "string" ? body.model : undefined,
+      extraInstructions:
+        typeof body.extraInstructions === "string"
+          ? body.extraInstructions
+          : undefined,
+      timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
+      dryRun,
+      persist: typeof body.persist === "boolean" ? body.persist : true,
+    };
+
+    const result = await runCopilotRemediationPatch(input, exec);
+    return c.json(result);
+  });
+
+  /**
+   * POST /api/remediation/verify
+   * Phase 2 Step 3: Verifies git diff, lockfile upgrade satisfaction, repo build/test,
+   * and optional downstream consumer validation.
+   */
+  route.post("/verify", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    const plan = assertPlan(body.plan);
+    const workspacePath =
+      typeof body.workspacePath === "string" ? body.workspacePath.trim() : "";
+    if (!workspacePath) {
+      return c.json(
+        { ok: false, error: "Field `workspacePath` is required." },
+        400,
+      );
+    }
+
+    const runId =
+      typeof body.runId === "string" && body.runId.trim()
+        ? body.runId.trim()
+        : createRunId("rem");
+
+    const input: VerifyRemediationInput = {
+      runId,
+      workspacePath,
+      plan,
+      commands: Array.isArray(body.commands)
+        ? body.commands.filter((x): x is string => typeof x === "string")
+        : undefined,
+      requireChanges:
+        typeof body.requireChanges === "boolean" ? body.requireChanges : undefined,
+      verifyLockfile:
+        typeof body.verifyLockfile === "boolean" ? body.verifyLockfile : undefined,
+      verifyDownstream:
+        typeof body.verifyDownstream === "boolean"
+          ? body.verifyDownstream
+          : undefined,
+      downstreamRepos: Array.isArray(body.downstreamRepos)
+        ? body.downstreamRepos.filter((x): x is string => typeof x === "string")
+        : undefined,
+      commandTimeoutMs:
+        typeof body.commandTimeoutMs === "number"
+          ? body.commandTimeoutMs
+          : undefined,
+      persist: typeof body.persist === "boolean" ? body.persist : true,
+    };
+
+    const result = await verifyRemediationWorkspace(input, exec);
+    return c.json({
+      ok: true,
+      runId,
+      workspacePath,
+      ...result,
+    });
+  });
+
+  /**
+   * POST /api/remediation/pr
+   * Phase 3: Commits verified changes, pushes temporary branch, and opens a Draft PR
+   * (or generates only the Markdown report when `dryRun: true`).
+   */
+  route.post("/pr", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    const plan = assertPlan(body.plan);
+    const remediationBranch =
+      typeof body.remediationBranch === "string"
+        ? body.remediationBranch.trim()
+        : "";
+    if (!remediationBranch) {
+      return c.json(
+        { ok: false, error: "Field `remediationBranch` is required." },
+        400,
+      );
+    }
+
+    const dryRun = Boolean(body.dryRun);
+    const workspacePath =
+      typeof body.workspacePath === "string" ? body.workspacePath.trim() : "";
+    if (!workspacePath && !dryRun) {
+      return c.json(
+        { ok: false, error: "Field `workspacePath` is required." },
+        400,
+      );
+    }
+
+    const runId =
+      typeof body.runId === "string" && body.runId.trim()
+        ? body.runId.trim()
+        : createRunId("rem");
+
+    const input: CreateDraftPrInput = {
+      runId,
+      workspacePath,
+      plan,
+      remediationBranch,
+      baseBranch: typeof body.baseBranch === "string" ? body.baseBranch : undefined,
+      title: typeof body.title === "string" ? body.title : undefined,
+      commitMessage:
+        typeof body.commitMessage === "string" ? body.commitMessage : undefined,
+      verification:
+        body.verification && typeof body.verification === "object"
+          ? (body.verification as RemediationVerificationResult)
+          : null,
+      copilotSummary:
+        typeof body.copilotSummary === "string" ? body.copilotSummary : null,
+      draft: typeof body.draft === "boolean" ? body.draft : true,
+      dryRun,
+      persist: typeof body.persist === "boolean" ? body.persist : true,
+      timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
+    };
+
+    const result = await createRemediationDraftPr(input, exec);
+    return c.json(result);
+  });
+
+  return route;
+}

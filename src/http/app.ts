@@ -4,11 +4,14 @@ import {
   type GitHubRepoClient,
 } from "../services/github/client.ts";
 import { createGitHubRoute } from "./routes/github.ts";
+import { createRemediationRoute } from "./routes/remediation.ts";
 import { createVulnerabilitiesRoute } from "./routes/vulnerabilities.ts";
+import type { CommandRunner } from "../services/remediation/workspace.ts";
 
 export interface AppConfig {
   apiToken?: string;
   createGitHubClient?: () => GitHubRepoClient;
+  exec?: CommandRunner;
   /** Enables request/response logging to stderr (defaults to true outside tests). */
   enableLogging?: boolean;
 }
@@ -19,7 +22,24 @@ function summarizeBody(raw: string): string {
   try {
     const parsed = JSON.parse(trimmed) as Record<string, unknown>;
     const summary: Record<string, unknown> = {};
-    for (const key of ["ok", "code", "error", "hint", "runId", "source", "useGitHub", "strictGitHub"]) {
+    for (const key of [
+      "ok",
+      "code",
+      "error",
+      "hint",
+      "runId",
+      "source",
+      "useGitHub",
+      "strictGitHub",
+      "targetRepo",
+      "remediationBranch",
+      "attempt",
+      "creditsUsed",
+      "creditBudget",
+      "passed",
+      "dryRun",
+      "prUrl",
+    ]) {
       if (parsed[key] !== undefined) summary[key] = parsed[key];
     }
     if (Array.isArray(parsed.findings)) summary.findingsCount = parsed.findings.length;
@@ -94,6 +114,10 @@ export function createApp(config: AppConfig = {}): Hono {
   });
 
   app.route("/api/github", createGitHubRoute());
+  app.route(
+    "/api/remediation",
+    createRemediationRoute({ exec: config.exec }),
+  );
   app.route(
     "/api/vulnerabilities",
     createVulnerabilitiesRoute({ createGitHubClient: config.createGitHubClient }),
