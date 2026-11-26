@@ -39,7 +39,7 @@ bun run typecheck
 # Terminal 1: Start TaskPilot HTTP API on http://127.0.0.1:3456
 bun run dev
 
-# Terminal 2: Start n8n locally (v2.49.6; workflow uses only v3-compatible HTTP/Form nodes)
+# Terminal 2: Start n8n locally (latest; workflow uses only v3-compatible HTTP/Form nodes)
 .\scripts\start-n8n.ps1
 ```
 

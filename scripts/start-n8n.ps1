@@ -11,11 +11,11 @@ if (-not $env:TASKPILOT_API_URL) {
   $env:TASKPILOT_API_URL = "http://127.0.0.1:3456"
 }
 
-Write-Host "Starting n8n v2.49.6 natively on Windows (for local dev; workflow is v3-compatible)..."
+Write-Host "Starting n8n (latest) natively on Windows (for local dev; workflow is v3-compatible)..."
 Write-Host "  n8n Data        : $n8nDataDir"
 Write-Host "  TaskPilot API   : $env:TASKPILOT_API_URL"
 Write-Host "  n8n UI URL      : http://localhost:5678"
 Write-Host ""
 Write-Host "Make sure TaskPilot API is running in another terminal: bun run dev"
 
-npx --yes n8n@2.49.6 start
+npx --yes n8n@latest start
