@@ -1,0 +1,140 @@
+{
+  "name": "Vulnerability Remediation - Submit & Plan (v2 & v3 Compatible)",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Vulnerability Remediation",
+        "formDescription": "Upload a vulnerability export (e.g. Wiz GraphQL JSON) to normalize findings and resolve owning repositories via GitHub lockfiles.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Report File",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".json",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Source",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  { "option": "wiz-graphql" }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Min Severity",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  { "option": "HIGH" },
+                  { "option": "CRITICAL" },
+                  { "option": "MEDIUM" },
+                  { "option": "LOW" }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Owned Scopes",
+              "fieldType": "text",
+              "placeholder": "@your-org/ (optional; defaults to config/ownership.json)",
+              "requiredField": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "form-trigger-1",
+      "name": "1. Upload Vulnerability Report",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [220, 180],
+      "webhookId": "vulnerability-remediation-upload"
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "binaryPropertyName": "Report_File",
+        "destinationKey": "reportPayload",
+        "options": {}
+      },
+      "id": "extract-json-1",
+      "name": "2. Extract JSON from File",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [500, 180]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:3456/api/vulnerabilities/ingest",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: $('1. Upload Vulnerability Report').item.json.Source || 'wiz-graphql', runId: 'n8n-' + $execution.id, policy: { minSeverity: $('1. Upload Vulnerability Report').item.json['Min Severity'] || 'HIGH', ...($('1. Upload Vulnerability Report').item.json['Owned Scopes'] ? { ownedScopes: $('1. Upload Vulnerability Report').item.json['Owned Scopes'].split(',').map(s => s.trim()).filter(Boolean) } : {}) }, payload: $json.reportPayload }) }}",
+        "options": {}
+      },
+      "id": "http-submit-1",
+      "name": "3. Submit Vulnerabilities",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:3456/api/vulnerabilities/plan",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, useGitHub: true, ownedScopes: $json.policy.ownedScopes, findings: $json.findings }) }}",
+        "options": {}
+      },
+      "id": "http-plan-1",
+      "name": "4. Plan Remediation Targets (GitHub Lockfile)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 620]
+    }
+  ],
+  "connections": {
+    "1. Upload Vulnerability Report": {
+      "main": [
+        [
+          {
+            "node": "2. Extract JSON from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Extract JSON from File": {
+      "main": [
+        [
+          {
+            "node": "3. Submit Vulnerabilities",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Submit Vulnerabilities": {
+      "main": [
+        [
+          {
+            "node": "4. Plan Remediation Targets (GitHub Lockfile)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

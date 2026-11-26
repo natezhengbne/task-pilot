@@ -1,0 +1,503 @@
+import type { GitHubRepoClient } from "../services/github/client.ts";
+import {
+  analyzePackageLock,
+  classifySemverUpgrade,
+  maxSemverVersion,
+  resolvePackageOwnership,
+  type LockfileStrategy,
+  type OwnershipRules,
+  type UpgradeKind,
+} from "../services/npm/lockfile.ts";
+import {
+  SEVERITY_RANK,
+  type Severity,
+  type VulnerabilityFinding,
+} from "./vulnerability.ts";
+
+export interface CVEInfo {
+  name: string;
+  severity: Severity;
+}
+
+export type AttributionSource = "lockfile" | "source-hint" | "consumer-fallback";
+
+export interface RemediationPackagePlan {
+  component: string;
+  version: string;
+  fixVersion: string | null;
+  filePath: string | null;
+  severity: Severity;
+  upgradeKind: UpgradeKind;
+  strategy: LockfileStrategy;
+  attributionSource: AttributionSource;
+  paths: string[][];
+  consumers: string[];
+  rootComponents: string[];
+  cves: string[];
+  cveDetails: CVEInfo[];
+  findingIds: string[];
+}
+
+export interface RemediationPlan {
+  dedupKey: string;
+  targetRepo: string;
+  branch: string;
+  ownership: "owned-library" | "consumer-repo";
+  maxSeverity: Severity;
+  packageCount: number;
+  cveCount: number;
+  findingCount: number;
+  consumers: string[];
+  rootComponents: string[];
+  packages: RemediationPackagePlan[];
+  cves: string[];
+  cveDetails: CVEInfo[];
+  findingIds: string[];
+}
+
+export interface PlanRemediationsOptions {
+  ownershipRules?: OwnershipRules;
+  github?: GitHubRepoClient;
+  /**
+   * When true (default when `github` is supplied), GitHub CLI/API errors fail
+   * fast instead of silently falling back to source hints, so n8n highlights
+   * the step in red with the exact error and fix hint.
+   */
+  strictGitHub?: boolean;
+}
+
+export interface LockfileWarning {
+  repository: string;
+  branch: string;
+  filePath: string;
+  error: string;
+}
+
+export interface PlanRemediationsResult {
+  plannedAt: string;
+  usedGitHub: boolean;
+  summary: {
+    inputFindings: number;
+    planCount: number;
+    ownedLibraryPlans: number;
+    consumerRepoPlans: number;
+    lockfileWarningCount: number;
+  };
+  plans: RemediationPlan[];
+  lockfileWarnings: LockfileWarning[];
+}
+
+interface ConsumerGroup {
+  consumerRepo: string;
+  branch: string;
+  component: string;
+  version: string;
+  fixVersion: string;
+  filePath: string;
+  findings: VulnerabilityFinding[];
+}
+
+interface ResolvedConsumerAttribution {
+  targetRepos: string[];
+  attributionSource: AttributionSource;
+  upgradeKind: UpgradeKind;
+  strategy: LockfileStrategy;
+  paths: string[][];
+}
+
+interface UpstreamPackageAccumulator {
+  key: string;
+  component: string;
+  version: string;
+  fixVersion: string;
+  filePath: string;
+  maxSeverity: Severity;
+  upgradeKind: UpgradeKind;
+  strategy: LockfileStrategy;
+  attributionSource: AttributionSource;
+  paths: string[][];
+  consumers: Set<string>;
+  rootComponents: Set<string>;
+  cves: Set<string>;
+  cveSeverities: Map<string, Severity>;
+  findingIds: Set<string>;
+}
+
+interface RepoPlanAccumulator {
+  targetRepo: string;
+  branch: string;
+  packages: Map<string, UpstreamPackageAccumulator>;
+}
+
+function higherSeverity(a: Severity, b: Severity): Severity {
+  return SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b;
+}
+
+function sortCVEInfo(a: CVEInfo, b: CVEInfo): number {
+  const diff = SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
+  return diff !== 0 ? diff : a.name.localeCompare(b.name);
+}
+
+function sha256HexShort(input: string): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(input);
+  return hasher.digest("hex").slice(0, 16);
+}
+
+/**
+ * Resolves a batch of standardized `VulnerabilityFinding[]` into consolidated
+ * repository-level `RemediationPlan[]` tasks.
+ *
+ * When a `GitHubRepoClient` is supplied, fetches each consumer repo's exact
+ * `package-lock.json` at HEAD SHA to trace real dependency chains and attribute
+ * each vulnerability to the deepest owned library repository.
+ */
+export async function planRemediations(
+  findings: VulnerabilityFinding[],
+  options: PlanRemediationsOptions = {},
+): Promise<PlanRemediationsResult> {
+  const rules: OwnershipRules = options.ownershipRules ?? {};
+  const github = options.github;
+  const strictGitHub = options.strictGitHub ?? true;
+
+  // Stage 1: Group per (consumerRepo, branch, component, version)
+  const consumerGroups = new Map<string, ConsumerGroup>();
+  for (const f of findings) {
+    const repo = f.detectedIn.repository.trim().replace(/^\/+|\/+$/g, "");
+    const branch = f.detectedIn.branch?.trim() || "main";
+    const component = f.packageName.trim();
+    if (!repo || !component) continue;
+
+    const version = f.installedVersion.trim();
+    const fixVersion = (f.recommendedVersion ?? f.fixedVersion ?? "").trim();
+    const filePath = f.detectedIn.manifestPath?.trim() || "/package-lock.json";
+    const keyVer = version || fixVersion;
+    const ck = `${repo}:${branch}:${component}@${keyVer}`;
+
+    let cg = consumerGroups.get(ck);
+    if (!cg) {
+      cg = {
+        consumerRepo: repo,
+        branch,
+        component,
+        version,
+        fixVersion,
+        filePath,
+        findings: [],
+      };
+      consumerGroups.set(ck, cg);
+    } else {
+      cg.fixVersion = maxSemverVersion(cg.fixVersion, fixVersion);
+    }
+    cg.findings.push(f);
+  }
+
+  // Per-request lockfile cache & warning dedupe
+  const lockfileCache = new Map<string, string | null>();
+  const lockfileWarnings: LockfileWarning[] = [];
+
+  async function fetchLockfile(
+    repo: string,
+    branch: string,
+    filePath: string,
+  ): Promise<string | null> {
+    if (!github) return null;
+    const cacheKey = `${repo}@${branch}:${filePath}`;
+    if (lockfileCache.has(cacheKey)) {
+      return lockfileCache.get(cacheKey) ?? null;
+    }
+
+    try {
+      const sha = await github.getBranchSha(repo, branch);
+      const content = await github.getFileAtSha(repo, sha, filePath);
+      lockfileCache.set(cacheKey, content);
+      return content;
+    } catch (err) {
+      if (strictGitHub) {
+        throw err;
+      }
+      lockfileCache.set(cacheKey, null);
+      lockfileWarnings.push({
+        repository: repo,
+        branch,
+        filePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  async function resolveAttribution(
+    cg: ConsumerGroup,
+  ): Promise<ResolvedConsumerAttribution> {
+    let paths: string[][] = [];
+    let upgradeKind: UpgradeKind = classifySemverUpgrade(cg.version, cg.fixVersion);
+    let strategy: LockfileStrategy = "needs_review";
+
+    // 1. Live lockfile attribution when GitHub client is available
+    const lockText = await fetchLockfile(cg.consumerRepo, cg.branch, cg.filePath);
+    if (lockText) {
+      try {
+        const analysis = analyzePackageLock(
+          lockText,
+          cg.consumerRepo,
+          cg.component,
+          cg.version,
+          cg.fixVersion,
+          rules,
+        );
+        paths = analysis.paths;
+        upgradeKind = analysis.upgradeKind;
+        strategy = analysis.strategy;
+
+        if (analysis.upstreams.length > 0) {
+          return {
+            targetRepos: [...new Set(analysis.upstreams.map((u) => u.repo))].sort(),
+            attributionSource: "lockfile",
+            upgradeKind,
+            strategy,
+            paths,
+          };
+        }
+      } catch (err) {
+        lockfileWarnings.push({
+          repository: cg.consumerRepo,
+          branch: cg.branch,
+          filePath: cg.filePath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // 2. Source-provided `introducedBy` (e.g. Wiz rootComponent) matched against OwnershipRules
+    const hinted = new Set<string>();
+    for (const f of cg.findings) {
+      const intro = f.dependency.introducedBy?.trim();
+      if (intro) {
+        const ownerRepo = resolvePackageOwnership(intro, rules);
+        if (ownerRepo) {
+          hinted.add(ownerRepo);
+        }
+      }
+    }
+    if (hinted.size > 0) {
+      return {
+        targetRepos: [...hinted].sort(),
+        attributionSource: "source-hint",
+        upgradeKind,
+        strategy:
+          upgradeKind === "major"
+            ? "major_upgrade_requires_approval"
+            : "upgrade_upstream",
+        paths,
+      };
+    }
+
+    // 3. Fallback to the consumer repository itself (e.g. third-party transitive dep like `ahooks`)
+    return {
+      targetRepos: [cg.consumerRepo],
+      attributionSource: "consumer-fallback",
+      upgradeKind,
+      strategy,
+      paths,
+    };
+  }
+
+  // Stage 2: Consolidate all vulnerable packages per (targetRepo, branch)
+  const repoGroups = new Map<string, RepoPlanAccumulator>();
+  const sortedConsumerKeys = [...consumerGroups.keys()].sort();
+
+  for (const ck of sortedConsumerKeys) {
+    const cg = consumerGroups.get(ck)!;
+    const attr = await resolveAttribution(cg);
+    const keyVer = cg.version || cg.fixVersion;
+
+    for (const targetRepo of attr.targetRepos) {
+      const rk = `${targetRepo}:${cg.branch}`;
+      let rg = repoGroups.get(rk);
+      if (!rg) {
+        rg = {
+          targetRepo,
+          branch: cg.branch,
+          packages: new Map(),
+        };
+        repoGroups.set(rk, rg);
+      }
+
+      const pk = `${cg.component}@${keyVer}`;
+      let acc = rg.packages.get(pk);
+      if (!acc) {
+        acc = {
+          key: pk,
+          component: cg.component,
+          version: cg.version,
+          fixVersion: cg.fixVersion,
+          filePath: cg.filePath,
+          maxSeverity: "UNKNOWN",
+          upgradeKind: attr.upgradeKind,
+          strategy: attr.strategy,
+          attributionSource: attr.attributionSource,
+          paths: attr.paths,
+          consumers: new Set(),
+          rootComponents: new Set(),
+          cves: new Set(),
+          cveSeverities: new Map(),
+          findingIds: new Set(),
+        };
+        rg.packages.set(pk, acc);
+      } else {
+        acc.fixVersion = maxSemverVersion(acc.fixVersion, cg.fixVersion);
+        if (acc.paths.length === 0 && attr.paths.length > 0) {
+          acc.paths = attr.paths;
+        }
+      }
+
+      acc.consumers.add(cg.consumerRepo);
+      for (const f of cg.findings) {
+        acc.maxSeverity = higherSeverity(acc.maxSeverity, f.severity);
+        const intro = f.dependency.introducedBy?.trim();
+        if (intro && intro !== cg.component) {
+          acc.rootComponents.add(intro);
+        }
+        if (f.cve) {
+          acc.cves.add(f.cve);
+          const prevSev = acc.cveSeverities.get(f.cve) ?? "UNKNOWN";
+          acc.cveSeverities.set(f.cve, higherSeverity(prevSev, f.severity));
+        }
+        if (f.id) {
+          acc.findingIds.add(f.id);
+        }
+      }
+    }
+  }
+
+  // Stage 3: Materialize deterministic RemediationPlan[]
+  const plans: RemediationPlan[] = [];
+  for (const rk of [...repoGroups.keys()].sort()) {
+    const rg = repoGroups.get(rk)!;
+    const allConsumers = new Set<string>();
+    const allRootComponents = new Set<string>();
+    const allCVEs = new Set<string>();
+    const allCVESeverities = new Map<string, Severity>();
+    const allFindingIds = new Set<string>();
+    let maxSeverity: Severity = "UNKNOWN";
+
+    const pkgPlans: RemediationPackagePlan[] = [];
+    const dedupParts: string[] = [];
+
+    for (const pk of [...rg.packages.keys()].sort()) {
+      const acc = rg.packages.get(pk)!;
+      maxSeverity = higherSeverity(maxSeverity, acc.maxSeverity);
+
+      const consumers = [...acc.consumers].sort();
+      for (const c of consumers) allConsumers.add(c);
+
+      const rootComponents = [...acc.rootComponents].sort();
+      for (const r of rootComponents) allRootComponents.add(r);
+
+      const cves = [...acc.cves].sort();
+      const cveDetails: CVEInfo[] = cves
+        .map((name) => {
+          allCVEs.add(name);
+          const sev = acc.cveSeverities.get(name) ?? "UNKNOWN";
+          const prev = allCVESeverities.get(name) ?? "UNKNOWN";
+          allCVESeverities.set(name, higherSeverity(prev, sev));
+          return { name, severity: sev };
+        })
+        .sort(sortCVEInfo);
+
+      const findingIds = [...acc.findingIds].sort();
+      for (const id of findingIds) allFindingIds.add(id);
+
+      dedupParts.push(`${acc.key}->${acc.fixVersion}`);
+      pkgPlans.push({
+        component: acc.component,
+        version: acc.version,
+        fixVersion: acc.fixVersion || null,
+        filePath: acc.filePath || null,
+        severity: acc.maxSeverity,
+        upgradeKind: acc.upgradeKind,
+        strategy: acc.strategy,
+        attributionSource: acc.attributionSource,
+        paths: acc.paths,
+        consumers,
+        rootComponents,
+        cves,
+        cveDetails,
+        findingIds,
+      });
+    }
+
+    pkgPlans.sort(
+      (a, b) =>
+        SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity] ||
+        a.component.localeCompare(b.component) ||
+        a.version.localeCompare(b.version),
+    );
+
+    let dedupKey: string;
+    if (pkgPlans.length === 1) {
+      const p = pkgPlans[0]!;
+      const kv = p.version || p.fixVersion || "unknown";
+      dedupKey =
+        rg.branch === "main"
+          ? `remediate:${rg.targetRepo}:${p.component}@${kv}`
+          : `remediate:${rg.targetRepo}:${rg.branch}:${p.component}@${kv}`;
+    } else {
+      dedupKey = `remediate:${rg.targetRepo}:${rg.branch}:batch-${sha256HexShort(dedupParts.join("|"))}`;
+    }
+
+    const consumers = [...allConsumers].sort();
+    const ownership: "owned-library" | "consumer-repo" = consumers.some(
+      (c) => c.toLowerCase() !== rg.targetRepo.toLowerCase(),
+    )
+      ? "owned-library"
+      : "consumer-repo";
+
+    const cves = [...allCVEs].sort();
+    const cveDetails: CVEInfo[] = cves
+      .map((name) => ({
+        name,
+        severity: allCVESeverities.get(name) ?? "UNKNOWN",
+      }))
+      .sort(sortCVEInfo);
+
+    plans.push({
+      dedupKey,
+      targetRepo: rg.targetRepo,
+      branch: rg.branch,
+      ownership,
+      maxSeverity,
+      packageCount: pkgPlans.length,
+      cveCount: cves.length,
+      findingCount: allFindingIds.size,
+      consumers,
+      rootComponents: [...allRootComponents].sort(),
+      packages: pkgPlans,
+      cves,
+      cveDetails,
+      findingIds: [...allFindingIds].sort(),
+    });
+  }
+
+  plans.sort(
+    (a, b) =>
+      SEVERITY_RANK[b.maxSeverity] - SEVERITY_RANK[a.maxSeverity] ||
+      b.findingCount - a.findingCount ||
+      a.targetRepo.localeCompare(b.targetRepo),
+  );
+
+  return {
+    plannedAt: new Date().toISOString(),
+    usedGitHub: Boolean(github),
+    summary: {
+      inputFindings: findings.length,
+      planCount: plans.length,
+      ownedLibraryPlans: plans.filter((p) => p.ownership === "owned-library").length,
+      consumerRepoPlans: plans.filter((p) => p.ownership === "consumer-repo").length,
+      lockfileWarningCount: lockfileWarnings.length,
+    },
+    plans,
+    lockfileWarnings,
+  };
+}

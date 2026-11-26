@@ -1,0 +1,8 @@
+{
+  "ownedScopes": {
+    "@your-org/": "your-org"
+  },
+  "ownedPackages": {
+    "@your-org/special-pkg": "your-org/actual-repo-name"
+  }
+}

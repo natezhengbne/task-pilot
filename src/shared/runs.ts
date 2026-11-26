@@ -1,0 +1,34 @@
+import { mkdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
+
+const RUNS_ROOT = resolve(process.cwd(), ".runs");
+
+function sanitizeSegment(value: string): string {
+  const cleaned = value.replace(/[^a-zA-Z0-9._-]/g, "_").trim();
+  return cleaned.length > 0 ? cleaned : "default";
+}
+
+export function createRunId(prefix = "run"): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const rand = crypto.randomUUID().slice(0, 8);
+  return `${prefix}-${stamp}-${rand}`;
+}
+
+export async function ensureRunDir(runId: string): Promise<string> {
+  const safeId = sanitizeSegment(runId);
+  const dir = join(RUNS_ROOT, safeId);
+  await mkdir(dir, { recursive: true });
+  return dir;
+}
+
+export async function saveRunArtifact(
+  runId: string,
+  filename: string,
+  content: string | Uint8Array,
+): Promise<string> {
+  const dir = await ensureRunDir(runId);
+  const safeFile = sanitizeSegment(filename);
+  const fullPath = join(dir, safeFile);
+  await Bun.write(fullPath, content);
+  return fullPath;
+}

@@ -1,0 +1,6 @@
+node_modules/
+.runs/
+.n8n/
+config/ownership.json
+*.log
+.DS_Store
