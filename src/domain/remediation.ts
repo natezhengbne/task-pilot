@@ -131,17 +131,20 @@ export function buildCopilotRemediationPrompt(
     );
   } else {
     lines.push(
-      "3. Dependencies were intentionally NOT installed before patching (corporate registries such as JFrog Xray/Curation may block Critical vulnerable versions with HTTP 403). Do NOT run `npm install` before editing `package.json`. First update `package.json` to eliminate the vulnerable version(s), then refresh the lockfile with `npm install --package-lock-only --no-audit --no-fund` so no blocked vulnerable versions remain, and finally run `npm install --no-audit --no-fund` (preserve any existing cached `node_modules` unless corrupted). If `npm install` still fails with HTTP 403 on an unrelated package not listed above, report the exact blocked package(s) and version(s) clearly.",
+      "3. Dependencies were intentionally NOT installed before patching (corporate registries such as JFrog Xray/Curation may block Critical vulnerable versions with HTTP 403). Do NOT run `npm install` before editing `package.json`. First update `package.json` to eliminate the vulnerable version(s), then refresh the lockfile with `npm install --package-lock-only --no-audit --no-fund` so no blocked vulnerable versions remain, and finally run `npm install --no-audit --no-fund` (preserve any existing cached `node_modules` unless corrupted).",
     );
   }
-  lines.push("4. Keep changes minimal and strictly scoped to resolving these CVEs. Do NOT disable, skip, or delete existing tests or linters.");
+  lines.push(
+    "4. **Handling unrelated HTTP 403 registry blocks**: If `npm install` fails with HTTP 403 (e.g. JFrog Curation blocking an older transitive dependency not listed above), you MAY add a minimal npm `overrides` entry to bump that blocked transitive package to the smallest unblocked safe version **within the same major version** (e.g. `7.29.0` -> `7.30.1`), regenerate `package-lock.json`, and re-run `npm install`. Do NOT perform cross-major upgrades on unrelated packages and do NOT bump direct dependencies across majors. If no same-major unblocked version exists, stop and report the exact blocked package(s) and version(s) clearly.",
+  );
+  lines.push("5. Keep changes minimal and strictly scoped to resolving these CVEs (plus any same-major 403 unblock above). Do NOT disable, skip, or delete existing tests or linters.");
 
   if (options.detectedScripts && options.detectedScripts.length > 0) {
     lines.push(
-      `5. Before finishing, verify the repository using available scripts: ${options.detectedScripts.map((s) => `\`npm run ${s}\``).join(", ")}.`,
+      `6. Before finishing, verify the repository using available scripts: ${options.detectedScripts.map((s) => `\`npm run ${s}\``).join(", ")}.`,
     );
   } else {
-    lines.push("5. Before finishing, run the repository's build/test scripts if present.");
+    lines.push("6. Before finishing, run the repository's build/test scripts if present.");
   }
 
   if (options.extraInstructions?.trim()) {
@@ -161,7 +164,7 @@ export function buildCopilotRemediationPrompt(
 
   lines.push("");
   lines.push(
-    "When finished, summarize the exact dependency changes made, why each change was chosen, and the verification commands you ran.",
+    "When finished, summarize the exact dependency changes made, why each change was chosen, and the verification commands you ran. If you had to add any same-major `overrides` to unblock an unrelated HTTP 403 registry error, list them under a separate `### Additional Registry-Blocked Dependencies Upgraded` section with old -> new version and reason so the Draft PR reviewer can audit them easily.",
   );
 
   return lines.join("\n");

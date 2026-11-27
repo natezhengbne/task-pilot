@@ -58,12 +58,16 @@ describe("http/dashboard", () => {
       const listHtml = await listRes.text();
       expect(listHtml).toContain("TaskPilot Runs");
       expect(listHtml).toContain("n8n-101");
+      expect(listHtml).toContain("Wiz Remediation");
+      expect(listHtml).toContain("/runs/stream");
+      expect(listHtml).toContain("shell-quote");
 
       const detailRes = await app.request("/runs/n8n-101");
       expect(detailRes.status).toBe(200);
       const detailHtml = await detailRes.text();
       expect(detailHtml).toContain("n8n-101");
       expect(detailHtml).toContain("/runs/n8n-101/stream");
+      expect(detailHtml).toContain("view-wiz-remediation");
     } finally {
       runsStore.close();
     }
@@ -107,10 +111,58 @@ describe("http/dashboard", () => {
       await finalizePromise;
 
       expect(sseText).toContain("event: snapshot");
+      expect(sseText).toContain('"runType":"wiz-remediation"');
       expect(sseText).toContain('"targetRepo":"acme-org/shared-utils"');
+      expect(sseText).toContain('"component":"shell-quote"');
+      expect(sseText).toContain('"CVE-2026-102422"');
       expect(sseText).toContain("Verification failed after 3 retries");
       expect(sseText).toContain("event: done");
       expect(sseText).toContain('"status":"failed"');
+    } finally {
+      runsStore.close();
+    }
+  });
+
+  test("GET /runs/stream pushes initial runs list and live updates via SSE", async () => {
+    const runsStore = new RunsStore(":memory:");
+    try {
+      runsStore.recordIngest("n8n-stream-list", {
+        source: "wiz-graphql",
+        totalFindings: 1,
+      });
+      runsStore.recordPlans("n8n-stream-list", [samplePlan]);
+
+      const app = createApp({ runsStore, enableLogging: false });
+      const ac = new AbortController();
+      const streamRes = await app.request("/runs/stream", {
+        signal: ac.signal,
+      });
+      expect(streamRes.status).toBe(200);
+      expect(streamRes.headers.get("content-type")).toContain("text/event-stream");
+      expect(streamRes.headers.get("x-accel-buffering")).toBe("no");
+
+      const reader = streamRes.body!.getReader();
+      const decoder = new TextDecoder();
+
+      const firstChunk = await reader.read();
+      const firstText = decoder.decode(firstChunk.value);
+      expect(firstText).toContain("event: runs");
+      expect(firstText).toContain("n8n-stream-list");
+
+      // Trigger a live repo update and verify the stream pushes immediately
+      runsStore.updateRepo("n8n-stream-list", "acme-org/shared-utils", {
+        status: "patching",
+        currentStage: "patch",
+      });
+
+      const secondChunk = await reader.read();
+      const secondText = decoder.decode(secondChunk.value);
+      expect(secondText).toContain("event: runs");
+      expect(secondText).toContain('"activeRepos":1');
+      expect(secondText).toContain('"shell-quote"');
+
+      ac.abort();
+      await reader.cancel();
     } finally {
       runsStore.close();
     }

@@ -5,6 +5,8 @@ import type { RemediationPlan } from "../domain/remediation-plan.ts";
 
 export type RunStatus = "running" | "completed" | "partial_failed" | "failed";
 
+export type RunType = "wiz-remediation" | "generic" | (string & {});
+
 export type RepoRunStatus =
   | "pending"
   | "preparing"
@@ -26,8 +28,20 @@ export type RunStage =
 
 export type RunEventStatus = "started" | "succeeded" | "failed" | "info";
 
+export interface StoredPackageDetail {
+  component: string;
+  version: string;
+  fixVersion: string | null;
+  severity: string;
+  upgradeKind: string;
+  strategy: string;
+  cves: string[];
+  cveDetails: { name: string; severity: string }[];
+}
+
 export interface RunRecord {
   runId: string;
+  runType: RunType;
   source: string | null;
   phase: string | null;
   status: RunStatus;
@@ -42,6 +56,24 @@ export interface RunRecord {
   finishedAt: string | null;
 }
 
+export interface RunActiveRepoSummary {
+  targetRepo: string;
+  status: RepoRunStatus;
+  maxSeverity: string;
+  packageCount: number;
+  cveCount: number;
+  packagesPreview: string[];
+}
+
+export interface RunListItem extends RunRecord {
+  activeRepos: number;
+  pendingRepos: number;
+  totalPackages: number;
+  totalCves: number;
+  severityCounts: Record<string, number>;
+  activeTargets: RunActiveRepoSummary[];
+}
+
 export interface RunRepoRecord {
   runId: string;
   targetRepo: string;
@@ -52,6 +84,9 @@ export interface RunRepoRecord {
   packageCount: number;
   cveCount: number;
   findingCount: number;
+  consumers: string[];
+  rootComponents: string[];
+  packages: StoredPackageDetail[];
   status: RepoRunStatus;
   attempt: number;
   maxRetries: number | null;
@@ -86,8 +121,10 @@ export interface RunSnapshot {
 }
 
 export type RunSnapshotListener = (snapshot: RunSnapshot) => void;
+export type RunsListListener = (runs: RunListItem[]) => void;
 
 export interface EnsureRunOptions {
+  runType?: RunType | null;
   source?: string | null;
   phase?: string | null;
   currentStage?: string | null;
@@ -128,6 +165,7 @@ export interface RecordEventInput {
 
 interface RawRunRow {
   run_id: string;
+  run_type: string | null;
   source: string | null;
   phase: string | null;
   status: string;
@@ -152,6 +190,9 @@ interface RawRepoRow {
   package_count: number;
   cve_count: number;
   finding_count: number;
+  consumers_json: string | null;
+  root_components_json: string | null;
+  packages_json: string | null;
   status: string;
   attempt: number;
   max_retries: number | null;
@@ -185,9 +226,49 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function inferRunType(
+  explicit: string | null | undefined,
+  source: string | null | undefined,
+  totalRepos = 0,
+): RunType {
+  if (explicit && explicit.trim()) return explicit.trim();
+  const s = (source ?? "").toLowerCase();
+  if (s.includes("wiz") || s.includes("remediation") || totalRepos > 0) {
+    return "wiz-remediation";
+  }
+  return "generic";
+}
+
+function safeParseJsonArray<T>(raw: string | null | undefined): T[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function serializePlanPackages(plan: RemediationPlan): StoredPackageDetail[] {
+  return (plan.packages ?? []).map((p) => ({
+    component: p.component,
+    version: p.version,
+    fixVersion: p.fixVersion ?? null,
+    severity: p.severity,
+    upgradeKind: p.upgradeKind,
+    strategy: p.strategy,
+    cves: p.cves ?? [],
+    cveDetails:
+      p.cveDetails && p.cveDetails.length > 0
+        ? p.cveDetails.map((c) => ({ name: c.name, severity: c.severity }))
+        : (p.cves ?? []).map((name) => ({ name, severity: p.severity })),
+  }));
+}
+
 function mapRunRow(row: RawRunRow): RunRecord {
   return {
     runId: row.run_id,
+    runType: inferRunType(row.run_type, row.source, row.total_repos),
     source: row.source,
     phase: row.phase,
     status: row.status as RunStatus,
@@ -214,6 +295,9 @@ function mapRepoRow(row: RawRepoRow): RunRepoRecord {
     packageCount: row.package_count,
     cveCount: row.cve_count,
     findingCount: row.finding_count,
+    consumers: safeParseJsonArray<string>(row.consumers_json),
+    rootComponents: safeParseJsonArray<string>(row.root_components_json),
+    packages: safeParseJsonArray<StoredPackageDetail>(row.packages_json),
     status: row.status as RepoRunStatus,
     attempt: row.attempt,
     maxRetries: row.max_retries,
@@ -247,6 +331,7 @@ function mapEventRow(row: RawEventRow): RunEventRecord {
 export class RunsStore {
   private readonly db: Database;
   private readonly listeners = new Map<string, Set<RunSnapshotListener>>();
+  private readonly allListeners = new Set<RunsListListener>();
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     if (dbPath !== ":memory:") {
@@ -260,10 +345,20 @@ export class RunsStore {
     this.initSchema();
   }
 
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const cols = this.db.query(`PRAGMA table_info(${table})`).all() as Array<{
+      name: string;
+    }>;
+    if (!cols.some((c) => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+    }
+  }
+
   private initSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
+        run_type TEXT,
         source TEXT,
         phase TEXT,
         status TEXT NOT NULL DEFAULT 'running',
@@ -288,6 +383,9 @@ export class RunsStore {
         package_count INTEGER NOT NULL DEFAULT 0,
         cve_count INTEGER NOT NULL DEFAULT 0,
         finding_count INTEGER NOT NULL DEFAULT 0,
+        consumers_json TEXT,
+        root_components_json TEXT,
+        packages_json TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         attempt INTEGER NOT NULL DEFAULT 0,
         max_retries INTEGER,
@@ -321,10 +419,17 @@ export class RunsStore {
       CREATE INDEX IF NOT EXISTS idx_runs_updated_at ON runs(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, id ASC);
     `);
+
+    // Forward-compatible migrations for existing SQLite databases
+    this.ensureColumn("runs", "run_type", "TEXT");
+    this.ensureColumn("run_repos", "consumers_json", "TEXT");
+    this.ensureColumn("run_repos", "root_components_json", "TEXT");
+    this.ensureColumn("run_repos", "packages_json", "TEXT");
   }
 
   close(): void {
     this.listeners.clear();
+    this.allListeners.clear();
     this.db.close();
   }
 
@@ -345,27 +450,51 @@ export class RunsStore {
     };
   }
 
+  subscribeAll(listener: RunsListListener): () => void {
+    this.allListeners.add(listener);
+    return () => {
+      this.allListeners.delete(listener);
+    };
+  }
+
   private emit(runId: string): void {
     const set = this.listeners.get(runId);
-    if (!set || set.size === 0) return;
-    const snapshot = this.getRunSnapshot(runId);
-    if (!snapshot) return;
-    for (const listener of set) {
-      try {
-        listener(snapshot);
-      } catch {
-        // Ignore broken subscriber callbacks
+    if (set && set.size > 0) {
+      const snapshot = this.getRunSnapshot(runId);
+      if (snapshot) {
+        for (const listener of set) {
+          try {
+            listener(snapshot);
+          } catch {
+            // Ignore broken subscriber callbacks
+          }
+        }
+      }
+    }
+
+    if (this.allListeners.size > 0) {
+      const summaries = this.listRunSummaries(50);
+      for (const listener of this.allListeners) {
+        try {
+          listener(summaries);
+        } catch {
+          // Ignore broken subscriber callbacks
+        }
       }
     }
   }
 
   ensureRun(runId: string, opts: EnsureRunOptions = {}): void {
     const ts = nowIso();
+    const inferredType =
+      opts.runType ??
+      (opts.source ? inferRunType(null, opts.source) : null);
     this.db
       .query(
-        `INSERT INTO runs (run_id, source, phase, status, current_stage, started_at, updated_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?)
+        `INSERT INTO runs (run_id, run_type, source, phase, status, current_stage, started_at, updated_at)
+         VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
          ON CONFLICT(run_id) DO UPDATE SET
+           run_type = COALESCE(excluded.run_type, runs.run_type),
            source = COALESCE(excluded.source, runs.source),
            phase = COALESCE(excluded.phase, runs.phase),
            current_stage = COALESCE(excluded.current_stage, runs.current_stage),
@@ -373,6 +502,7 @@ export class RunsStore {
       )
       .run(
         runId,
+        inferredType,
         opts.source ?? null,
         opts.phase ?? null,
         opts.currentStage ?? null,
@@ -385,13 +515,16 @@ export class RunsStore {
     runId: string,
     info: {
       source: string;
+      runType?: RunType;
       totalFindings: number;
       phase?: string | null;
       durationMs?: number;
     },
   ): void {
     const ts = nowIso();
+    const runType = inferRunType(info.runType, info.source);
     this.ensureRun(runId, {
+      runType,
       source: info.source,
       phase: info.phase ?? null,
       currentStage: "ingest",
@@ -399,10 +532,10 @@ export class RunsStore {
     this.db
       .query(
         `UPDATE runs
-         SET source = ?, total_findings = ?, current_stage = 'ingest', status = 'running', finished_at = NULL, updated_at = ?
+         SET run_type = COALESCE(?, run_type), source = ?, total_findings = ?, current_stage = 'ingest', status = 'running', finished_at = NULL, updated_at = ?
          WHERE run_id = ?`,
       )
-      .run(info.source, info.totalFindings, ts, runId);
+      .run(runType, info.source, info.totalFindings, ts, runId);
 
     this.insertEventRow(runId, {
       stage: "ingest",
@@ -419,13 +552,18 @@ export class RunsStore {
     opts: { durationMs?: number } = {},
   ): void {
     const ts = nowIso();
-    this.ensureRun(runId, { currentStage: "plan" });
+    this.ensureRun(runId, {
+      runType: "wiz-remediation",
+      currentStage: "plan",
+    });
 
     const upsertRepo = this.db.query(
       `INSERT INTO run_repos (
          run_id, target_repo, branch, ownership, max_severity,
-         package_count, cve_count, finding_count, status, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+         package_count, cve_count, finding_count,
+         consumers_json, root_components_json, packages_json,
+         status, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
        ON CONFLICT(run_id, target_repo) DO UPDATE SET
          branch = excluded.branch,
          ownership = excluded.ownership,
@@ -433,6 +571,9 @@ export class RunsStore {
          package_count = excluded.package_count,
          cve_count = excluded.cve_count,
          finding_count = excluded.finding_count,
+         consumers_json = excluded.consumers_json,
+         root_components_json = excluded.root_components_json,
+         packages_json = excluded.packages_json,
          updated_at = excluded.updated_at`,
     );
 
@@ -447,6 +588,9 @@ export class RunsStore {
           plan.packageCount,
           plan.cveCount,
           plan.findingCount,
+          JSON.stringify(plan.consumers ?? []),
+          JSON.stringify(plan.rootComponents ?? []),
+          JSON.stringify(serializePlanPackages(plan)),
           ts,
         );
       }
@@ -469,13 +613,26 @@ export class RunsStore {
   updateRepo(runId: string, targetRepo: string, patch: UpdateRepoPatch): void {
     const ts = nowIso();
     const tx = this.db.transaction(() => {
-      this.ensureRun(runId, { currentStage: patch.currentStage });
+      this.ensureRun(runId, {
+        runType: patch.plan ? "wiz-remediation" : undefined,
+        currentStage: patch.currentStage,
+      });
 
       const existing = this.db
         .query("SELECT * FROM run_repos WHERE run_id = ? AND target_repo = ?")
         .get(runId, targetRepo) as RawRepoRow | null;
 
       const plan = patch.plan;
+      const consumersJson = plan
+        ? JSON.stringify(plan.consumers ?? [])
+        : (existing?.consumers_json ?? null);
+      const rootComponentsJson = plan
+        ? JSON.stringify(plan.rootComponents ?? [])
+        : (existing?.root_components_json ?? null);
+      const packagesJson = plan
+        ? JSON.stringify(serializePlanPackages(plan))
+        : (existing?.packages_json ?? null);
+
       const nextStatus: RepoRunStatus =
         patch.status ?? (existing?.status as RepoRunStatus | undefined) ?? "pending";
       const isTerminal = nextStatus === "completed" || nextStatus === "failed";
@@ -488,10 +645,12 @@ export class RunsStore {
           .query(
             `INSERT INTO run_repos (
                run_id, target_repo, branch, remediation_branch, ownership, max_severity,
-               package_count, cve_count, finding_count, status, attempt, max_retries,
+               package_count, cve_count, finding_count,
+               consumers_json, root_components_json, packages_json,
+               status, attempt, max_retries,
                credits_used, credit_budget, cache_hit, dry_run, pr_url, report_path,
                last_error, started_at, updated_at, finished_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             runId,
@@ -503,6 +662,9 @@ export class RunsStore {
             patch.packageCount ?? plan?.packageCount ?? 0,
             patch.cveCount ?? plan?.cveCount ?? 0,
             patch.findingCount ?? plan?.findingCount ?? 0,
+            consumersJson,
+            rootComponentsJson,
+            packagesJson,
             nextStatus,
             patch.attempt ?? 0,
             patch.maxRetries ?? null,
@@ -536,6 +698,9 @@ export class RunsStore {
                package_count = ?,
                cve_count = ?,
                finding_count = ?,
+               consumers_json = ?,
+               root_components_json = ?,
+               packages_json = ?,
                status = ?,
                attempt = ?,
                max_retries = ?,
@@ -561,6 +726,9 @@ export class RunsStore {
             patch.packageCount ?? plan?.packageCount ?? existing.package_count,
             patch.cveCount ?? plan?.cveCount ?? existing.cve_count,
             patch.findingCount ?? plan?.findingCount ?? existing.finding_count,
+            consumersJson,
+            rootComponentsJson,
+            packagesJson,
             nextStatus,
             patch.attempt !== undefined ? patch.attempt : existing.attempt,
             patch.maxRetries !== undefined
@@ -728,6 +896,131 @@ export class RunsStore {
       .query("SELECT * FROM runs ORDER BY updated_at DESC LIMIT ?")
       .all(safeLimit) as RawRunRow[];
     return rows.map(mapRunRow);
+  }
+
+  listRunSummaries(limit = 50): RunListItem[] {
+    const runs = this.listRuns(limit);
+    if (runs.length === 0) return [];
+
+    const runIds = runs.map((r) => r.runId);
+    const placeholders = runIds.map(() => "?").join(", ");
+    const repoRows = this.db
+      .query(
+        `SELECT * FROM run_repos
+         WHERE run_id IN (${placeholders})
+         ORDER BY
+           CASE status
+             WHEN 'patching' THEN 1
+             WHEN 'verifying' THEN 2
+             WHEN 'creating_pr' THEN 3
+             WHEN 'preparing' THEN 4
+             WHEN 'prepared' THEN 5
+             WHEN 'failed' THEN 6
+             WHEN 'pending' THEN 7
+             WHEN 'completed' THEN 8
+             ELSE 9
+           END,
+           target_repo ASC`,
+      )
+      .all(...runIds) as RawRepoRow[];
+
+    const reposByRun = new Map<string, RunRepoRecord[]>();
+    for (const row of repoRows) {
+      const mapped = mapRepoRow(row);
+      let list = reposByRun.get(mapped.runId);
+      if (!list) {
+        list = [];
+        reposByRun.set(mapped.runId, list);
+      }
+      list.push(mapped);
+    }
+
+    return runs.map((run) => {
+      const repos = reposByRun.get(run.runId) ?? [];
+      let activeRepos = 0;
+      let pendingRepos = 0;
+      let totalPackages = 0;
+      let totalCves = 0;
+      const severityCounts: Record<string, number> = {};
+      const activeTargets: RunActiveRepoSummary[] = [];
+
+      for (const repo of repos) {
+        const isActive =
+          repo.status !== "pending" &&
+          repo.status !== "completed" &&
+          repo.status !== "failed";
+        if (isActive) activeRepos++;
+        if (repo.status === "pending") pendingRepos++;
+        totalPackages += repo.packageCount;
+        totalCves += repo.cveCount;
+
+        if (repo.packages.length > 0) {
+          for (const pkg of repo.packages) {
+            if (pkg.cveDetails.length > 0) {
+              for (const cve of pkg.cveDetails) {
+                const sev = cve.severity || "UNKNOWN";
+                severityCounts[sev] = (severityCounts[sev] ?? 0) + 1;
+              }
+            } else {
+              const sev = pkg.severity || "UNKNOWN";
+              severityCounts[sev] = (severityCounts[sev] ?? 0) + 1;
+            }
+          }
+        } else if (repo.maxSeverity && repo.maxSeverity !== "UNKNOWN") {
+          severityCounts[repo.maxSeverity] =
+            (severityCounts[repo.maxSeverity] ?? 0) + Math.max(1, repo.cveCount);
+        }
+
+        if (isActive) {
+          activeTargets.push({
+            targetRepo: repo.targetRepo,
+            status: repo.status,
+            maxSeverity: repo.maxSeverity,
+            packageCount: repo.packageCount,
+            cveCount: repo.cveCount,
+            packagesPreview: repo.packages.slice(0, 3).map((p) => p.component),
+          });
+        }
+      }
+
+      // If no repo is currently active, include up to 2 notable repos (failed or pending) for context
+      if (activeTargets.length === 0 && repos.length > 0) {
+        for (const repo of repos.slice(0, 2)) {
+          activeTargets.push({
+            targetRepo: repo.targetRepo,
+            status: repo.status,
+            maxSeverity: repo.maxSeverity,
+            packageCount: repo.packageCount,
+            cveCount: repo.cveCount,
+            packagesPreview: repo.packages.slice(0, 3).map((p) => p.component),
+          });
+        }
+      }
+
+      return {
+        ...run,
+        activeRepos,
+        pendingRepos,
+        totalPackages,
+        totalCves,
+        severityCounts,
+        activeTargets,
+      };
+    });
+  }
+
+  getLatestUpdatedAt(): string | null {
+    const row = this.db
+      .query("SELECT MAX(updated_at) AS latest FROM runs")
+      .get() as { latest: string | null } | null;
+    return row?.latest ?? null;
+  }
+
+  getRunUpdatedAt(runId: string): string | null {
+    const row = this.db
+      .query("SELECT updated_at FROM runs WHERE run_id = ?")
+      .get(runId) as { updated_at: string } | null;
+    return row?.updated_at ?? null;
   }
 
   getRunSnapshot(runId: string): RunSnapshot | null {

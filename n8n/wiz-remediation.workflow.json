@@ -189,7 +189,7 @@
         "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/preflight' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ checks: ['gh', 'copilot', 'git', 'npm'] }) }}",
+        "jsonBody": "={{ JSON.stringify({ checks: ['gh', 'copilot', 'git', 'node', 'npm', 'npm-auth'] }) }}",
         "options": {
           "timeout": 15000
         }

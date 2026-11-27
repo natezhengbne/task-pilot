@@ -74,6 +74,8 @@ describe("domain/remediation", () => {
     expect(prompt).toContain("`npm run typecheck`");
     expect(prompt).toContain("Do NOT run `npm install` before editing `package.json`");
     expect(prompt).toContain("npm install --package-lock-only --no-audit --no-fund");
+    expect(prompt).toContain("within the same major version");
+    expect(prompt).toContain("Additional Registry-Blocked Dependencies Upgraded");
   });
 
   test("builds Copilot prompt with pre-installed guidance when depsInstalled is true", () => {

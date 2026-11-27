@@ -135,4 +135,97 @@ describe("db/runs-store", () => {
       store.close();
     }
   });
+
+  test("persists package/CVE details, computes listRunSummaries, and emits to subscribeAll", () => {
+    const store = new RunsStore(":memory:");
+    try {
+      const listEvents: number[] = [];
+      const unsubscribeAll = store.subscribeAll((runs) => {
+        listEvents.push(runs.length);
+      });
+
+      const richPlan: RemediationPlan = {
+        ...makePlan("acme-org/ux-utilities", "CRITICAL"),
+        packageCount: 2,
+        cveCount: 3,
+        consumers: ["acme-org/ux-embedded-operation-bar"],
+        rootComponents: ["@acme-org/ux-utilities"],
+        packages: [
+          {
+            component: "shell-quote",
+            version: "1.8.4",
+            fixVersion: "1.11.0",
+            filePath: "/package-lock.json",
+            severity: "CRITICAL",
+            upgradeKind: "minor",
+            strategy: "upgrade_upstream",
+            attributionSource: "lockfile",
+            paths: [],
+            consumers: ["acme-org/ux-embedded-operation-bar"],
+            rootComponents: ["@acme-org/ux-utilities"],
+            cves: ["CVE-2026-102422", "CVE-2026-13311"],
+            cveDetails: [
+              { name: "CVE-2026-102422", severity: "CRITICAL" },
+              { name: "CVE-2026-13311", severity: "HIGH" },
+            ],
+            findingIds: ["f-1", "f-2"],
+          },
+          {
+            component: "adm-zip",
+            version: "0.5.10",
+            fixVersion: "0.6.1",
+            filePath: "/package-lock.json",
+            severity: "HIGH",
+            upgradeKind: "minor",
+            strategy: "upgrade_upstream",
+            attributionSource: "lockfile",
+            paths: [],
+            consumers: ["acme-org/ux-embedded-operation-bar"],
+            rootComponents: ["@acme-org/ux-utilities"],
+            cves: ["CVE-2026-102282"],
+            cveDetails: [{ name: "CVE-2026-102282", severity: "HIGH" }],
+            findingIds: ["f-3"],
+          },
+        ],
+      };
+
+      store.recordIngest("n8n-rich", {
+        source: "wiz-graphql",
+        totalFindings: 3,
+      });
+      store.recordPlans("n8n-rich", [richPlan]);
+      store.updateRepo("n8n-rich", "acme-org/ux-utilities", {
+        status: "patching",
+        currentStage: "patch",
+      });
+
+      const snap = store.getRunSnapshot("n8n-rich")!;
+      expect(snap.run.runType).toBe("wiz-remediation");
+      expect(snap.repos[0]?.consumers).toEqual(["acme-org/ux-embedded-operation-bar"]);
+      expect(snap.repos[0]?.rootComponents).toEqual(["@acme-org/ux-utilities"]);
+      expect(snap.repos[0]?.packages).toHaveLength(2);
+      expect(snap.repos[0]?.packages[0]?.component).toBe("shell-quote");
+      expect(snap.repos[0]?.packages[0]?.fixVersion).toBe("1.11.0");
+      expect(snap.repos[0]?.packages[0]?.cveDetails).toEqual([
+        { name: "CVE-2026-102422", severity: "CRITICAL" },
+        { name: "CVE-2026-13311", severity: "HIGH" },
+      ]);
+
+      const summaries = store.listRunSummaries(10);
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]?.activeRepos).toBe(1);
+      expect(summaries[0]?.totalPackages).toBe(2);
+      expect(summaries[0]?.severityCounts).toEqual({ CRITICAL: 1, HIGH: 2 });
+      expect(summaries[0]?.activeTargets[0]?.targetRepo).toBe("acme-org/ux-utilities");
+      expect(summaries[0]?.activeTargets[0]?.packagesPreview).toEqual([
+        "shell-quote",
+        "adm-zip",
+      ]);
+
+      expect(listEvents.length).toBeGreaterThanOrEqual(3);
+      unsubscribeAll();
+    } finally {
+      store.close();
+    }
+  });
 });

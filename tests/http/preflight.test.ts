@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createApp } from "../../src/http/app.ts";
+import { runPreflightChecks } from "../../src/services/preflight.ts";
 import type { CommandRunner } from "../../src/services/remediation/workspace.ts";
 
 describe("http/preflight", () => {
@@ -109,5 +110,121 @@ describe("http/preflight", () => {
       body: JSON.stringify({ checks: [] }),
     });
     expect(emptyRes.status).toBe(400);
+  });
+
+  test("runPreflightChecks rejects WSL Windows interop npm and Bun node shim on linux", async () => {
+    const mockExec: CommandRunner = async (cmd) => {
+      if (cmd[0] === "which" && cmd[1] === "npm") {
+        return {
+          exitCode: 0,
+          stdout: "/mnt/c/Users/alice/AppData/Local/fnm/npm\n",
+          stderr: "",
+          timedOut: false,
+        };
+      }
+      if (cmd[0] === "which" && cmd[1] === "node") {
+        return {
+          exitCode: 0,
+          stdout: "/tmp/bun-node-1000-abc/node\n",
+          stderr: "",
+          timedOut: false,
+        };
+      }
+      return { exitCode: 0, stdout: "v22.12.0\n", stderr: "", timedOut: false };
+    };
+
+    const report = await runPreflightChecks(["node", "npm"], mockExec, {
+      platform: "linux",
+    });
+
+    expect(report.ready).toBe(false);
+    expect(report.missing).toEqual(["node", "npm"]);
+    expect(report.checks.npm?.error).toContain("WSL interop");
+    expect(report.checks.node?.error).toContain("Bun shim");
+  });
+
+  test("runPreflightChecks validates npm-auth userconfig existence and credentials", async () => {
+    const mockExec: CommandRunner = async (cmd) => {
+      if (cmd[0] === "which" && cmd[1] === "npm") {
+        return {
+          exitCode: 0,
+          stdout: "/home/ubuntu/.nvm/versions/node/v22.12.0/bin/npm\n",
+          stderr: "",
+          timedOut: false,
+        };
+      }
+      if (cmd[0] === "npm" && cmd[1] === "config" && cmd[2] === "get") {
+        return {
+          exitCode: 0,
+          stdout: "/home/ubuntu/.npmrc\n",
+          stderr: "",
+          timedOut: false,
+        };
+      }
+      return { exitCode: 0, stdout: "10.9.0\n", stderr: "", timedOut: false };
+    };
+
+    const missingReport = await runPreflightChecks(["npm-auth"], mockExec, {
+      platform: "linux",
+      readFileText: async () => null,
+    });
+    expect(missingReport.ready).toBe(false);
+    expect(missingReport.missing).toEqual(["npm-auth"]);
+    expect(missingReport.checks["npm-auth"]?.error).toContain("not found");
+
+    const noCredsReport = await runPreflightChecks(["npm-auth"], mockExec, {
+      platform: "linux",
+      readFileText: async () => "registry=https://jfrog.example.com/npm/\n",
+    });
+    expect(noCredsReport.ready).toBe(false);
+    expect(noCredsReport.checks["npm-auth"]?.error).toContain("no authentication credentials");
+
+    const okReport = await runPreflightChecks(["npm-auth"], mockExec, {
+      platform: "linux",
+      readFileText: async () =>
+        "//jfrog.example.com/api/npm/:_authToken=secret-token-value\n",
+    });
+    expect(okReport.ready).toBe(true);
+    expect(okReport.checks["npm-auth"]?.authenticated).toBe(true);
+    expect(JSON.stringify(okReport)).not.toContain("secret-token-value");
+  });
+
+  test("runPreflightChecks works on win32 (allows .exe/.cmd, rejects Bun shim, validates expectedOs)", async () => {
+    const mockExec: CommandRunner = async (cmd) => {
+      if (cmd[0] === "where" && cmd[1] === "npm") {
+        return {
+          exitCode: 0,
+          stdout: "C:\\Program Files\\nodejs\\npm.cmd\r\n",
+          stderr: "",
+          timedOut: false,
+        };
+      }
+      if (cmd[0] === "where" && cmd[1] === "node") {
+        return {
+          exitCode: 0,
+          stdout: "C:\\Program Files\\nodejs\\node.exe\r\n",
+          stderr: "",
+          timedOut: false,
+        };
+      }
+      return { exitCode: 0, stdout: "v22.12.0\n", stderr: "", timedOut: false };
+    };
+
+    const winOk = await runPreflightChecks(["node", "npm"], mockExec, {
+      platform: "win32",
+      expectedOs: "windows",
+    });
+    expect(winOk.ready).toBe(true);
+    expect(winOk.platform).toBe("win32");
+    expect(winOk.checks.node?.resolvedPath).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expect(winOk.checks.npm?.resolvedPath).toBe("C:\\Program Files\\nodejs\\npm.cmd");
+
+    const osMismatch = await runPreflightChecks(["node", "npm"], mockExec, {
+      platform: "win32",
+      expectedOs: "linux",
+    });
+    expect(osMismatch.ready).toBe(false);
+    expect(osMismatch.missing).toContain("os");
+    expect(osMismatch.checks.os?.error).toContain("win32");
   });
 });

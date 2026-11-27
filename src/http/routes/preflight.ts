@@ -31,14 +31,17 @@ export function createPreflightRoute(deps: PreflightRouteDeps = {}): Hono {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
+    const expectedOs = c.req.query("os")?.trim() || undefined;
 
-    const report = await runPreflightChecks(requested, exec);
+    const report = await runPreflightChecks(requested, exec, {
+      ...(expectedOs ? { expectedOs } : {}),
+    });
     return c.json(report, report.ready ? 200 : 503);
   });
 
   /**
    * POST /api/preflight
-   * Body: { "checks": ["gh", "copilot", "git", "npm"] }
+   * Body: { "checks": ["gh", "copilot", "git", "node", "npm"], "os": "linux" }
    * Designed for workflow definitions (e.g. n8n) to declare their own runtime requirements.
    */
   route.post("/", async (c) => {
@@ -80,7 +83,12 @@ export function createPreflightRoute(deps: PreflightRouteDeps = {}): Hono {
     }
 
     const requested = checksField.filter((x): x is string => typeof x === "string");
-    const report = await runPreflightChecks(requested, exec);
+    const rawOs = (parsed as Record<string, unknown>).os;
+    const expectedOs =
+      typeof rawOs === "string" && rawOs.trim() ? rawOs.trim() : undefined;
+    const report = await runPreflightChecks(requested, exec, {
+      ...(expectedOs ? { expectedOs } : {}),
+    });
     return c.json(report, report.ready ? 200 : 503);
   });
 
