@@ -155,13 +155,13 @@ export function createRemediationRoute(
         lastError: msg,
         currentStage: "prepare",
         autoFinalize: true,
-      });
-      runsStore?.recordEvent(runId, {
-        targetRepo: plan.targetRepo,
-        stage: "prepare",
-        status: "failed",
-        durationMs: Math.round(performance.now() - startMs),
-        message: `Workspace preparation failed: ${msg}`,
+        event: {
+          targetRepo: plan.targetRepo,
+          stage: "prepare",
+          status: "failed",
+          durationMs: Math.round(performance.now() - startMs),
+          message: `Workspace preparation failed: ${msg}`,
+        },
       });
       throw err;
     } finally {
@@ -388,16 +388,16 @@ export function createRemediationRoute(
         clearError: result.ok,
         currentStage: "patch",
         autoFinalize: isTerminalFailure,
-      });
-      runsStore?.recordEvent(runId, {
-        targetRepo: plan.targetRepo,
-        stage: "patch",
-        status: result.ok ? "succeeded" : "failed",
-        attempt: result.attempt,
-        durationMs,
-        message: result.ok
-          ? `Copilot patch finished (${result.changedFiles.length} file(s) changed, credits ${result.creditsUsed}/${result.creditBudget})`
-          : `Copilot patch failed (${result.code ?? "ERROR"}): ${result.error ?? "unknown error"}`,
+        event: {
+          targetRepo: plan.targetRepo,
+          stage: "patch",
+          status: result.ok ? "succeeded" : "failed",
+          attempt: result.attempt,
+          durationMs,
+          message: result.ok
+            ? `Copilot patch finished (${result.changedFiles.length} file(s) changed, credits ${result.creditsUsed}/${result.creditBudget})`
+            : `Copilot patch failed (${result.code ?? "ERROR"}): ${result.error ?? "unknown error"}`,
+        },
       });
 
       return c.json(result, httpStatus);
@@ -409,14 +409,14 @@ export function createRemediationRoute(
         lastError: msg,
         currentStage: "patch",
         autoFinalize: true,
-      });
-      runsStore?.recordEvent(runId, {
-        targetRepo: plan.targetRepo,
-        stage: "patch",
-        status: "failed",
-        attempt,
-        durationMs: Math.round(performance.now() - startMs),
-        message: `Copilot patch errored: ${msg}`,
+        event: {
+          targetRepo: plan.targetRepo,
+          stage: "patch",
+          status: "failed",
+          attempt,
+          durationMs: Math.round(performance.now() - startMs),
+          message: `Copilot patch errored: ${msg}`,
+        },
       });
       throw err;
     } finally {
@@ -537,13 +537,13 @@ export function createRemediationRoute(
         lastError: msg,
         currentStage: "verify",
         autoFinalize: true,
-      });
-      runsStore?.recordEvent(runId, {
-        targetRepo: plan.targetRepo,
-        stage: "verify",
-        status: "failed",
-        durationMs: Math.round(performance.now() - startMs),
-        message: `Verification errored: ${msg}`,
+        event: {
+          targetRepo: plan.targetRepo,
+          stage: "verify",
+          status: "failed",
+          durationMs: Math.round(performance.now() - startMs),
+          message: `Verification errored: ${msg}`,
+        },
       });
       throw err;
     } finally {
@@ -665,17 +665,17 @@ export function createRemediationRoute(
         clearError: true,
         currentStage: "pr",
         autoFinalize: true,
-      });
-      runsStore?.recordEvent(runId, {
-        targetRepo: plan.targetRepo,
-        stage: "pr",
-        status: "succeeded",
-        durationMs,
-        message: result.prUrl
-          ? result.prUpdated
-            ? `Draft PR updated: ${result.prUrl}`
-            : `Draft PR opened: ${result.prUrl}`
-          : `Dry-run report generated (${result.remediationBranch})`,
+        event: {
+          targetRepo: plan.targetRepo,
+          stage: "pr",
+          status: "succeeded",
+          durationMs,
+          message: result.prUrl
+            ? result.prUpdated
+              ? `Draft PR updated: ${result.prUrl}`
+              : `Draft PR opened: ${result.prUrl}`
+            : `Dry-run report generated (${result.remediationBranch})`,
+        },
       });
       return c.json(result);
     } catch (err) {
@@ -686,13 +686,13 @@ export function createRemediationRoute(
         lastError: msg,
         currentStage: "pr",
         autoFinalize: true,
-      });
-      runsStore?.recordEvent(runId, {
-        targetRepo: plan.targetRepo,
-        stage: "pr",
-        status: "failed",
-        durationMs: Math.round(performance.now() - startMs),
-        message: `PR creation failed: ${msg}`,
+        event: {
+          targetRepo: plan.targetRepo,
+          stage: "pr",
+          status: "failed",
+          durationMs: Math.round(performance.now() - startMs),
+          message: `PR creation failed: ${msg}`,
+        },
       });
       throw err;
     } finally {

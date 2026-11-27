@@ -1544,6 +1544,15 @@ function renderRunDetailPage(runId: string): string {
         if (failStage === "verify") return ["done", "done", "failed", "idle"];
         if (failStage === "patch") return ["done", "failed", "idle", "idle"];
         if (failStage === "prepare") return ["failed", "idle", "idle", "idle"];
+        if (!failStage) {
+          for (let i = repoEvents.length - 1; i >= 0; i--) {
+            const ev = repoEvents[i];
+            if (ev.stage === "pr") return ["done", "done", "done", "failed"];
+            if (ev.stage === "verify") return ["done", "done", "failed", "idle"];
+            if (ev.stage === "patch") return ["done", "failed", "idle", "idle"];
+            if (ev.stage === "prepare") return ["failed", "idle", "idle", "idle"];
+          }
+        }
         if (repo.attempt > 0) return ["done", "done", "failed", "idle"];
         return ["failed", "idle", "idle", "idle"];
       }

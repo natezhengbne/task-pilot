@@ -139,6 +139,49 @@ describe("http/dashboard", () => {
       expect(sseText).toContain('"component":"shell-quote"');
       expect(sseText).toContain('"CVE-2026-102422"');
       expect(sseText).toContain("Verification failed after 3 retries");
+      expect(sseText).toContain('"stage":"finalize","status":"failed"');
+      expect(sseText).toContain("event: done");
+      expect(sseText).toContain('"status":"failed"');
+    } finally {
+      runsStore.close();
+    }
+  });
+
+  test("GET /runs/:runId/stream delivers terminal PR failure event before closing SSE stream", async () => {
+    const runsStore = new RunsStore(":memory:");
+    try {
+      runsStore.recordIngest("n8n-pr-fail-sse", {
+        source: "wiz-graphql",
+        totalFindings: 1,
+      });
+      runsStore.recordPlans("n8n-pr-fail-sse", [samplePlan]);
+
+      const app = createApp({ runsStore, enableLogging: false });
+      const streamRes = await app.request("/runs/n8n-pr-fail-sse/stream");
+      expect(streamRes.status).toBe(200);
+
+      const prPromise = (async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        const res = await app.request("/api/remediation/pr", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            runId: "n8n-pr-fail-sse",
+            workspacePath: "/nonexistent/workspace/for-sse-test",
+            plan: samplePlan,
+            remediationBranch: "fix/vuln-shell-quote",
+            dryRun: false,
+            persist: false,
+          }),
+        });
+        expect(res.status).toBe(500);
+      })();
+
+      const sseText = await streamRes.text();
+      await prPromise;
+
+      expect(sseText).toContain("PR creation failed:");
+      expect(sseText).toContain('"stage":"pr","status":"failed"');
       expect(sseText).toContain("event: done");
       expect(sseText).toContain('"status":"failed"');
     } finally {

@@ -182,6 +182,8 @@ export interface UpdateRepoPatch {
   clearError?: boolean;
   currentStage?: string;
   autoFinalize?: boolean;
+  /** Optional event recorded atomically in the same transaction before emitting SSE snapshots. */
+  event?: RecordEventInput;
 }
 
 export interface RecordEventInput {
@@ -828,6 +830,14 @@ export class RunsStore {
           );
       }
 
+      if (patch.event) {
+        this.insertEventRow(
+          runId,
+          { targetRepo, ...patch.event },
+          ts,
+        );
+      }
+
       this.recomputeRunCounts(
         runId,
         ts,
@@ -870,13 +880,13 @@ export class RunsStore {
       lastError: reason,
       currentStage: "finalize",
       autoFinalize: opts.autoFinalize ?? true,
-    });
-    this.recordEvent(runId, {
-      targetRepo,
-      stage: "finalize",
-      status: "failed",
-      attempt: opts.attempt ?? null,
-      message: `${targetRepo} failed: ${reason}`,
+      event: {
+        targetRepo,
+        stage: "finalize",
+        status: "failed",
+        attempt: opts.attempt ?? null,
+        message: `${targetRepo} failed: ${reason}`,
+      },
     });
   }
 
