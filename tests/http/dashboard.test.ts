@@ -262,4 +262,74 @@ describe("http/dashboard", () => {
       runsStore.close();
     }
   });
+
+  test("GET /runs distinguishes completed runs needing PR review from no-PR runs and renders clickable PR links", async () => {
+    const runsStore = new RunsStore(":memory:");
+    try {
+      const uxCorePlan: RemediationPlan = {
+        ...samplePlan,
+        dedupKey: "remediate:acme-org/ux-core:shell-quote@1.8.4",
+        targetRepo: "acme-org/ux-core",
+      };
+      const opBarPlan: RemediationPlan = {
+        ...samplePlan,
+        dedupKey: "remediate:acme-org/ux-embedded-operation-bar:shell-quote@1.8.4",
+        targetRepo: "acme-org/ux-embedded-operation-bar",
+        ownership: "consumer-repo",
+      };
+
+      // Run 1: ux-core needed no changes, ux-embedded-operation-bar opened a PR
+      runsStore.recordIngest("run-with-pr", {
+        source: "wiz-graphql",
+        totalFindings: 2,
+      });
+      runsStore.recordPlans("run-with-pr", [uxCorePlan, opBarPlan]);
+      runsStore.updateRepo("run-with-pr", "acme-org/ux-core", {
+        status: "completed",
+      });
+      runsStore.updateRepo("run-with-pr", "acme-org/ux-embedded-operation-bar", {
+        status: "completed",
+        prUrl: "https://github.com/acme-org/ux-embedded-operation-bar/pull/42",
+        autoFinalize: true,
+      });
+
+      // Run 2: completed with no PR needed
+      runsStore.recordIngest("run-no-pr", {
+        source: "wiz-graphql",
+        totalFindings: 1,
+      });
+      runsStore.recordPlans("run-no-pr", [uxCorePlan]);
+      runsStore.updateRepo("run-no-pr", "acme-org/ux-core", {
+        status: "completed",
+        autoFinalize: true,
+      });
+
+      const app = createApp({ runsStore, enableLogging: false });
+
+      const listRes = await app.request("/runs");
+      expect(listRes.status).toBe(200);
+      const listHtml = await listRes.text();
+
+      // Run with PR shows subdivided "Needs Review" status + direct clickable PR link
+      expect(listHtml).toContain("badge-needs_review");
+      expect(listHtml).toContain("Needs Review");
+      expect(listHtml).toContain("https://github.com/acme-org/ux-embedded-operation-bar/pull/42");
+      expect(listHtml).toContain("ux-embedded-operation-bar #42 ↗");
+
+      // Run without PR stays "Completed" with "No PR needed"
+      expect(listHtml).toContain("badge-completed");
+      expect(listHtml).toContain("No PR needed");
+
+      // Detail page includes PR follow-up banner, topbar PR pill, and subdivided repo states
+      const detailRes = await app.request("/runs/run-with-pr");
+      expect(detailRes.status).toBe(200);
+      const detailHtml = await detailRes.text();
+      expect(detailHtml).toContain('id="pr-followup-banner"');
+      expect(detailHtml).toContain('id="run-pr-pill"');
+      expect(detailHtml).toContain("Automation completed — manual PR review required");
+      expect(detailHtml).toContain("No Changes");
+    } finally {
+      runsStore.close();
+    }
+  });
 });

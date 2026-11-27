@@ -46,6 +46,7 @@ interface PlanRequestBody {
   useGitHub?: boolean;
   strictGitHub?: boolean;
   ownedScopes?: string[];
+  repoBaseBranches?: Record<string, string>;
   ownershipRules?: OwnershipRules;
   findings: VulnerabilityFinding[];
 }
@@ -195,11 +196,37 @@ export function createVulnerabilitiesRoute(
     const strictGitHub = body.strictGitHub ?? true;
 
     const defaultRules = await loadDefaultOwnershipRules();
+    const mergedRepoBaseBranches =
+      defaultRules.repoBaseBranches ||
+      body.ownershipRules?.repoBaseBranches ||
+      body.repoBaseBranches
+        ? {
+            ...(defaultRules.repoBaseBranches ?? {}),
+            ...(body.ownershipRules?.repoBaseBranches ?? {}),
+            ...(body.repoBaseBranches ?? {}),
+          }
+        : undefined;
+
     const ownershipRules: OwnershipRules = body.ownershipRules
-      ? body.ownershipRules
+      ? {
+          ...body.ownershipRules,
+          ...(mergedRepoBaseBranches
+            ? { repoBaseBranches: mergedRepoBaseBranches }
+            : {}),
+        }
       : body.ownedScopes && body.ownedScopes.length > 0
-        ? ownershipRulesFromScopes(body.ownedScopes)
-        : defaultRules;
+        ? {
+            ...ownershipRulesFromScopes(body.ownedScopes),
+            ...(mergedRepoBaseBranches
+              ? { repoBaseBranches: mergedRepoBaseBranches }
+              : {}),
+          }
+        : {
+            ...defaultRules,
+            ...(mergedRepoBaseBranches
+              ? { repoBaseBranches: mergedRepoBaseBranches }
+              : {}),
+          };
 
     const startMs = performance.now();
     const releaseActivity = runsStore?.trackRunActivity(runId);

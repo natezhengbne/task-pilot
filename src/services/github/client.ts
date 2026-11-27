@@ -1,6 +1,7 @@
 import { runCommand } from "../../shared/exec.ts";
 
 export interface GitHubRepoClient {
+  getDefaultBranch?(repo: string): Promise<string | null>;
   getBranchSha(repo: string, branch: string): Promise<string>;
   getFileAtSha(repo: string, commitSha: string, filePath: string): Promise<string>;
 }
@@ -130,11 +131,27 @@ function splitRepo(repo: string): { owner: string; name: string } {
  */
 export class GhCliRepoClient implements GitHubRepoClient {
   private readonly timeoutMs: number;
+  private readonly defaultBranchCache = new Map<string, string>();
   private readonly shaCache = new Map<string, string>();
   private readonly fileCache = new Map<string, string>();
 
   constructor(options: { timeoutMs?: number } = {}) {
     this.timeoutMs = options.timeoutMs ?? 30_000;
+  }
+
+  async getDefaultBranch(repo: string): Promise<string | null> {
+    const { owner, name } = splitRepo(repo);
+    const cacheKey = `${owner.toLowerCase()}/${name.toLowerCase()}`;
+    const cached = this.defaultBranchCache.get(cacheKey);
+    if (cached) return cached;
+
+    const endpoint = `repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
+    const payload = await this.ghApiJson<{ default_branch?: string }>(endpoint);
+    const defaultBranch = payload.default_branch?.trim() || null;
+    if (defaultBranch) {
+      this.defaultBranchCache.set(cacheKey, defaultBranch);
+    }
+    return defaultBranch;
   }
 
   private async ghApiJson<T>(endpoint: string): Promise<T> {

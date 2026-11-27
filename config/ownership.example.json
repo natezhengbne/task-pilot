@@ -4,5 +4,9 @@
   },
   "ownedPackages": {
     "@your-org/special-pkg": "your-org/actual-repo-name"
+  },
+  "repoBaseBranches": {
+    "your-org/special-repo": "develop",
+    "your-org/legacy-repo": "main"
   }
 }

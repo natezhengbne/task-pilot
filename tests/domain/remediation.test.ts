@@ -200,6 +200,38 @@ describe("domain/remediation", () => {
     expect(prompt).not.toContain("**Install Mode**: `deferred`");
   });
 
+  test("notes target base branch resolution in Draft PR body when it differs from reportedBranch", () => {
+    const ghDefaultBody = buildDraftPrBody({
+      plan: {
+        ...samplePlan,
+        branch: "develop",
+        reportedBranch: "main",
+        branchSource: "github-default",
+      },
+      baseBranch: "develop",
+      remediationBranch: "fix/vuln-shell-quote-1-11-0-deadbeef",
+    });
+
+    expect(ghDefaultBody).toContain(
+      "- **Base Branch**: `develop` (resolved from GitHub `default_branch`; vulnerability reported on `main`)",
+    );
+
+    const configBody = buildDraftPrBody({
+      plan: {
+        ...samplePlan,
+        branch: "release/2.x",
+        reportedBranch: "main",
+        branchSource: "config",
+      },
+      baseBranch: "release/2.x",
+      remediationBranch: "fix/vuln-shell-quote-1-11-0-deadbeef",
+    });
+
+    expect(configBody).toContain(
+      "- **Base Branch**: `release/2.x` (configured via `repoBaseBranches`; vulnerability reported on `main`)",
+    );
+  });
+
   test("builds Draft PR title and Markdown body with verification details", () => {
     const title = buildDraftPrTitle(samplePlan);
     expect(title).toBe(

@@ -3,6 +3,8 @@ export interface OwnershipRules {
   ownedPackages?: Record<string, string>;
   /** npm scope prefix -> GitHub owner, e.g. { "@org/": "org" } */
   ownedScopes?: Record<string, string>;
+  /** Explicit GitHub repo -> target base branch overrides, e.g. { "org/repo": "develop" } */
+  repoBaseBranches?: Record<string, string>;
 }
 
 export interface UpstreamTarget {
@@ -144,6 +146,109 @@ export function classifySemverUpgrade(fromVer: string, toVer: string): UpgradeKi
   if (t[1] !== f[1]) return "minor";
   if (t[2] !== f[2]) return "patch";
   return "same";
+}
+
+/**
+ * Parses an npm v2/v3 `package-lock.json` and returns a map of
+ * `packageName -> sorted resolved versions[]`, or `null` if invalid/unsupported.
+ */
+export function indexLockfilePackageVersions(
+  lockfileText: string,
+): Map<string, string[]> | null {
+  let doc: LockfileDoc;
+  try {
+    doc = JSON.parse(lockfileText) as LockfileDoc;
+  } catch {
+    return null;
+  }
+  if (!doc || typeof doc !== "object" || !doc.packages || typeof doc.packages !== "object") {
+    return null;
+  }
+
+  const versionsByPkg = new Map<string, Set<string>>();
+  for (const [pkgPath, entry] of Object.entries(doc.packages)) {
+    if (!pkgPath || !entry || typeof entry !== "object") continue;
+    let name = entry.name?.trim();
+    if (!name) {
+      const idx = pkgPath.lastIndexOf("node_modules/");
+      if (idx >= 0) {
+        name = pkgPath.slice(idx + "node_modules/".length);
+      }
+    }
+    const ver = entry.version?.trim();
+    if (!name || !ver) continue;
+
+    let set = versionsByPkg.get(name);
+    if (!set) {
+      set = new Set<string>();
+      versionsByPkg.set(name, set);
+    }
+    set.add(ver);
+  }
+
+  const out = new Map<string, string[]>();
+  for (const [name, set] of versionsByPkg.entries()) {
+    out.set(name, [...set].sort());
+  }
+  return out;
+}
+
+export interface LockfileVersionSatisfaction {
+  satisfied: boolean;
+  resolvedVersions: string[];
+  note: string;
+}
+
+/**
+ * Checks whether a vulnerable package is already remediated in an indexed lockfile:
+ * - Absent from lockfile -> satisfied (transitive dependency removed)
+ * - Every resolved version >= fixVersion -> satisfied
+ * - Missing/unparseable fixVersion while package is still present -> not satisfied (conservative)
+ */
+export function checkPackageSatisfiedInLockfile(
+  lockfileIndex: Map<string, string[]>,
+  component: string,
+  fixVersion: string | null | undefined,
+): LockfileVersionSatisfaction {
+  const resolved = lockfileIndex.get(component) ?? [];
+  if (resolved.length === 0) {
+    return {
+      satisfied: true,
+      resolvedVersions: [],
+      note: "Package is no longer present in target branch package-lock.json.",
+    };
+  }
+
+  const expected = fixVersion?.trim() || null;
+  if (!expected) {
+    return {
+      satisfied: false,
+      resolvedVersions: resolved,
+      note: "Package is still present in target branch and no minimum fixVersion was specified.",
+    };
+  }
+
+  const expectedSemver = parseSemver(expected);
+  if (!expectedSemver) {
+    return {
+      satisfied: false,
+      resolvedVersions: resolved,
+      note: `Unable to compare resolved version(s) against non-semver fixVersion "${expected}".`,
+    };
+  }
+
+  const allSatisfied = resolved.every((ver) => {
+    const parsed = parseSemver(ver);
+    return parsed !== null && compareSemver(parsed, expectedSemver) >= 0;
+  });
+
+  return {
+    satisfied: allSatisfied,
+    resolvedVersions: resolved,
+    note: allSatisfied
+      ? `Target branch lockfile already satisfies >= ${expected} (resolved: ${resolved.join(", ")}).`
+      : `Target branch lockfile still contains version(s) below ${expected} (resolved: ${resolved.join(", ")}).`,
+  };
 }
 
 function allDepNames(pkg: LockPackage): string[] {

@@ -75,6 +75,21 @@ function shortRepoName(repo: string): string {
   return idx >= 0 ? repo.slice(idx + 1) : repo;
 }
 
+function isSafeHttpUrl(url: string | null | undefined): url is string {
+  return typeof url === "string" && /^https?:\/\//i.test(url.trim());
+}
+
+function extractPrNumber(prUrl: string): string | null {
+  const match = prUrl.match(/\/pull\/(\d+)/i);
+  return match ? `#${match[1]}` : null;
+}
+
+function formatPrLinkLabel(targetRepo: string, prUrl: string): string {
+  const num = extractPrNumber(prUrl);
+  const name = shortRepoName(targetRepo);
+  return num ? `${name} ${num}` : `${name} PR`;
+}
+
 const SHARED_CSS = `
 :root {
   color-scheme: dark;
@@ -176,6 +191,8 @@ h1 {
 .badge-running { color: var(--blue); background: var(--blue-soft); }
 .badge-running::before { animation: pulse 1.6s ease-in-out infinite; }
 .badge-completed { color: var(--green); background: var(--green-soft); }
+.badge-needs_review { color: var(--amber); background: var(--amber-soft); }
+.badge-no_changes { color: var(--muted); background: var(--gray-soft); }
 .badge-partial_failed { color: var(--amber); background: var(--amber-soft); }
 .badge-failed { color: var(--red); background: var(--red-soft); }
 .badge-cancelled { color: var(--muted); background: var(--gray-soft); }
@@ -706,6 +723,92 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
   border-color: rgba(167, 139, 250, 0.28);
   font-variant-numeric: tabular-nums;
 }
+.pr-action-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  color: var(--amber);
+  background: var(--amber-soft);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  white-space: nowrap;
+}
+.pr-link-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 5px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  border: 1px solid rgba(79, 143, 247, 0.35);
+  white-space: nowrap;
+  text-decoration: none;
+}
+.pr-link-chip:hover {
+  background: rgba(79, 143, 247, 0.24);
+  text-decoration: none;
+}
+.pr-cta-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--blue);
+  border: 1px solid rgba(79, 143, 247, 0.6);
+  white-space: nowrap;
+  text-decoration: none;
+}
+.pr-cta-btn:hover {
+  background: #3b82f6;
+  text-decoration: none;
+}
+.pr-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 13px 16px;
+  margin-bottom: 16px;
+  border-radius: 10px;
+  background: linear-gradient(90deg, rgba(251, 191, 36, 0.11), rgba(79, 143, 247, 0.08));
+  border: 1px solid rgba(251, 191, 36, 0.42);
+}
+.pr-banner-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.pr-banner-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--amber);
+}
+.pr-banner-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+.pr-banner-links {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.step-skipped {
+  border-color: var(--border);
+  background: var(--gray-soft);
+  color: var(--muted);
+}
 .run-detail-link {
   font-size: 12px;
   font-weight: 600;
@@ -736,16 +839,57 @@ function formatCreditsCell(used: number, budget: number | null): string {
   return "-";
 }
 
+function getRunPrRepos(r: RunListItem): Array<{ targetRepo: string; prUrl: string }> {
+  return (r.repos ?? [])
+    .filter((repo): repo is typeof repo & { prUrl: string } => isSafeHttpUrl(repo.prUrl))
+    .map((repo) => ({ targetRepo: repo.targetRepo, prUrl: repo.prUrl.trim() }));
+}
+
 function renderRunProgressActivity(r: RunListItem): string {
-  const first = r.activeTargets[0];
-  if (!first) {
-    return "";
+  const parts: string[] = [];
+  const prRepos = getRunPrRepos(r);
+
+  if (r.status === "running") {
+    const first = r.activeTargets[0];
+    if (first) {
+      const extraRepos = r.activeRepos > 1 ? ` +${r.activeRepos - 1}` : "";
+      parts.push(`<div class="activity-sub">
+        <span class="pill mono">${escapeHtml(statusLabel(first.status))}</span>
+        <span class="activity-repo mono" title="${escapeHtml(first.targetRepo)}">${escapeHtml(shortRepoName(first.targetRepo))}${escapeHtml(extraRepos)}</span>
+      </div>`);
+    }
   }
-  const extraRepos = r.activeRepos > 1 ? ` +${r.activeRepos - 1}` : "";
-  return `<div class="activity-sub">
-    <span class="pill mono">${escapeHtml(statusLabel(first.status))}</span>
-    <span class="activity-repo mono" title="${escapeHtml(first.targetRepo)}">${escapeHtml(shortRepoName(first.targetRepo))}${escapeHtml(extraRepos)}</span>
-  </div>`;
+
+  if (prRepos.length > 0) {
+    const visible = prRepos.slice(0, 2);
+    const extra = prRepos.length - visible.length;
+    const links = visible
+      .map(
+        (repo) =>
+          `<a class="pr-link-chip mono" href="${escapeHtml(repo.prUrl)}" target="_blank" rel="noopener noreferrer" title="Review PR for ${escapeHtml(repo.targetRepo)}">${escapeHtml(formatPrLinkLabel(repo.targetRepo, repo.prUrl))} ↗</a>`,
+      )
+      .join("");
+    const extraHtml = extra > 0 ? `<span class="pill mono">+${extra} more PR</span>` : "";
+    parts.push(`<div class="activity-sub">${links}${extraHtml}</div>`);
+  } else if (r.status !== "running") {
+    const repos = r.repos ?? [];
+    if (repos.length > 0 && r.status === "completed") {
+      const allDryRun = repos.every((repo) => Boolean(repo.dryRun));
+      parts.push(
+        `<div class="activity-sub"><span class="pill">${allDryRun ? "Dry run (no PR)" : "No PR needed"}</span></div>`,
+      );
+    } else {
+      const first = r.activeTargets[0];
+      if (first) {
+        parts.push(`<div class="activity-sub">
+          <span class="pill mono">${escapeHtml(statusLabel(first.status))}</span>
+          <span class="activity-repo mono" title="${escapeHtml(first.targetRepo)}">${escapeHtml(shortRepoName(first.targetRepo))}</span>
+        </div>`);
+      }
+    }
+  }
+
+  return parts.join("");
 }
 
 function renderRunsListRows(runs: RunListItem[]): string {
@@ -755,6 +899,7 @@ function renderRunsListRows(runs: RunListItem[]): string {
       const failCount = r.failedRepos;
       const activeCount = r.activeRepos;
       const total = r.totalRepos;
+      const prRepos = getRunPrRepos(r);
       const okPct = total > 0 ? Math.round((doneCount / total) * 100) : r.status === "completed" ? 100 : 0;
       const runPct = total > 0 ? Math.round((activeCount / total) * 100) : r.status === "running" ? 15 : 0;
       const failPct = total > 0 ? Math.round((failCount / total) * 100) : r.status === "failed" ? 100 : 0;
@@ -774,13 +919,27 @@ function renderRunsListRows(runs: RunListItem[]): string {
         progressParts.push("-");
       }
 
+      const needsReview = r.status === "completed" && prRepos.length > 0;
+      const displayStatus = needsReview ? "needs_review" : r.status;
+      const displayStatusLabel = needsReview ? "Needs Review" : statusLabel(r.status);
+      const displayStatusTitle = needsReview
+        ? `Automation completed — ${prRepos.length} PR(s) waiting for manual review and merge`
+        : "";
+      const prBadgeHtml =
+        prRepos.length > 0 && !needsReview
+          ? `<span class="pr-action-pill" title="${prRepos.length} PR(s) waiting for manual review and merge">${prRepos.length} PR${prRepos.length > 1 ? "s" : ""} to review</span>`
+          : needsReview
+            ? `<span class="pr-action-pill" title="Manual follow-up required">${prRepos.length} PR${prRepos.length > 1 ? "s" : ""}</span>`
+            : "";
+
       return `
         <tr class="run-row" data-href="${href}" data-run-id="${escapeHtml(r.runId)}" data-started-at="${escapeHtml(r.startedAt)}" data-finished-at="${escapeHtml(r.finishedAt ?? "")}">
           <td><a class="run-id-link mono" href="${href}">${escapeHtml(r.runId)}</a></td>
           <td><span class="type-pill ${isGeneric ? "type-pill-generic" : ""}">${escapeHtml(runTypeLabel(r.runType))}</span></td>
           <td>
-            <div class="status-cell">
-              <span class="badge badge-${escapeHtml(r.status)}">${escapeHtml(statusLabel(r.status))}</span>
+            <div class="status-cell" style="flex-wrap:wrap">
+              <span class="badge badge-${escapeHtml(displayStatus)}"${displayStatusTitle ? ` title="${escapeHtml(displayStatusTitle)}"` : ""}>${escapeHtml(displayStatusLabel)}</span>
+              ${prBadgeHtml}
               ${r.status === "running" ? `<button type="button" class="stop-btn" data-stop-run="${escapeHtml(r.runId)}" title="Mark this run as stopped">Stop</button>` : ""}
             </div>
           </td>
@@ -904,14 +1063,67 @@ function renderRunsListPage(runs: RunListItem[]): string {
       return idx >= 0 ? repo.slice(idx + 1) : (repo || "");
     }
 
+    function isSafeHttpUrl(url) {
+      return typeof url === "string" && /^https?:\\/\\//i.test(url.trim());
+    }
+
+    function formatPrLabel(targetRepo, prUrl) {
+      const m = String(prUrl || "").match(/\\/pull\\/(\\d+)/i);
+      const name = shortRepo(targetRepo);
+      return m ? name + " #" + m[1] : name + " PR";
+    }
+
+    function getRunPrRepos(r) {
+      return (r.repos || [])
+        .filter((repo) => isSafeHttpUrl(repo.prUrl))
+        .map((repo) => ({ targetRepo: repo.targetRepo, prUrl: repo.prUrl.trim() }));
+    }
+
     function renderActivityHtml(r) {
-      const first = (r.activeTargets || [])[0];
-      if (!first) return "";
-      const extraRepos = (r.activeRepos || 0) > 1 ? " +" + (r.activeRepos - 1) : "";
-      return '<div class="activity-sub">' +
-        '<span class="pill mono">' + esc(STATUS_LABELS[first.status] || first.status) + '</span>' +
-        '<span class="activity-repo mono" title="' + esc(first.targetRepo) + '">' + esc(shortRepo(first.targetRepo) + extraRepos) + '</span>' +
-      '</div>';
+      const parts = [];
+      const prRepos = getRunPrRepos(r);
+
+      if (r.status === "running") {
+        const first = (r.activeTargets || [])[0];
+        if (first) {
+          const extraRepos = (r.activeRepos || 0) > 1 ? " +" + (r.activeRepos - 1) : "";
+          parts.push(
+            '<div class="activity-sub">' +
+              '<span class="pill mono">' + esc(STATUS_LABELS[first.status] || first.status) + '</span>' +
+              '<span class="activity-repo mono" title="' + esc(first.targetRepo) + '">' + esc(shortRepo(first.targetRepo) + extraRepos) + '</span>' +
+            '</div>',
+          );
+        }
+      }
+
+      if (prRepos.length > 0) {
+        const visible = prRepos.slice(0, 2);
+        const extra = prRepos.length - visible.length;
+        const links = visible.map((repo) =>
+          '<a class="pr-link-chip mono" href="' + esc(repo.prUrl) + '" target="_blank" rel="noopener noreferrer" title="Review PR for ' + esc(repo.targetRepo) + '">' +
+            esc(formatPrLabel(repo.targetRepo, repo.prUrl)) + ' ↗</a>'
+        ).join("");
+        const extraHtml = extra > 0 ? '<span class="pill mono">+' + extra + ' more PR</span>' : '';
+        parts.push('<div class="activity-sub">' + links + extraHtml + '</div>');
+      } else if (r.status !== "running") {
+        const repos = r.repos || [];
+        if (repos.length > 0 && r.status === "completed") {
+          const allDryRun = repos.every((repo) => Boolean(repo.dryRun));
+          parts.push('<div class="activity-sub"><span class="pill">' + (allDryRun ? "Dry run (no PR)" : "No PR needed") + '</span></div>');
+        } else {
+          const first = (r.activeTargets || [])[0];
+          if (first) {
+            parts.push(
+              '<div class="activity-sub">' +
+                '<span class="pill mono">' + esc(STATUS_LABELS[first.status] || first.status) + '</span>' +
+                '<span class="activity-repo mono" title="' + esc(first.targetRepo) + '">' + esc(shortRepo(first.targetRepo)) + '</span>' +
+              '</div>',
+            );
+          }
+        }
+      }
+
+      return parts.join("");
     }
 
     function renderRuns(runs) {
@@ -932,6 +1144,7 @@ function renderRunsListPage(runs: RunListItem[]): string {
         const done = r.completedRepos || 0;
         const active = r.activeRepos || 0;
         const fail = r.failedRepos || 0;
+        const prRepos = getRunPrRepos(r);
         const okPct = total > 0 ? Math.round((done / total) * 100) : (r.status === "completed" ? 100 : 0);
         const runPct = total > 0 ? Math.round((active / total) * 100) : (r.status === "running" ? 15 : 0);
         const failPct = total > 0 ? Math.round((fail / total) * 100) : (r.status === "failed" ? 100 : 0);
@@ -951,6 +1164,19 @@ function renderRunsListPage(runs: RunListItem[]): string {
           progressParts.push("-");
         }
 
+        const needsReview = r.status === "completed" && prRepos.length > 0;
+        const displayStatus = needsReview ? "needs_review" : r.status;
+        const displayStatusLabel = needsReview ? "Needs Review" : (STATUS_LABELS[r.status] || r.status);
+        const displayStatusTitle = needsReview
+          ? ' title="Automation completed — ' + prRepos.length + ' PR(s) waiting for manual review and merge"'
+          : '';
+        const prBadgeHtml = prRepos.length > 0 && !needsReview
+          ? '<span class="pr-action-pill" title="' + prRepos.length + ' PR(s) waiting for manual review and merge">' +
+              prRepos.length + ' PR' + (prRepos.length > 1 ? 's' : '') + ' to review</span>'
+          : needsReview
+            ? '<span class="pr-action-pill" title="Manual follow-up required">' + prRepos.length + ' PR' + (prRepos.length > 1 ? 's' : '') + '</span>'
+            : '';
+
         const usedCr = r.totalCreditsUsed || 0;
         const budgetCr = r.totalCreditBudget;
         const creditHtml = (usedCr > 0 || (budgetCr != null && budgetCr > 0))
@@ -961,8 +1187,9 @@ function renderRunsListPage(runs: RunListItem[]): string {
           '<td><a class="run-id-link mono" href="' + href + '">' + esc(r.runId) + '</a></td>' +
           '<td><span class="type-pill ' + (isGeneric ? 'type-pill-generic' : '') + '">' + esc(typeLabel(r.runType)) + '</span></td>' +
           '<td>' +
-            '<div class="status-cell">' +
-              '<span class="badge badge-' + esc(r.status) + '">' + esc(STATUS_LABELS[r.status] || r.status) + '</span>' +
+            '<div class="status-cell" style="flex-wrap:wrap">' +
+              '<span class="badge badge-' + esc(displayStatus) + '"' + displayStatusTitle + '>' + esc(displayStatusLabel) + '</span>' +
+              prBadgeHtml +
               (r.status === "running" ? '<button type="button" class="stop-btn" data-stop-run="' + esc(r.runId) + '" title="Mark this run as stopped">Stop</button>' : '') +
             '</div>' +
           '</td>' +
@@ -1074,6 +1301,7 @@ function renderRunDetailPage(runId: string): string {
           <h1 class="mono">${safeRunId}</h1>
           <span id="run-type-pill" class="type-pill" style="display:none"></span>
           <span id="run-status" class="badge badge-pending">Connecting...</span>
+          <span id="run-pr-pill" class="pr-action-pill" style="display:none"></span>
           <span id="run-elapsed" class="pill mono">-</span>
           <span id="run-total-credits" class="pill mono credit-pill" style="display:none"></span>
         </div>
@@ -1107,6 +1335,9 @@ function renderRunDetailPage(runId: string): string {
           <div id="bar-fail" class="progress-fail" style="width:0%"></div>
         </div>
       </div>
+
+      <!-- PR Follow-up Banner (shown whenever 1+ Draft PRs were created) -->
+      <div id="pr-followup-banner" class="pr-banner" style="display:none"></div>
 
       <!-- View A: Wiz Remediation Master-Detail Split Layout -->
       <div id="view-wiz-remediation" style="display:none">
@@ -1215,6 +1446,8 @@ function renderRunDetailPage(runId: string): string {
 
     function badgeClass(status) {
       if (status === "completed") return "badge-completed";
+      if (status === "needs_review") return "badge-needs_review";
+      if (status === "no_changes") return "badge-no_changes";
       if (status === "failed") return "badge-failed";
       if (status === "cancelled") return "badge-cancelled";
       if (status === "partial_failed") return "badge-partial_failed";
@@ -1222,19 +1455,76 @@ function renderRunDetailPage(runId: string): string {
       return "badge-running";
     }
 
+    function shortRepo(repo) {
+      const idx = String(repo || "").indexOf("/");
+      return idx >= 0 ? repo.slice(idx + 1) : (repo || "");
+    }
+
+    function isSafeHttpUrl(url) {
+      return typeof url === "string" && /^https?:\\/\\//i.test(url.trim());
+    }
+
+    function extractPrNum(prUrl) {
+      const m = String(prUrl || "").match(/\\/pull\\/(\\d+)/i);
+      return m ? "#" + m[1] : null;
+    }
+
+    function formatPrLabel(targetRepo, prUrl) {
+      const num = extractPrNum(prUrl);
+      const name = shortRepo(targetRepo);
+      return num ? name + " " + num : name + " PR";
+    }
+
+    function getRepoDisplayStatus(repo) {
+      if (repo.status === "completed") {
+        if (isSafeHttpUrl(repo.prUrl)) {
+          return { cls: "badge-needs_review", label: "Needs Review" };
+        }
+        if (repo.dryRun) {
+          return { cls: "badge-completed", label: "Dry Run" };
+        }
+        return { cls: "badge-no_changes", label: "No Changes" };
+      }
+      return {
+        cls: badgeClass(repo.status),
+        label: STATUS_LABELS[repo.status] || repo.status,
+      };
+    }
+
+    function linkifyMessage(text) {
+      const raw = String(text ?? "");
+      const urlRe = /https?:\\/\\/[^\\s<>()]+/g;
+      let out = "";
+      let last = 0;
+      let match;
+      while ((match = urlRe.exec(raw)) !== null) {
+        out += esc(raw.slice(last, match.index));
+        const url = match[0];
+        out += '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(url) + '</a>';
+        last = match.index + url.length;
+      }
+      out += esc(raw.slice(last));
+      return out;
+    }
+
     const ACTIVE_STATUSES = new Set(["preparing", "patching", "verifying", "creating_pr"]);
     function isRepoActive(status, runStatus) {
       return runStatus === "running" && ACTIVE_STATUSES.has(status);
     }
 
-    function setBadge(el, status) {
+    function setBadge(el, status, labelOverride) {
       el.className = "badge " + badgeClass(status);
-      el.textContent = STATUS_LABELS[status] || status;
+      el.textContent = labelOverride || STATUS_LABELS[status] || status;
     }
 
     function computeStepStates(repo) {
       const s = repo.status;
-      if (s === "completed") return ["done", "done", "done", "done"];
+      if (s === "completed") {
+        if (!isSafeHttpUrl(repo.prUrl) && !repo.dryRun) {
+          return ["done", "done", "done", "skipped"];
+        }
+        return ["done", "done", "done", "done"];
+      }
       if (s === "creating_pr") return ["done", "done", "done", "active"];
       if (s === "verifying") return ["done", "done", "active", "idle"];
       if (s === "patching") return ["done", "active", "idle", "idle"];
@@ -1271,7 +1561,7 @@ function renderRunDetailPage(runId: string): string {
         return '<div class="event-row event-' + esc(ev.status) + '">' +
           '<span class="event-time">' + esc(fmtTime(ev.createdAt)) + '</span>' +
           '<span class="event-stage">' + esc(ev.stage) + '</span>' +
-          '<span>' + esc(msg) + '</span>' +
+          '<span>' + linkifyMessage(msg) + '</span>' +
           '<span class="event-dur">' + (ev.durationMs != null ? esc(ev.durationMs + "ms") : "") + '</span>' +
         '</div>';
       }).join("");
@@ -1285,8 +1575,14 @@ function renderRunDetailPage(runId: string): string {
       }
 
       const states = computeStepStates(repo);
-      const icons = { done: "✓", active: "●", failed: "✕", idle: "" };
-      const stepLabels = ["1. Prepare", "2. Patch", "3. Verify", "4. Draft PR"];
+      const icons = { done: "✓", active: "●", failed: "✕", skipped: "–", idle: "" };
+      const step4Label =
+        repo.status === "completed" && !isSafeHttpUrl(repo.prUrl) && !repo.dryRun
+          ? "4. No PR Needed"
+          : repo.dryRun
+            ? "4. Dry Run"
+            : "4. Draft PR";
+      const stepLabels = ["1. Prepare", "2. Patch", "3. Verify", step4Label];
       const stepperHtml = states.map((st, i) => {
         return '<div class="step' + (st !== "idle" ? " step-" + st : "") + '">' +
           '<span>' + stepLabels[i] + '</span>' +
@@ -1318,11 +1614,16 @@ function renderRunDetailPage(runId: string): string {
       );
 
       let actionHtml = "";
-      if (repo.prUrl) {
-        actionHtml = '<a class="pill" style="color:var(--blue);border-color:rgba(79,143,247,0.4)" href="' + esc(repo.prUrl) + '" target="_blank" rel="noopener noreferrer">Open Draft PR ↗</a>';
+      if (isSafeHttpUrl(repo.prUrl)) {
+        const prNum = extractPrNum(repo.prUrl);
+        actionHtml = '<a class="pr-cta-btn" href="' + esc(repo.prUrl.trim()) + '" target="_blank" rel="noopener noreferrer">Review PR' + (prNum ? " " + esc(prNum) : "") + ' ↗</a>';
       } else if (repo.status === "completed" && repo.dryRun) {
         actionHtml = '<span class="pill" style="color:var(--green)">Verified (Dry Run)</span>';
+      } else if (repo.status === "completed") {
+        actionHtml = '<span class="pill">No changes / No PR needed</span>';
       }
+
+      const displayStatus = getRepoDisplayStatus(repo);
 
       const errorHtml = repo.lastError
         ? '<details class="repo-error" open style="margin:12px 0">' +
@@ -1390,7 +1691,7 @@ function renderRunDetailPage(runId: string): string {
           '<div class="detail-title">' +
             '<span class="detail-repo-name mono">' + esc(repo.targetRepo) + '</span>' +
             '<span class="sev sev-' + esc(repo.maxSeverity || "UNKNOWN") + '">' + esc(repo.maxSeverity || "UNKNOWN") + '</span>' +
-            '<span class="badge ' + badgeClass(repo.status) + '">' + esc(STATUS_LABELS[repo.status] || repo.status) + '</span>' +
+            '<span class="badge ' + displayStatus.cls + '">' + esc(displayStatus.label) + '</span>' +
           '</div>' +
           actionHtml +
         '</div>' +
@@ -1432,11 +1733,13 @@ function renderRunDetailPage(runId: string): string {
       const activeCount = repos.filter((r) => isRepoActive(r.status, snap.run.status)).length;
       $("wiz-active-pill").textContent = activeCount > 0 ? activeCount + " active" : "";
 
-      // Pick default repo if user hasn't manually clicked one
+      // Pick default repo if user hasn't manually clicked one:
+      // prioritize active -> failed -> PR needing review -> first repo
       if (!userPickedRepo || !repos.some((r) => r.targetRepo === selectedRepo)) {
         const activeRepo = repos.find((r) => isRepoActive(r.status, snap.run.status));
         const failedRepo = repos.find((r) => r.status === "failed");
-        selectedRepo = (activeRepo || failedRepo || repos[0]).targetRepo;
+        const prRepo = repos.find((r) => isSafeHttpUrl(r.prUrl));
+        selectedRepo = (activeRepo || failedRepo || prRepo || repos[0]).targetRepo;
       }
 
       const nav = $("wiz-repo-nav");
@@ -1452,26 +1755,43 @@ function renderRunDetailPage(runId: string): string {
         const usedCr = repo.creditsUsed || 0;
         const creditText = "AI: " + usedCr + (repo.creditBudget ? " / " + repo.creditBudget : "") + " cr";
         const creditCls = usedCr > 0 ? "pill mono credit-pill" : "mono muted";
+        const displayStatus = getRepoDisplayStatus(repo);
+        const prChipHtml = isSafeHttpUrl(repo.prUrl)
+          ? '<a class="pr-link-chip mono" data-pr-link="1" href="' + esc(repo.prUrl.trim()) + '" target="_blank" rel="noopener noreferrer">PR ' + esc(extractPrNum(repo.prUrl) || "Link") + ' ↗</a>'
+          : '';
 
-        return '<button type="button" class="repo-nav-item' + (isSel ? " selected" : "") + '" data-select-repo="' + esc(repo.targetRepo) + '">' +
+        return '<div role="button" tabindex="0" class="repo-nav-item' + (isSel ? " selected" : "") + '" data-select-repo="' + esc(repo.targetRepo) + '">' +
           '<div class="repo-nav-top">' +
             '<span class="repo-nav-name mono" title="' + esc(repo.targetRepo) + '">' + esc(repo.targetRepo) + '</span>' +
-            '<span class="badge ' + badgeClass(repo.status) + '">' + esc(STATUS_LABELS[repo.status] || repo.status) + '</span>' +
+            '<span class="badge ' + displayStatus.cls + '">' + esc(displayStatus.label) + '</span>' +
           '</div>' +
           '<div class="repo-nav-sub mono">' + esc(subLine) + '</div>' +
           (attr ? '<div class="repo-nav-sub mono" style="font-size:11px">' + esc(attr) + '</div>' : '') +
           '<div class="repo-nav-foot">' +
-            '<span class="sev sev-' + esc(repo.maxSeverity || "UNKNOWN") + '">' + esc(repo.maxSeverity || "UNKNOWN") + '</span>' +
+            '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">' +
+              '<span class="sev sev-' + esc(repo.maxSeverity || "UNKNOWN") + '">' + esc(repo.maxSeverity || "UNKNOWN") + '</span>' +
+              prChipHtml +
+            '</div>' +
             '<span class="' + creditCls + '">' + esc(creditText) + '</span>' +
           '</div>' +
-        '</button>';
+        '</div>';
       }).join("");
 
-      nav.querySelectorAll("[data-select-repo]").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          selectedRepo = btn.getAttribute("data-select-repo");
+      nav.querySelectorAll("[data-select-repo]").forEach((item) => {
+        const selectThis = () => {
+          selectedRepo = item.getAttribute("data-select-repo");
           userPickedRepo = true;
           renderWizView(latestSnap);
+        };
+        item.addEventListener("click", (ev) => {
+          if (ev.target && ev.target.closest && ev.target.closest("a[data-pr-link]")) return;
+          selectThis();
+        });
+        item.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            selectThis();
+          }
         });
       });
 
@@ -1505,14 +1825,61 @@ function renderRunDetailPage(runId: string): string {
 
       const run = snap.run;
       const repos = snap.repos || [];
+      const prRepos = repos.filter((r) => isSafeHttpUrl(r.prUrl));
+      const noChangeCount = repos.filter((r) => r.status === "completed" && !isSafeHttpUrl(r.prUrl) && !r.dryRun).length;
 
       const typeEl = $("run-type-pill");
       typeEl.style.display = "inline-flex";
       typeEl.textContent = typeLabel(run.runType);
       typeEl.className = "type-pill" + (run.runType === "generic" ? " type-pill-generic" : "");
 
-      setBadge($("run-status"), run.status);
+      const needsReview = run.status === "completed" && prRepos.length > 0;
+      if (needsReview) {
+        setBadge($("run-status"), "needs_review", "Needs Review");
+      } else {
+        setBadge($("run-status"), run.status);
+      }
+
+      const prPillEl = $("run-pr-pill");
+      if (prPillEl) {
+        if (prRepos.length > 0) {
+          prPillEl.style.display = "inline-flex";
+          prPillEl.textContent = prRepos.length + " PR" + (prRepos.length > 1 ? "s" : "") + " to review";
+        } else {
+          prPillEl.style.display = "none";
+        }
+      }
+
       $("run-elapsed").textContent = fmtDuration(run.startedAt, run.finishedAt);
+
+      const bannerEl = $("pr-followup-banner");
+      if (bannerEl) {
+        if (prRepos.length > 0) {
+          const title = run.status === "completed"
+            ? "Automation completed — manual PR review required"
+            : prRepos.length + " Draft PR" + (prRepos.length > 1 ? "s" : "") + " ready for review";
+          const subParts = [
+            prRepos.length + " repo" + (prRepos.length > 1 ? "s" : "") + " created a PR that still needs your review & merge",
+          ];
+          if (noChangeCount > 0) {
+            subParts.push(noChangeCount + " repo" + (noChangeCount > 1 ? "s" : "") + " required no changes");
+          }
+          const linksHtml = prRepos.map((repo) =>
+            '<a class="pr-cta-btn mono" href="' + esc(repo.prUrl.trim()) + '" target="_blank" rel="noopener noreferrer">' +
+              'Review ' + esc(formatPrLabel(repo.targetRepo, repo.prUrl)) + ' ↗</a>'
+          ).join("");
+          bannerEl.style.display = "flex";
+          bannerEl.innerHTML =
+            '<div class="pr-banner-copy">' +
+              '<div class="pr-banner-title">' + esc(title) + '</div>' +
+              '<div class="pr-banner-sub">' + esc(subParts.join(" · ")) + '</div>' +
+            '</div>' +
+            '<div class="pr-banner-links">' + linksHtml + '</div>';
+        } else {
+          bannerEl.style.display = "none";
+          bannerEl.innerHTML = "";
+        }
+      }
 
       const totalCreditsUsed = repos.reduce((sum, r) => sum + (r.creditsUsed || 0), 0);
       const hasBudget = repos.some((r) => r.creditBudget != null && r.creditBudget > 0);
@@ -1549,7 +1916,13 @@ function renderRunDetailPage(runId: string): string {
       $("bar-run").style.width = runPct + "%";
       $("bar-fail").style.width = failPct + "%";
 
-      const summaryParts = [run.completedRepos + " completed"];
+      const summaryParts = [];
+      if (prRepos.length > 0) summaryParts.push(prRepos.length + " PR ready");
+      if (noChangeCount > 0) summaryParts.push(noChangeCount + " no changes");
+      const otherCompleted = run.completedRepos - prRepos.length - noChangeCount;
+      if (otherCompleted > 0 || (prRepos.length === 0 && noChangeCount === 0)) {
+        summaryParts.push((otherCompleted > 0 ? otherCompleted : run.completedRepos) + " completed");
+      }
       if (activeCount > 0) summaryParts.push(activeCount + " active");
       if (pendingCount > 0) summaryParts.push(pendingCount + " pending");
       if (run.failedRepos > 0) summaryParts.push(run.failedRepos + " failed");

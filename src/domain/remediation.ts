@@ -559,6 +559,21 @@ export function buildDraftPrBody(input: DraftPrBodyInput): string {
   );
   lines.push("");
   lines.push(`- **Ownership**: \`${plan.ownership}\``);
+  if (plan.reportedBranch && plan.reportedBranch !== baseBranch) {
+    const sourceDetail =
+      plan.branchSource === "config"
+        ? "configured via `repoBaseBranches`"
+        : plan.branchSource === "github-default"
+          ? "resolved from GitHub `default_branch`"
+          : "resolved target branch";
+    lines.push(
+      `- **Base Branch**: \`${baseBranch}\` (${sourceDetail}; vulnerability reported on \`${plan.reportedBranch}\`)`,
+    );
+  } else if (plan.branchSource === "config") {
+    lines.push(
+      `- **Base Branch**: \`${baseBranch}\` (configured via \`repoBaseBranches\`)`,
+    );
+  }
   lines.push(`- **Max Severity**: \`${plan.maxSeverity}\``);
   lines.push(`- **Packages**: ${plan.packageCount} | **CVEs**: ${plan.cveCount} | **Findings**: ${plan.findingCount}`);
   if (plan.consumers.length > 0) {

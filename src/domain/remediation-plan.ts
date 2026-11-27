@@ -1,13 +1,16 @@
 import type { GitHubRepoClient } from "../services/github/client.ts";
 import {
   analyzePackageLock,
+  checkPackageSatisfiedInLockfile,
   classifySemverUpgrade,
+  indexLockfilePackageVersions,
   maxSemverVersion,
   resolvePackageOwnership,
   type LockfileStrategy,
   type OwnershipRules,
   type UpgradeKind,
 } from "../services/npm/lockfile.ts";
+import { resolveConfiguredRepoBaseBranch } from "../shared/ownership-config.ts";
 import {
   SEVERITY_RANK,
   type Severity,
@@ -38,10 +41,14 @@ export interface RemediationPackagePlan {
   findingIds: string[];
 }
 
+export type BranchResolutionSource = "config" | "github-default" | "reported";
+
 export interface RemediationPlan {
   dedupKey: string;
   targetRepo: string;
   branch: string;
+  reportedBranch?: string;
+  branchSource?: BranchResolutionSource;
   ownership: "owned-library" | "consumer-repo";
   maxSeverity: Severity;
   packageCount: number;
@@ -73,6 +80,20 @@ export interface LockfileWarning {
   error: string;
 }
 
+export interface AlreadyFixedPackageItem {
+  targetRepo: string;
+  branch: string;
+  reportedBranch: string;
+  branchSource: BranchResolutionSource;
+  ownership: "owned-library" | "consumer-repo";
+  component: string;
+  reportedVersion: string;
+  fixVersion: string | null;
+  resolvedVersions: string[];
+  cves: string[];
+  note: string;
+}
+
 export interface PlanRemediationsResult {
   plannedAt: string;
   usedGitHub: boolean;
@@ -81,9 +102,11 @@ export interface PlanRemediationsResult {
     planCount: number;
     ownedLibraryPlans: number;
     consumerRepoPlans: number;
+    alreadyFixedCount: number;
     lockfileWarningCount: number;
   };
   plans: RemediationPlan[];
+  alreadyFixed: AlreadyFixedPackageItem[];
   lockfileWarnings: LockfileWarning[];
 }
 
@@ -126,6 +149,8 @@ interface UpstreamPackageAccumulator {
 interface RepoPlanAccumulator {
   targetRepo: string;
   branch: string;
+  reportedBranch: string;
+  branchSource: BranchResolutionSource;
   packages: Map<string, UpstreamPackageAccumulator>;
 }
 
@@ -303,8 +328,66 @@ export async function planRemediations(
     };
   }
 
-  // Stage 2: Consolidate all vulnerable packages per (targetRepo, branch)
+  // Stage 2: Consolidate all vulnerable packages per (targetRepo, resolvedBranch)
+  // Priority for target base branch:
+  //   1. Explicit config override (`ownershipRules.repoBaseBranches`)
+  //   2. GitHub repository `default_branch` via `gh api`
+  //   3. Fallback to reported finding branch
   const repoGroups = new Map<string, RepoPlanAccumulator>();
+  const defaultBranchLookupCache = new Map<
+    string,
+    { branch: string; source: BranchResolutionSource } | null
+  >();
+
+  async function resolveTargetBranch(
+    targetRepo: string,
+    reportedBranch: string,
+  ): Promise<{ branch: string; source: BranchResolutionSource }> {
+    const cacheKey = targetRepo.trim().toLowerCase();
+    if (defaultBranchLookupCache.has(cacheKey)) {
+      const cached = defaultBranchLookupCache.get(cacheKey);
+      if (cached) return cached;
+      return { branch: reportedBranch, source: "reported" };
+    }
+
+    const configured = resolveConfiguredRepoBaseBranch(
+      targetRepo,
+      rules.repoBaseBranches,
+    );
+    if (configured) {
+      const resolved = { branch: configured, source: "config" as const };
+      defaultBranchLookupCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    if (github?.getDefaultBranch) {
+      try {
+        const ghDefault = await github.getDefaultBranch(targetRepo);
+        if (ghDefault?.trim()) {
+          const resolved = {
+            branch: ghDefault.trim(),
+            source: "github-default" as const,
+          };
+          defaultBranchLookupCache.set(cacheKey, resolved);
+          return resolved;
+        }
+      } catch (err) {
+        if (strictGitHub) {
+          throw err;
+        }
+        lockfileWarnings.push({
+          repository: targetRepo,
+          branch: reportedBranch,
+          filePath: "<default_branch>",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    defaultBranchLookupCache.set(cacheKey, null);
+    return { branch: reportedBranch, source: "reported" };
+  }
+
   const sortedConsumerKeys = [...consumerGroups.keys()].sort();
 
   for (const ck of sortedConsumerKeys) {
@@ -313,12 +396,15 @@ export async function planRemediations(
     const keyVer = cg.version || cg.fixVersion;
 
     for (const targetRepo of attr.targetRepos) {
-      const rk = `${targetRepo}:${cg.branch}`;
+      const targetBranchInfo = await resolveTargetBranch(targetRepo, cg.branch);
+      const rk = `${targetRepo}:${targetBranchInfo.branch}`;
       let rg = repoGroups.get(rk);
       if (!rg) {
         rg = {
           targetRepo,
-          branch: cg.branch,
+          branch: targetBranchInfo.branch,
+          reportedBranch: cg.branch,
+          branchSource: targetBranchInfo.source,
           packages: new Map(),
         };
         repoGroups.set(rk, rg);
@@ -371,10 +457,53 @@ export async function planRemediations(
     }
   }
 
-  // Stage 3: Materialize deterministic RemediationPlan[]
+  // Stage 3: Pre-check target branch lockfiles when targetBranch !== reportedBranch,
+  // then materialize deterministic RemediationPlan[] for still-vulnerable packages.
+  const targetLockfileIndexCache = new Map<string, Map<string, string[]> | null>();
+
+  async function fetchTargetLockfileIndex(
+    repo: string,
+    branch: string,
+    filePath: string,
+  ): Promise<Map<string, string[]> | null> {
+    if (!github) return null;
+    const cacheKey = `${repo}@${branch}:${filePath}`;
+    if (targetLockfileIndexCache.has(cacheKey)) {
+      return targetLockfileIndexCache.get(cacheKey) ?? null;
+    }
+
+    try {
+      const sha = await github.getBranchSha(repo, branch);
+      const content = await github.getFileAtSha(repo, sha, filePath);
+      const indexed = indexLockfilePackageVersions(content);
+      targetLockfileIndexCache.set(cacheKey, indexed);
+      return indexed;
+    } catch {
+      // Conservative: if the target branch has no package-lock.json (e.g. a library
+      // that does not commit a lockfile) or cannot be read, keep the plan item.
+      targetLockfileIndexCache.set(cacheKey, null);
+      return null;
+    }
+  }
+
   const plans: RemediationPlan[] = [];
+  const alreadyFixed: AlreadyFixedPackageItem[] = [];
+
   for (const rk of [...repoGroups.keys()].sort()) {
     const rg = repoGroups.get(rk)!;
+    const allGroupConsumers = new Set<string>();
+    for (const acc of rg.packages.values()) {
+      for (const c of acc.consumers) allGroupConsumers.add(c);
+    }
+    const groupOwnership: "owned-library" | "consumer-repo" = [
+      ...allGroupConsumers,
+    ].some((c) => c.toLowerCase() !== rg.targetRepo.toLowerCase())
+      ? "owned-library"
+      : "consumer-repo";
+
+    const shouldPrecheckTargetBranch =
+      Boolean(github) && rg.branch !== rg.reportedBranch;
+
     const allConsumers = new Set<string>();
     const allRootComponents = new Set<string>();
     const allCVEs = new Set<string>();
@@ -387,6 +516,42 @@ export async function planRemediations(
 
     for (const pk of [...rg.packages.keys()].sort()) {
       const acc = rg.packages.get(pk)!;
+
+      if (shouldPrecheckTargetBranch) {
+        const lockfilePath =
+          groupOwnership === "owned-library"
+            ? "/package-lock.json"
+            : acc.filePath || "/package-lock.json";
+        const targetIndex = await fetchTargetLockfileIndex(
+          rg.targetRepo,
+          rg.branch,
+          lockfilePath,
+        );
+        if (targetIndex) {
+          const check = checkPackageSatisfiedInLockfile(
+            targetIndex,
+            acc.component,
+            acc.fixVersion || null,
+          );
+          if (check.satisfied) {
+            alreadyFixed.push({
+              targetRepo: rg.targetRepo,
+              branch: rg.branch,
+              reportedBranch: rg.reportedBranch,
+              branchSource: rg.branchSource,
+              ownership: groupOwnership,
+              component: acc.component,
+              reportedVersion: acc.version,
+              fixVersion: acc.fixVersion || null,
+              resolvedVersions: check.resolvedVersions,
+              cves: [...acc.cves].sort(),
+              note: check.note,
+            });
+            continue;
+          }
+        }
+      }
+
       maxSeverity = higherSeverity(maxSeverity, acc.maxSeverity);
 
       const consumers = [...acc.consumers].sort();
@@ -428,6 +593,10 @@ export async function planRemediations(
       });
     }
 
+    if (pkgPlans.length === 0) {
+      continue;
+    }
+
     pkgPlans.sort(
       (a, b) =>
         SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity] ||
@@ -466,6 +635,8 @@ export async function planRemediations(
       dedupKey,
       targetRepo: rg.targetRepo,
       branch: rg.branch,
+      reportedBranch: rg.reportedBranch,
+      branchSource: rg.branchSource,
       ownership,
       maxSeverity,
       packageCount: pkgPlans.length,
@@ -495,9 +666,11 @@ export async function planRemediations(
       planCount: plans.length,
       ownedLibraryPlans: plans.filter((p) => p.ownership === "owned-library").length,
       consumerRepoPlans: plans.filter((p) => p.ownership === "consumer-repo").length,
+      alreadyFixedCount: alreadyFixed.length,
       lockfileWarningCount: lockfileWarnings.length,
     },
     plans,
+    alreadyFixed,
     lockfileWarnings,
   };
 }
