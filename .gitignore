@@ -3,5 +3,7 @@ node_modules/
 .workspaces/
 .n8n/
 config/ownership.json
+.env
+.env.local
 *.log
 .DS_Store
