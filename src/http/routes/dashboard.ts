@@ -892,6 +892,13 @@ function renderRunProgressActivity(r: RunListItem): string {
   return parts.join("");
 }
 
+function formatDisplayRunId(runId: string): string {
+  const uuidMatch = /^([a-z0-9_-]+-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}([0-9a-f]{8})$/i.exec(
+    runId,
+  );
+  return uuidMatch ? `${uuidMatch[1]}${uuidMatch[2]}` : runId;
+}
+
 function renderRunsListRows(runs: RunListItem[]): string {
   return runs
     .map((r) => {
@@ -932,9 +939,12 @@ function renderRunsListRows(runs: RunListItem[]): string {
             ? `<span class="pr-action-pill" title="Manual follow-up required">${prRepos.length} PR${prRepos.length > 1 ? "s" : ""}</span>`
             : "";
 
+      const displayRunId = formatDisplayRunId(r.runId);
+      const runIdTitle = displayRunId !== r.runId ? ` title="${escapeHtml(r.runId)}"` : "";
+
       return `
         <tr class="run-row" data-href="${href}" data-run-id="${escapeHtml(r.runId)}" data-started-at="${escapeHtml(r.startedAt)}" data-finished-at="${escapeHtml(r.finishedAt ?? "")}">
-          <td><a class="run-id-link mono" href="${href}">${escapeHtml(r.runId)}</a></td>
+          <td><a class="run-id-link mono" href="${href}"${runIdTitle}>${escapeHtml(displayRunId)}</a></td>
           <td><span class="type-pill ${isGeneric ? "type-pill-generic" : ""}">${escapeHtml(runTypeLabel(r.runType))}</span></td>
           <td>
             <div class="status-cell" style="flex-wrap:wrap">
@@ -1126,6 +1136,11 @@ function renderRunsListPage(runs: RunListItem[]): string {
       return parts.join("");
     }
 
+    function formatDisplayRunId(runId) {
+      const m = /^([a-z0-9_-]+-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}([0-9a-f]{8})$/i.exec(runId || "");
+      return m ? (m[1] + m[2]) : (runId || "");
+    }
+
     function renderRuns(runs) {
       const list = runs || [];
       const totalAllCredits = list.reduce((sum, r) => sum + (r.totalCreditsUsed || 0), 0);
@@ -1183,8 +1198,11 @@ function renderRunsListPage(runs: RunListItem[]): string {
           ? '<span class="pill mono credit-pill">' + esc(budgetCr != null && budgetCr > 0 ? usedCr + ' / ' + budgetCr : String(usedCr)) + '</span>'
           : '<span class="mono muted">-</span>';
 
+        const displayRunId = formatDisplayRunId(r.runId);
+        const runIdTitle = displayRunId !== r.runId ? ' title="' + esc(r.runId) + '"' : '';
+
         return '<tr class="run-row" data-href="' + href + '" data-run-id="' + esc(r.runId) + '" data-started-at="' + esc(r.startedAt) + '" data-finished-at="' + esc(r.finishedAt || "") + '">' +
-          '<td><a class="run-id-link mono" href="' + href + '">' + esc(r.runId) + '</a></td>' +
+          '<td><a class="run-id-link mono" href="' + href + '"' + runIdTitle + '>' + esc(displayRunId) + '</a></td>' +
           '<td><span class="type-pill ' + (isGeneric ? 'type-pill-generic' : '') + '">' + esc(typeLabel(r.runType)) + '</span></td>' +
           '<td>' +
             '<div class="status-cell" style="flex-wrap:wrap">' +

@@ -60,7 +60,8 @@ value:
               process.env.WM_ROOT_FLOW_JOB_ID ||
               process.env.WM_JOB_ID ||
               String(Date.now());
-            const runId = `wmill-${jobId}`;
+            const shortJobId = jobId.replace(/-/g, "").slice(-8);
+            const runId = `wmill-${shortJobId}`;
 
             const parsedScopes = owned_scopes
               ? owned_scopes
