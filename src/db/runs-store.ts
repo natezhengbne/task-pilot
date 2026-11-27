@@ -449,6 +449,11 @@ export class RunsStore {
         FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS run_sequences (
+        name TEXT PRIMARY KEY,
+        value INTEGER NOT NULL DEFAULT 0
+      );
+
       CREATE INDEX IF NOT EXISTS idx_runs_updated_at ON runs(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, id ASC);
     `);
@@ -458,6 +463,61 @@ export class RunsStore {
     this.ensureColumn("run_repos", "consumers_json", "TEXT");
     this.ensureColumn("run_repos", "root_components_json", "TEXT");
     this.ensureColumn("run_repos", "packages_json", "TEXT");
+  }
+
+  /**
+   * Allocates the next monotonically increasing sequential runId (e.g. `run-1`, `run-2`, ...).
+   * Persisted in SQLite `run_sequences` so IDs survive server restarts and never collide
+   * with existing rows in `runs`.
+   */
+  allocateRunId(prefix = "run"): string {
+    const safePrefix =
+      prefix.replace(/[^a-zA-Z0-9_-]/g, "").trim() || "run";
+
+    const tx = this.db.transaction((): string => {
+      const existingSeq = this.db
+        .query("SELECT value FROM run_sequences WHERE name = 'global'")
+        .get() as { value: number } | null;
+
+      let current = existingSeq?.value ?? 0;
+      if (!existingSeq) {
+        // Seed from any existing numeric-suffixed run_ids (e.g. run-3, n8n-7) so we never collide
+        const existingRows = this.db
+          .query("SELECT run_id FROM runs")
+          .all() as Array<{ run_id: string }>;
+        for (const row of existingRows) {
+          const match = /-(\d+)$/.exec(row.run_id);
+          if (match) {
+            const num = Number.parseInt(match[1]!, 10);
+            if (Number.isSafeInteger(num) && num > current) {
+              current = num;
+            }
+          }
+        }
+        this.db
+          .query(
+            "INSERT INTO run_sequences (name, value) VALUES ('global', ?)",
+          )
+          .run(current);
+      }
+
+      const checkExists = this.db.query(
+        "SELECT 1 FROM runs WHERE run_id = ? LIMIT 1",
+      );
+      let candidate: string;
+      do {
+        current += 1;
+        candidate = `${safePrefix}-${current}`;
+      } while (checkExists.get(candidate));
+
+      this.db
+        .query("UPDATE run_sequences SET value = ? WHERE name = 'global'")
+        .run(current);
+
+      return candidate;
+    });
+
+    return tx();
   }
 
   close(): void {

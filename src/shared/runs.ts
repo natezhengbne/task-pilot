@@ -14,6 +14,21 @@ export function createRunId(prefix = "run"): string {
   return `${prefix}-${stamp}-${rand}`;
 }
 
+export interface RunIdAllocator {
+  allocateRunId(prefix?: string): string;
+}
+
+export function resolveRunId(
+  explicitRunId: unknown,
+  allocator?: RunIdAllocator,
+  prefix = "run",
+): string {
+  if (typeof explicitRunId === "string" && explicitRunId.trim()) {
+    return explicitRunId.trim();
+  }
+  return allocator ? allocator.allocateRunId(prefix) : createRunId(prefix);
+}
+
 export async function ensureRunDir(runId: string): Promise<string> {
   const safeId = sanitizeSegment(runId);
   const dir = join(RUNS_ROOT, safeId);

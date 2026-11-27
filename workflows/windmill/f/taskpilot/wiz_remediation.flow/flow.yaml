@@ -56,13 +56,6 @@ value:
               "http://localhost:3456"
             ).replace(/\/+$/, "");
 
-            const jobId =
-              process.env.WM_ROOT_FLOW_JOB_ID ||
-              process.env.WM_JOB_ID ||
-              String(Date.now());
-            const shortJobId = jobId.replace(/-/g, "").slice(-8);
-            const runId = `wmill-${shortJobId}`;
-
             const parsedScopes = owned_scopes
               ? owned_scopes
                   .split(",")
@@ -82,7 +75,6 @@ value:
               headers: buildHeaders(),
               body: JSON.stringify({
                 source: source || "wiz-graphql",
-                runId,
                 phase: phase || "Phase 3 - Full Remediation + Draft PR",
                 policy,
                 payload,

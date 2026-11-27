@@ -245,4 +245,36 @@ describe("http/vulnerabilities", () => {
     expect(fallbackBody.ok).toBe(true);
     expect(fallbackBody.summary.lockfileWarningCount).toBe(1);
   });
+
+  test("POST /api/vulnerabilities/ingest allocates sequential runIds when runId is omitted", async () => {
+    const app = createApp();
+
+    const firstRes = await app.request("/api/vulnerabilities/ingest", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        source: "wiz-graphql",
+        persist: false,
+        payload: sampleWizPayload,
+      }),
+    });
+    expect(firstRes.status).toBe(200);
+    const first = (await firstRes.json()) as { ok: boolean; runId: string };
+    expect(first.ok).toBe(true);
+    expect(first.runId).toBe("run-1");
+
+    const secondRes = await app.request("/api/vulnerabilities/ingest", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        source: "wiz-graphql",
+        persist: false,
+        payload: sampleWizPayload,
+      }),
+    });
+    expect(secondRes.status).toBe(200);
+    const second = (await secondRes.json()) as { ok: boolean; runId: string };
+    expect(second.ok).toBe(true);
+    expect(second.runId).toBe("run-2");
+  });
 });

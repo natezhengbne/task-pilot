@@ -286,7 +286,7 @@ export function buildCopilotRemediationPrompt(
   );
   lines.push(
     allowUnrelated403
-      ? "- **Unrelated 403 Scope Expansion**: `allowed` (resolve HTTP 403 registry-blocked unrelated packages to their minimal compliant version — prefer same-major scoped `overrides`/parent upgrades; controlled cross-major upgrade permitted only when no same-major compliant version exists, usage impact is minimal, and all verification checks pass; list every upgraded package under `### Additional Registry-Blocked Dependencies Upgraded`)."
+      ? "- **Unrelated 403 Scope Expansion**: `allowed` (resolve HTTP 403 registry-blocked unrelated packages to their minimal compliant version in order: first try lockfile refresh `npm update <pkg> --package-lock-only` without editing `package.json`, then same-major parent upgrade, and only as last resort a major-version-scoped `overrides` entry like `\"parent@^X\": { \"pkg\": \"^Y.Z.W\" }`; controlled cross-major upgrade permitted only when no same-major compliant version exists, usage impact is minimal, and all verification checks pass; list every upgraded package under `### Additional Registry-Blocked Dependencies Upgraded`)."
       : "- **Unrelated 403 Scope Expansion**: `forbidden` (default — if `npm install` fails with HTTP 403 on an unrelated package, stop and report `STATUS: REGISTRY_BLOCKED_UNRELATED` instead of expanding PR scope).",
   );
   if (options.detectedScripts && options.detectedScripts.length > 0) {

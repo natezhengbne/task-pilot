@@ -34,8 +34,8 @@ import {
 } from "../../services/remediation/workspace.ts";
 import { runCommand } from "../../shared/exec.ts";
 import {
-  createRunId,
   readRunArtifactJson,
+  resolveRunId,
   saveRunArtifact,
 } from "../../shared/runs.ts";
 
@@ -93,10 +93,7 @@ export function createRemediationRoute(
   route.post("/workspace/prepare", async (c) => {
     const body = await parseJsonObject(await c.req.text());
     const plan = assertPlan(body.plan);
-    const runId =
-      typeof body.runId === "string" && body.runId.trim()
-        ? body.runId.trim()
-        : createRunId("rem");
+    const runId = resolveRunId(body.runId, runsStore);
 
     const input: PrepareWorkspaceInput = {
       runId,
@@ -207,10 +204,7 @@ export function createRemediationRoute(
    */
   route.post("/workspaces/prepare", async (c) => {
     const body = await parseJsonObject(await c.req.text());
-    const runId =
-      typeof body.runId === "string" && body.runId.trim()
-        ? body.runId.trim()
-        : createRunId("rem");
+    const runId = resolveRunId(body.runId, runsStore);
 
     let rawPlans: unknown = body.plans;
     if (rawPlans === undefined && typeof body.runId === "string" && body.runId.trim()) {
@@ -377,10 +371,7 @@ export function createRemediationRoute(
       );
     }
 
-    const runId =
-      typeof body.runId === "string" && body.runId.trim()
-        ? body.runId.trim()
-        : createRunId("rem");
+    const runId = resolveRunId(body.runId, runsStore);
 
     const input: RunCopilotPatchInput = {
       runId,
@@ -511,10 +502,7 @@ export function createRemediationRoute(
       );
     }
 
-    const runId =
-      typeof body.runId === "string" && body.runId.trim()
-        ? body.runId.trim()
-        : createRunId("rem");
+    const runId = resolveRunId(body.runId, runsStore);
 
     const input: VerifyRemediationInput = {
       runId,
@@ -650,10 +638,7 @@ export function createRemediationRoute(
       );
     }
 
-    const runId =
-      typeof body.runId === "string" && body.runId.trim()
-        ? body.runId.trim()
-        : createRunId("rem");
+    const runId = resolveRunId(body.runId, runsStore);
 
     const rawUpstream =
       body.upstreamContext &&
@@ -1267,10 +1252,7 @@ export function createRemediationRoute(
     }
     const errorOutput =
       typeof body.errorOutput === "string" ? body.errorOutput : "";
-    const runId =
-      typeof body.runId === "string" && body.runId.trim()
-        ? body.runId.trim()
-        : createRunId("rem");
+    const runId = resolveRunId(body.runId, runsStore);
 
     const input: RunAiRescueInput = {
       runId,

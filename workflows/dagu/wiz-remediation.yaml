@@ -65,7 +65,6 @@ params:
 
 env:
   - API_URL: "${TASKPILOT_API_URL:-http://127.0.0.1:3456}"
-  - RUN_ID: "dagu-${DAG_RUN_ID}"
 
 steps:
   - id: ingest_vulnerabilities
@@ -79,7 +78,6 @@ steps:
         Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
       body: |
         {
-          "runId": "${RUN_ID}",
           "source": "${params.source}",
           "phase": "${params.phase}",
           "reportPath": "${params.report_path}",
@@ -102,7 +100,7 @@ steps:
         Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
       body: |
         {
-          "runId": "${RUN_ID}",
+          "runId": "${INGEST_RES.runId}",
           "useGitHub": true,
           "ownedScopes": "${params.owned_scopes}"
         }
@@ -140,7 +138,7 @@ steps:
         Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
       body: |
         {
-          "runId": "${RUN_ID}",
+          "runId": "${INGEST_RES.runId}",
           "reuseExisting": true,
           "installDeps": false,
           "enableAiRescue": ${params.enable_ai_rescue},
@@ -155,7 +153,7 @@ steps:
     with:
       dag: remediate-single-repo
       params:
-        run_id: "${RUN_ID}"
+        run_id: "${INGEST_RES.runId}"
         target_repo: "${ITEM}"
         phase: "${params.phase}"
         max_retries: "${params.max_retries}"
@@ -184,7 +182,7 @@ steps:
         Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
       body: |
         {
-          "runId": "${RUN_ID}",
+          "runId": "${INGEST_RES.runId}",
           "cancelIncomplete": true,
           "message": "Dagu workflow finished"
         }

@@ -109,7 +109,7 @@
         "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/vulnerabilities/ingest' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ source: $('1. Upload Vulnerability Report').item.json.Source || 'wiz-graphql', runId: 'n8n-' + $execution.id, phase: $('1. Upload Vulnerability Report').item.json.Phase || 'Phase 3 - Full Remediation + Draft PR', policy: { minSeverity: $('1. Upload Vulnerability Report').item.json['Min Severity'] || 'HIGH', ...($('1. Upload Vulnerability Report').item.json['Owned Scopes'] ? { ownedScopes: $('1. Upload Vulnerability Report').item.json['Owned Scopes'].split(',').map(s => s.trim()).filter(Boolean) } : {}) }, payload: $json.reportPayload }) }}",
+        "jsonBody": "={{ JSON.stringify({ source: $('1. Upload Vulnerability Report').item.json.Source || 'wiz-graphql', phase: $('1. Upload Vulnerability Report').item.json.Phase || 'Phase 3 - Full Remediation + Draft PR', policy: { minSeverity: $('1. Upload Vulnerability Report').item.json['Min Severity'] || 'HIGH', ...($('1. Upload Vulnerability Report').item.json['Owned Scopes'] ? { ownedScopes: $('1. Upload Vulnerability Report').item.json['Owned Scopes'].split(',').map(s => s.trim()).filter(Boolean) } : {}) }, payload: $json.reportPayload }) }}",
         "options": {
           "timeout": 3000
         }

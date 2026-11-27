@@ -24,8 +24,8 @@ import {
   loadDefaultOwnershipRules,
 } from "../../shared/ownership-config.ts";
 import {
-  createRunId,
   readRunArtifactJson,
+  resolveRunId,
   saveRunArtifact,
 } from "../../shared/runs.ts";
 
@@ -153,7 +153,7 @@ export function createVulnerabilitiesRoute(
     } else {
       payload = parsedBody;
     }
-    const runId = body.runId?.trim() || createRunId("vuln");
+    const runId = resolveRunId(body.runId, runsStore);
     const persist = body.persist ?? true;
 
     const defaultRules = await loadDefaultOwnershipRules();
@@ -229,7 +229,7 @@ export function createVulnerabilitiesRoute(
     }
 
     const body = parsedBody as Partial<PlanRequestBody>;
-    const runId = body.runId?.trim() || createRunId("plan");
+    const runId = resolveRunId(body.runId, runsStore);
     let findings = body.findings;
     if (findings === undefined && body.runId?.trim()) {
       const stored = await readRunArtifactJson<{

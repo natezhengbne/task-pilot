@@ -6,7 +6,7 @@ import {
 } from "../../services/ai/rescue.ts";
 import type { CommandRunner } from "../../services/remediation/workspace.ts";
 import { runCommand } from "../../shared/exec.ts";
-import { createRunId } from "../../shared/runs.ts";
+import { resolveRunId } from "../../shared/runs.ts";
 
 export interface AiRouteDeps {
   exec?: CommandRunner;
@@ -73,10 +73,7 @@ export function createAiRoute(deps: AiRouteDeps = {}): Hono {
       return c.json({ ok: false, error: "Field `goal` is required." }, 400);
     }
 
-    const runId =
-      typeof body.runId === "string" && body.runId.trim()
-        ? body.runId.trim()
-        : createRunId("ai");
+    const runId = resolveRunId(body.runId, runsStore);
 
     const errorOutput =
       typeof body.errorOutput === "string" ? body.errorOutput : "";

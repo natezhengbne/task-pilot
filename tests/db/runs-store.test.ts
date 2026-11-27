@@ -309,4 +309,30 @@ describe("db/runs-store", () => {
       store.close();
     }
   });
+
+  test("allocateRunId generates sequential IDs, seeds from existing runs, and skips collisions", () => {
+    const store = new RunsStore(":memory:");
+    try {
+      expect(store.allocateRunId()).toBe("run-1");
+      expect(store.allocateRunId()).toBe("run-2");
+      expect(store.allocateRunId()).toBe("run-3");
+
+      // Manually insert run-4 so next allocation skips it
+      store.ensureRun("run-4");
+      expect(store.allocateRunId()).toBe("run-5");
+    } finally {
+      store.close();
+    }
+
+    // Seeding from existing numeric-suffixed runs in a legacy DB (e.g. n8n-7)
+    const seeded = new RunsStore(":memory:");
+    try {
+      seeded.ensureRun("n8n-7");
+      seeded.ensureRun("wmill-82c5b56a");
+      expect(seeded.allocateRunId()).toBe("run-8");
+      expect(seeded.allocateRunId()).toBe("run-9");
+    } finally {
+      seeded.close();
+    }
+  });
 });
