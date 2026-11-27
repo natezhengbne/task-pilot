@@ -271,7 +271,7 @@
         "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/verify' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, workspacePath: $json.workspacePath, plan: $('9. Init Attempt State').first().json.plan, verifyDownstream: $('9. Init Attempt State').first().json.verifyDownstream }) }}",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, workspacePath: $json.workspacePath, plan: $('9. Init Attempt State').first().json.plan, verifyDownstream: $('9. Init Attempt State').first().json.verifyDownstream, copilotOutput: $json.copilotOutput, copilotStructuredOutput: $json.structuredOutput }) }}",
         "options": {
           "timeout": 240000
         }
@@ -310,6 +310,162 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [1720, 560]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-fallback-action",
+              "leftValue": "={{ $json.nextAction || '' }}",
+              "rightValue": "fallback_to_consumers",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "cond-fallback-plans",
+              "leftValue": "={{ ($json.fallbackPlans || []).length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-fallback-consumers",
+      "name": "12a. Fallback to Consumers?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1980, 560]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/workspaces/prepare' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, plans: $json.fallbackPlans || [], reuseExisting: true, installDeps: false }) }}",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "http-prepare-fallback-ws",
+      "name": "📦 12d. Prepare Consumer Fallbacks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2240, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const state = $('9. Init Attempt State').first().json;\nconst patch = $('🤖 10. Copilot Patch').first().json;\nconst verify = $('🧪 11. Verify Patch').first().json;\nconst batch = $input.first().json;\nconst workspaces = batch.workspaces || [];\nconst upstreamNote = `Upstream owned-library (${state.targetRepo}) fallback (${verify.copilotStatus || 'fallback_to_consumers'}): ${verify.fallbackReason || 'Refresh consumer lockfile or apply consumer-scoped fix.'}`;\nconst upstreamContext = {\n  repository: state.targetRepo,\n  status: verify.copilotStatus || 'fallback_to_consumers',\n  reason: verify.fallbackReason || null,\n  copilotSummary: patch.copilotOutput || null,\n};\n\nreturn workspaces.map((ws) => ({\n  json: {\n    runId: ws.runId || state.runId,\n    phase: state.phase,\n    maxRetries: state.maxRetries,\n    creditBudget: state.creditBudget,\n    verifyDownstream: false,\n    plan: ws.plan,\n    targetRepo: ws.targetRepo,\n    baseBranch: ws.baseBranch,\n    remediationBranch: ws.remediationBranch,\n    workspacePath: ws.workspacePath,\n    depsInstalled: Boolean(ws.depsInstalled),\n    attempt: 1,\n    creditsUsed: patch.creditsUsed || 0,\n    previousError: null,\n    extraInstructions: upstreamNote,\n    upstreamContext,\n  },\n}));"
+      },
+      "id": "code-expand-fallback",
+      "name": "12e. Expand Consumer Fallbacks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2500, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/patch' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, workspacePath: $json.workspacePath, plan: $json.plan, attempt: $json.attempt, maxRetries: $json.maxRetries, creditBudget: $json.creditBudget, creditsUsed: $json.creditsUsed, previousError: $json.previousError, depsInstalled: Boolean($json.depsInstalled), extraInstructions: $json.extraInstructions }) }}",
+        "options": {
+          "timeout": 660000
+        }
+      },
+      "id": "http-copilot-patch-consumer",
+      "name": "🤖 12f. Copilot Patch (Consumer)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2760, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/verify' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, workspacePath: $json.workspacePath, plan: $('12e. Expand Consumer Fallbacks').item.json.plan, verifyDownstream: false, copilotOutput: $json.copilotOutput, copilotStructuredOutput: $json.structuredOutput }) }}",
+        "options": {
+          "timeout": 240000
+        }
+      },
+      "id": "http-verify-patch-consumer",
+      "name": "🧪 12g. Verify Patch (Consumer)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3020, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-consumer-verified",
+              "leftValue": "={{ Boolean($json.passed) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-consumer-verified",
+      "name": "12h. Consumer Verified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3280, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/pr' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, workspacePath: $json.workspacePath, plan: $('12e. Expand Consumer Fallbacks').item.json.plan, remediationBranch: $('12e. Expand Consumer Fallbacks').item.json.remediationBranch, baseBranch: $('12e. Expand Consumer Fallbacks').item.json.baseBranch, verification: $json, copilotSummary: $('🤖 12f. Copilot Patch (Consumer)').item.json.copilotOutput, upstreamContext: $('12e. Expand Consumer Fallbacks').item.json.upstreamContext, draft: true, dryRun: $('12e. Expand Consumer Fallbacks').item.json.phase !== 'Phase 3 - Full Remediation + Draft PR' }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "http-create-consumer-pr",
+      "name": "🔀 12i. Create Consumer Draft PR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3540, 320]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const state = $('12e. Expand Consumer Fallbacks').item.json;\nconst patch = $('🤖 12f. Copilot Patch (Consumer)').item.json;\nconst verify = $input.item.json;\n\nreturn {\n  json: {\n    ok: false,\n    status: 'failed',\n    runId: state.runId,\n    targetRepo: state.targetRepo,\n    remediationBranch: state.remediationBranch,\n    attempts: patch.attempt,\n    creditsUsed: patch.creditsUsed,\n    creditBudget: patch.creditBudget,\n    reason: 'Consumer fallback verification failed',\n    failureSummary: verify.failureSummary || patch.error || null,\n  },\n};"
+      },
+      "id": "code-record-consumer-failure",
+      "name": "12j. Record Consumer Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3540, 560]
     },
     {
       "parameters": {
@@ -514,7 +670,49 @@
     "12. Verification Passed?": {
       "main": [
         [{ "node": "🔀 13. Create Draft PR / Report", "type": "main", "index": 0 }],
+        [{ "node": "12a. Fallback to Consumers?", "type": "main", "index": 0 }]
+      ]
+    },
+    "12a. Fallback to Consumers?": {
+      "main": [
+        [{ "node": "📦 12d. Prepare Consumer Fallbacks", "type": "main", "index": 0 }],
         [{ "node": "12b. Retry Budget Remaining?", "type": "main", "index": 0 }]
+      ]
+    },
+    "📦 12d. Prepare Consumer Fallbacks": {
+      "main": [
+        [{ "node": "12e. Expand Consumer Fallbacks", "type": "main", "index": 0 }]
+      ]
+    },
+    "12e. Expand Consumer Fallbacks": {
+      "main": [
+        [{ "node": "🤖 12f. Copilot Patch (Consumer)", "type": "main", "index": 0 }]
+      ]
+    },
+    "🤖 12f. Copilot Patch (Consumer)": {
+      "main": [
+        [{ "node": "🧪 12g. Verify Patch (Consumer)", "type": "main", "index": 0 }]
+      ]
+    },
+    "🧪 12g. Verify Patch (Consumer)": {
+      "main": [
+        [{ "node": "12h. Consumer Verified?", "type": "main", "index": 0 }]
+      ]
+    },
+    "12h. Consumer Verified?": {
+      "main": [
+        [{ "node": "🔀 12i. Create Consumer Draft PR", "type": "main", "index": 0 }],
+        [{ "node": "12j. Record Consumer Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "🔀 12i. Create Consumer Draft PR": {
+      "main": [
+        [{ "node": "8. Loop Over Repos", "type": "main", "index": 0 }]
+      ]
+    },
+    "12j. Record Consumer Failure": {
+      "main": [
+        [{ "node": "14b. Report Repo Failure", "type": "main", "index": 0 }]
       ]
     },
     "12b. Retry Budget Remaining?": {

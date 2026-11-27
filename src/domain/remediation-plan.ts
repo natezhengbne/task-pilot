@@ -501,3 +501,135 @@ export async function planRemediations(
     lockfileWarnings,
   };
 }
+
+/**
+ * Derives `consumer-repo` fallback remediation plans from an `owned-library`
+ * plan when upstream remediation is unnecessary (`RANGE_ALREADY_SATISFIED`)
+ * or unavailable (`fallback_to_consumers`), so downstream consumer repos can
+ * refresh their lockfiles or apply consumer-scoped fixes directly.
+ */
+export function buildConsumerFallbackPlans(
+  plan: RemediationPlan,
+): RemediationPlan[] {
+  if (plan.ownership !== "owned-library" || !Array.isArray(plan.consumers)) {
+    return [];
+  }
+
+  const targetLower = plan.targetRepo.trim().toLowerCase();
+  const seenConsumers = new Set<string>();
+  const distinctConsumers: string[] = [];
+  for (const raw of plan.consumers) {
+    const trimmed = raw.trim();
+    const lower = trimmed.toLowerCase();
+    if (!trimmed || lower === targetLower || seenConsumers.has(lower)) {
+      continue;
+    }
+    seenConsumers.add(lower);
+    distinctConsumers.push(trimmed);
+  }
+
+  if (distinctConsumers.length === 0) {
+    return [];
+  }
+
+  const branch = plan.branch?.trim() || "main";
+  const fallbackPlans: RemediationPlan[] = [];
+
+  for (const consumerRepo of distinctConsumers) {
+    const consumerLower = consumerRepo.toLowerCase();
+    const matchingPackages = plan.packages.filter(
+      (pkg) =>
+        !pkg.consumers ||
+        pkg.consumers.length === 0 ||
+        pkg.consumers.some((c) => c.trim().toLowerCase() === consumerLower),
+    );
+    const sourcePackages =
+      matchingPackages.length > 0 ? matchingPackages : plan.packages;
+
+    let maxSeverity: Severity = "UNKNOWN";
+    const allCVEs = new Set<string>();
+    const allCVESeverities = new Map<string, Severity>();
+    const allFindingIds = new Set<string>();
+    const allRootComponents = new Set<string>();
+    const dedupParts: string[] = [];
+
+    const pkgPlans: RemediationPackagePlan[] = sourcePackages.map((pkg) => {
+      maxSeverity = higherSeverity(maxSeverity, pkg.severity);
+      for (const id of pkg.findingIds ?? []) allFindingIds.add(id);
+      for (const rc of pkg.rootComponents ?? []) allRootComponents.add(rc);
+      for (const detail of pkg.cveDetails ?? []) {
+        allCVEs.add(detail.name);
+        const prev = allCVESeverities.get(detail.name) ?? "UNKNOWN";
+        allCVESeverities.set(detail.name, higherSeverity(prev, detail.severity));
+      }
+      for (const name of pkg.cves ?? []) {
+        allCVEs.add(name);
+        if (!allCVESeverities.has(name)) {
+          allCVESeverities.set(name, pkg.severity);
+        }
+      }
+
+      const nextStrategy: LockfileStrategy =
+        pkg.strategy === "upgrade_upstream"
+          ? pkg.upgradeKind === "major"
+            ? "major_upgrade_requires_approval"
+            : pkg.upgradeKind === "unknown"
+              ? "needs_review"
+              : "upgrade_direct"
+          : pkg.strategy;
+
+      dedupParts.push(
+        `${pkg.component}@${pkg.version || pkg.fixVersion || "unknown"}->${pkg.fixVersion ?? ""}`,
+      );
+
+      return {
+        ...pkg,
+        strategy: nextStrategy,
+        attributionSource: "consumer-fallback",
+        consumers: [consumerRepo],
+      };
+    });
+
+    let dedupKey: string;
+    if (pkgPlans.length === 1) {
+      const p = pkgPlans[0]!;
+      const kv = p.version || p.fixVersion || "unknown";
+      dedupKey =
+        branch === "main"
+          ? `remediate:${consumerRepo}:${p.component}@${kv}`
+          : `remediate:${consumerRepo}:${branch}:${p.component}@${kv}`;
+    } else {
+      dedupKey = `remediate:${consumerRepo}:${branch}:batch-${sha256HexShort(dedupParts.join("|"))}`;
+    }
+
+    const cves = [...allCVEs].sort();
+    const cveDetails: CVEInfo[] = cves
+      .map((name) => ({
+        name,
+        severity: allCVESeverities.get(name) ?? "UNKNOWN",
+      }))
+      .sort(sortCVEInfo);
+
+    fallbackPlans.push({
+      dedupKey,
+      targetRepo: consumerRepo,
+      branch,
+      ownership: "consumer-repo",
+      maxSeverity: maxSeverity === "UNKNOWN" ? plan.maxSeverity : maxSeverity,
+      packageCount: pkgPlans.length,
+      cveCount: cves.length,
+      findingCount: allFindingIds.size || plan.findingCount,
+      consumers: [consumerRepo],
+      rootComponents:
+        allRootComponents.size > 0
+          ? [...allRootComponents].sort()
+          : [...(plan.rootComponents ?? [])],
+      packages: pkgPlans,
+      cves,
+      cveDetails,
+      findingIds: [...allFindingIds].sort(),
+    });
+  }
+
+  return fallbackPlans;
+}

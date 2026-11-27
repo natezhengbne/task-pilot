@@ -46,6 +46,11 @@ describe("http/dashboard", () => {
         totalFindings: 4,
       });
       runsStore.recordPlans("n8n-101", [samplePlan]);
+      runsStore.updateRepo("n8n-101", "acme-org/shared-utils", {
+        status: "patching",
+        creditsUsed: 4,
+        creditBudget: 30,
+      });
 
       const app = createApp({
         apiToken: "secret-token",
@@ -60,15 +65,14 @@ describe("http/dashboard", () => {
       expect(listHtml).toContain("n8n-101");
       expect(listHtml).toContain("Wiz Remediation");
       expect(listHtml).toContain("/runs/stream");
-      expect(listHtml).toContain("run-card");
-      expect(listHtml).toContain("acme-org/shared-utils");
-      expect(listHtml).toContain("from acme-org/web-app");
-      expect(listHtml).toContain("shell-quote");
-      expect(listHtml).toContain("1.8.4");
-      expect(listHtml).toContain("1.11.0");
-      expect(listHtml).toContain("CVE-2026-102422");
+      expect(listHtml).toContain('id="runs-table"');
+      expect(listHtml).toContain("run-row");
+      expect(listHtml).toContain("AI Credits: 4");
+      expect(listHtml).toContain("4 / 30");
+      expect(listHtml).toContain("Details →");
+      expect(listHtml).not.toContain("CVE-2026-102422");
 
-      // Also verify generic run type renders its own card body cleanly
+      // Also verify generic run type renders cleanly in the table
       runsStore.recordIngest("generic-1", {
         runType: "generic",
         source: "manual-webhook",
@@ -77,8 +81,8 @@ describe("http/dashboard", () => {
       const listRes2 = await app.request("/runs");
       const listHtml2 = await listRes2.text();
       expect(listHtml2).toContain("generic-1");
+      expect(listHtml2).toContain("Workflow");
       expect(listHtml2).toContain("manual-webhook");
-      expect(listHtml2).toContain("run-generic-grid");
 
       const detailRes = await app.request("/runs/n8n-101");
       expect(detailRes.status).toBe(200);
@@ -86,6 +90,7 @@ describe("http/dashboard", () => {
       expect(detailHtml).toContain("n8n-101");
       expect(detailHtml).toContain("/runs/n8n-101/stream");
       expect(detailHtml).toContain("view-wiz-remediation");
+      expect(detailHtml).toContain('id="run-total-credits"');
     } finally {
       runsStore.close();
     }

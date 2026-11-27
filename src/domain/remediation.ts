@@ -112,8 +112,10 @@ export interface RemediationVerificationResult {
   downstreamChecks: DownstreamVerificationResult[];
   downstreamEffective?: boolean;
   downstreamUpdateRequired?: boolean;
+  copilotStatus?: RemediationOutcomeStatus | null;
   fallbackToConsumers?: boolean;
   fallbackReason?: string | null;
+  fallbackPlans?: RemediationPlan[];
   nextAction?: RemediationNextAction;
   failureSummary: string | null;
 }
@@ -369,12 +371,20 @@ export function buildDraftPrTitle(plan: RemediationPlan): string {
   return `fix(security): remediate ${plan.packageCount} vulnerable packages (${plan.cveCount} CVEs, max ${plan.maxSeverity})`;
 }
 
+export interface UpstreamTriageContext {
+  repository: string;
+  status?: string | null;
+  reason?: string | null;
+  copilotSummary?: string | null;
+}
+
 export interface DraftPrBodyInput {
   plan: RemediationPlan;
   baseBranch: string;
   remediationBranch: string;
   verification?: RemediationVerificationResult | null;
   copilotSummary?: string | null;
+  upstreamContext?: UpstreamTriageContext | null;
 }
 
 const VALID_OUTCOME_STATUS_SET = new Set<string>(REMEDIATION_OUTCOME_STATUSES);
@@ -532,7 +542,14 @@ export function extractCopilotSummaryForPr(raw: string, maxLen = 4000): string {
  * upgrade rationale, and automated verification results.
  */
 export function buildDraftPrBody(input: DraftPrBodyInput): string {
-  const { plan, baseBranch, remediationBranch, verification, copilotSummary } = input;
+  const {
+    plan,
+    baseBranch,
+    remediationBranch,
+    verification,
+    copilotSummary,
+    upstreamContext,
+  } = input;
   const lines: string[] = [];
 
   lines.push("## Security Vulnerability Remediation (Draft PR)");
@@ -570,6 +587,37 @@ export function buildDraftPrBody(input: DraftPrBodyInput): string {
       lines.push(`### \`${pkg.component}\``);
       for (const p of pkg.paths.slice(0, 5)) {
         lines.push(`- \`${p.join(" -> ")}\``);
+      }
+    }
+  }
+
+  if (upstreamContext?.repository?.trim()) {
+    lines.push("");
+    lines.push("## Upstream Triage Context");
+    lines.push("");
+    lines.push(
+      `This consumer remediation was triggered after evaluating upstream owned-library \`${upstreamContext.repository.trim()}\`:`,
+    );
+    lines.push("");
+    lines.push(`- **Upstream Repository**: \`${upstreamContext.repository.trim()}\``);
+    if (upstreamContext.status?.trim()) {
+      lines.push(`- **Decision Status**: \`${upstreamContext.status.trim()}\``);
+    }
+    if (upstreamContext.reason?.trim()) {
+      lines.push(`- **Rationale**: ${upstreamContext.reason.trim()}`);
+    }
+    if (upstreamContext.copilotSummary?.trim()) {
+      const formattedUpstream = extractCopilotSummaryForPr(
+        upstreamContext.copilotSummary,
+      );
+      if (
+        formattedUpstream &&
+        formattedUpstream.trim() !== upstreamContext.reason?.trim()
+      ) {
+        lines.push("");
+        lines.push("### Upstream Analysis");
+        lines.push("");
+        lines.push(formattedUpstream);
       }
     }
   }

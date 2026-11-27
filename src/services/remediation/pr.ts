@@ -4,6 +4,7 @@ import {
   buildDraftPrBody,
   buildDraftPrTitle,
   type RemediationVerificationResult,
+  type UpstreamTriageContext,
 } from "../../domain/remediation.ts";
 import { runCommand } from "../../shared/exec.ts";
 import { saveRunArtifact } from "../../shared/runs.ts";
@@ -19,6 +20,7 @@ export interface CreateDraftPrInput {
   commitMessage?: string;
   verification?: RemediationVerificationResult | null;
   copilotSummary?: string | null;
+  upstreamContext?: UpstreamTriageContext | null;
   draft?: boolean;
   dryRun?: boolean;
   persist?: boolean;
@@ -69,6 +71,7 @@ export async function createRemediationDraftPr(
     remediationBranch,
     verification: input.verification,
     copilotSummary: input.copilotSummary,
+    upstreamContext: input.upstreamContext,
   });
 
   const slug = targetRepo.replace(/[^a-zA-Z0-9._-]+/g, "_");

@@ -2,10 +2,8 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import type {
   RunListItem,
-  RunRepoRecord,
   RunsStore,
   RunSnapshot,
-  StoredPackageDetail,
 } from "../../db/runs-store.ts";
 
 export interface DashboardRouteDeps {
@@ -72,42 +70,9 @@ function runTypeLabel(runType: string): string {
   }
 }
 
-function repoBadgeClass(status: string): string {
-  switch (status) {
-    case "completed":
-      return "badge-completed";
-    case "failed":
-      return "badge-failed";
-    case "cancelled":
-      return "badge-cancelled";
-    case "partial_failed":
-      return "badge-partial_failed";
-    case "pending":
-      return "badge-pending";
-    default:
-      return "badge-running";
-  }
-}
-
-function formatAttribution(repo: {
-  targetRepo: string;
-  consumers?: string[];
-  rootComponents?: string[];
-}): string {
-  const consumers = (repo.consumers ?? []).filter((c) => c !== repo.targetRepo);
-  const roots = repo.rootComponents ?? [];
-  const parts: string[] = [];
-  if (consumers.length > 0) {
-    parts.push(
-      `from ${consumers[0]}${consumers.length > 1 ? ` +${consumers.length - 1}` : ""}`,
-    );
-  }
-  if (roots.length > 0) {
-    parts.push(
-      `via ${roots.slice(0, 2).join(", ")}${roots.length > 2 ? ` +${roots.length - 2}` : ""}`,
-    );
-  }
-  return parts.join(" · ");
+function shortRepoName(repo: string): string {
+  const idx = repo.indexOf("/");
+  return idx >= 0 ? repo.slice(idx + 1) : repo;
 }
 
 const SHARED_CSS = `
@@ -696,45 +661,50 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 .live-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .live-dot.reconnecting { background: var(--amber); }
 
-/* Per-Run Card List (/runs) */
-.runs-list {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+/* Runs Table (/runs) */
+.table-wrap {
+  overflow-x: auto;
 }
-.run-card {
-  overflow: hidden;
-  transition: border-color 0.15s ease;
+.run-row {
+  cursor: pointer;
+  transition: background 0.12s ease;
 }
-.run-card:hover {
-  border-color: var(--border-strong);
+.run-row:hover {
+  background: var(--surface-hover);
 }
-.run-card-head {
+.run-id-link {
+  font-weight: 600;
+  color: var(--blue);
+  white-space: nowrap;
+}
+.status-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.progress-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 14px 18px 10px;
-}
-.run-card-title {
-  display: flex;
-  align-items: center;
   gap: 10px;
-  flex-wrap: wrap;
-}
-.run-id-link {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--blue);
-}
-.run-card-meta {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
   font-size: 12px;
+  margin-bottom: 5px;
+}
+.stage-pill {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
   color: var(--muted);
+  white-space: nowrap;
+}
+.credit-pill {
+  color: var(--purple);
+  background: var(--purple-soft);
+  border-color: rgba(167, 139, 250, 0.28);
+  font-variant-numeric: tabular-nums;
 }
 .run-detail-link {
   font-size: 12px;
@@ -742,118 +712,8 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
   color: var(--blue);
   white-space: nowrap;
 }
-.run-card-progress {
-  padding: 0 18px 12px;
-  border-bottom: 1px solid var(--border);
-}
-.run-progress-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-  font-size: 12px;
-  margin-bottom: 7px;
-}
-.run-progress-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.run-card-body {
-  padding: 14px 18px 16px;
-  background: rgba(11, 14, 20, 0.28);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.run-repo-block {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px 14px;
-}
-.run-repo-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 6px;
-}
-.run-repo-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-.run-repo-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-  word-break: break-word;
-}
-.run-repo-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 10px;
-}
-.run-repo-error {
-  border: 1px solid rgba(248, 113, 113, 0.32);
-  background: rgba(248, 113, 113, 0.08);
-  border-radius: 6px;
-  padding: 6px 10px;
-  color: #fecaca;
-  font-size: 12px;
-  margin-bottom: 10px;
-  word-break: break-word;
-}
-.expand-toggle-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 500;
-  padding: 5px 12px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-family: inherit;
-  align-self: flex-start;
-}
-.expand-toggle-btn:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-  background: var(--surface-hover);
-}
-.run-generic-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 18px;
-  font-size: 12.5px;
-  color: var(--muted);
-}
-.run-generic-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.run-generic-val {
-  color: var(--text);
-  font-weight: 500;
-}
-.run-body-note {
-  font-size: 12.5px;
-  color: var(--muted);
+.col-right {
+  text-align: right;
 }
 
 @media (max-width: 920px) {
@@ -869,176 +729,26 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 }
 `;
 
-const CARD_DEFAULT_REPOS_LIMIT = 3;
-const CARD_DEFAULT_PKGS_LIMIT = 4;
-const CARD_DEFAULT_CVES_LIMIT = 5;
-
-function renderRunSeverityChips(r: RunListItem): string {
-  const order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
-  const chips: string[] = [];
-  for (const sev of order) {
-    const count = r.severityCounts[sev] ?? 0;
-    if (count > 0) {
-      const short = sev === "CRITICAL" ? "CRIT" : sev === "MEDIUM" ? "MED" : sev;
-      chips.push(`<span class="sev sev-${sev}">${count} ${short}</span>`);
-    }
+function formatCreditsCell(used: number, budget: number | null): string {
+  if (used > 0 || (budget !== null && budget > 0)) {
+    return budget !== null && budget > 0 ? `${used} / ${budget}` : `${used}`;
   }
-  return chips.length > 0 ? `<div class="sev-stack" style="margin-top:0">${chips.join("")}</div>` : "";
+  return "-";
 }
 
-function renderCardPackageRow(
-  runId: string,
-  targetRepo: string,
-  p: StoredPackageDetail,
-): string {
-  const pkgKey = `${runId}::${targetRepo}::${p.component}@${p.version}`;
-  const cveList =
-    p.cveDetails && p.cveDetails.length > 0
-      ? p.cveDetails
-      : (p.cves ?? []).map((name) => ({ name, severity: p.severity || "UNKNOWN" }));
-  const visibleCves = cveList.slice(0, CARD_DEFAULT_CVES_LIMIT);
-  const hiddenCount = cveList.length - visibleCves.length;
-
-  const cveChips = visibleCves
-    .map((c) => {
-      const sev = c.severity || "UNKNOWN";
-      return `<span class="cve-chip sev-${escapeHtml(sev)}">${escapeHtml(sev)} · ${escapeHtml(c.name)}</span>`;
-    })
-    .join("");
-
-  const moreBtn =
-    hiddenCount > 0
-      ? `<button type="button" class="cve-more-btn" data-toggle-cves="${escapeHtml(pkgKey)}">+${hiddenCount} more</button>`
-      : "";
-
-  const verHtml = p.fixVersion
-    ? `${escapeHtml(p.version)} → <span style="color:var(--text)">${escapeHtml(p.fixVersion)}</span>`
-    : escapeHtml(p.version || "-");
-
-  const kindCls = p.upgradeKind === "major" ? "pkg-kind pkg-kind-major" : "pkg-kind";
-  const kindHtml =
-    p.upgradeKind && p.upgradeKind !== "unknown"
-      ? `<span class="${kindCls}">${escapeHtml(p.upgradeKind)}</span>`
-      : "";
-
-  return `<div class="pkg-row">
-    <div class="pkg-left">
-      <span class="pkg-name mono">${escapeHtml(p.component)}</span>
-      <span class="pkg-ver mono">${verHtml}</span>
-      ${kindHtml}
-    </div>
-    <div class="pkg-cves">${cveChips}${moreBtn}</div>
+function renderRunProgressActivity(r: RunListItem): string {
+  const first = r.activeTargets[0];
+  if (!first) {
+    return "";
+  }
+  const extraRepos = r.activeRepos > 1 ? ` +${r.activeRepos - 1}` : "";
+  return `<div class="activity-sub">
+    <span class="pill mono">${escapeHtml(statusLabel(first.status))}</span>
+    <span class="activity-repo mono" title="${escapeHtml(first.targetRepo)}">${escapeHtml(shortRepoName(first.targetRepo))}${escapeHtml(extraRepos)}</span>
   </div>`;
 }
 
-function renderCardRepoBlock(runId: string, repo: RunRepoRecord): string {
-  const attr = formatAttribution(repo);
-  const metaParts: string[] = [
-    `<span class="mono">${repo.packageCount} ${repo.packageCount === 1 ? "package" : "packages"} · ${repo.cveCount} ${repo.cveCount === 1 ? "CVE" : "CVEs"}</span>`,
-  ];
-  if (attr) {
-    metaParts.push(`<span class="pill mono">${escapeHtml(attr)}</span>`);
-  }
-  if (repo.remediationBranch) {
-    metaParts.push(
-      `<span class="pill mono">${escapeHtml(repo.branch)} → ${escapeHtml(repo.remediationBranch)}</span>`,
-    );
-  }
-  if (repo.attempt > 0) {
-    metaParts.push(
-      `<span class="pill mono">Attempt ${repo.attempt}${repo.maxRetries ? `/${repo.maxRetries}` : ""}</span>`,
-    );
-  }
-  if (repo.creditsUsed > 0 || repo.creditBudget) {
-    metaParts.push(
-      `<span class="pill mono">${repo.creditsUsed}${repo.creditBudget ? ` / ${repo.creditBudget}` : ""} credits</span>`,
-    );
-  }
-
-  let actionHtml = "";
-  if (repo.prUrl) {
-    actionHtml = `<a class="pill" style="color:var(--blue);border-color:rgba(79,143,247,0.4)" href="${escapeHtml(repo.prUrl)}" target="_blank" rel="noopener noreferrer">Open Draft PR ↗</a>`;
-  } else if (repo.status === "completed" && repo.dryRun) {
-    actionHtml = `<span class="pill" style="color:var(--green)">Verified (Dry Run)</span>`;
-  }
-
-  const errorHtml = repo.lastError
-    ? `<div class="run-repo-error mono">${escapeHtml(repo.lastError)}</div>`
-    : "";
-
-  const pkgs = repo.packages ?? [];
-  let pkgsHtml = "";
-  if (pkgs.length > 0) {
-    const visiblePkgs = pkgs.slice(0, CARD_DEFAULT_PKGS_LIMIT);
-    const hiddenPkgs = pkgs.length - visiblePkgs.length;
-    const repoKey = `${runId}::${repo.targetRepo}`;
-    const pkgRows = visiblePkgs
-      .map((p) => renderCardPackageRow(runId, repo.targetRepo, p))
-      .join("");
-    pkgsHtml = `<div class="pkg-list">${pkgRows}</div>${
-      hiddenPkgs > 0
-        ? `<div style="margin-top:8px"><button type="button" class="expand-toggle-btn" data-toggle-pkgs="${escapeHtml(repoKey)}">+${hiddenPkgs} more ${hiddenPkgs === 1 ? "package" : "packages"}</button></div>`
-        : ""
-    }`;
-  }
-
-  return `<div class="run-repo-block">
-    <div class="run-repo-head">
-      <div class="run-repo-title">
-        <span class="run-repo-name mono">${escapeHtml(repo.targetRepo)}</span>
-        <span class="badge ${repoBadgeClass(repo.status)}">${escapeHtml(statusLabel(repo.status))}</span>
-      </div>
-      ${actionHtml}
-    </div>
-    <div class="run-repo-meta">${metaParts.join("")}</div>
-    ${errorHtml}
-    ${pkgsHtml}
-  </div>`;
-}
-
-function renderRunCardBody(r: RunListItem): string {
-  const isWiz = r.runType === "wiz-remediation" || r.repos.length > 0;
-  if (isWiz) {
-    if (r.repos.length === 0) {
-      const note =
-        r.error
-          ? `<div class="run-repo-error mono" style="margin-bottom:0">${escapeHtml(r.error)}</div>`
-          : r.status === "running"
-            ? `<div class="run-body-note">Waiting for remediation plans...</div>`
-            : `<div class="run-body-note">No target repositories planned.</div>`;
-      return `<div class="run-card-body">${note}</div>`;
-    }
-
-    const visibleRepos = r.repos.slice(0, CARD_DEFAULT_REPOS_LIMIT);
-    const hiddenRepos = r.repos.length - visibleRepos.length;
-    const repoBlocks = visibleRepos
-      .map((repo) => renderCardRepoBlock(r.runId, repo))
-      .join("");
-    const toggleBtn =
-      hiddenRepos > 0
-        ? `<button type="button" class="expand-toggle-btn" data-toggle-repos="${escapeHtml(r.runId)}">Show all ${r.repos.length} repositories (+${hiddenRepos} more)</button>`
-        : "";
-    return `<div class="run-card-body">${repoBlocks}${toggleBtn}</div>`;
-  }
-
-  // Generic / other run types
-  const items: string[] = [
-    `<span class="run-generic-item">Source: <span class="run-generic-val mono">${escapeHtml(r.source ?? "-")}</span></span>`,
-    `<span class="run-generic-item">Stage: <span class="run-generic-val mono">${escapeHtml(r.currentStage ?? "-")}</span></span>`,
-    `<span class="run-generic-item">Items: <span class="run-generic-val mono">${r.totalFindings}</span></span>`,
-  ];
-  if (r.phase) {
-    items.push(
-      `<span class="run-generic-item">Phase: <span class="run-generic-val mono">${escapeHtml(r.phase)}</span></span>`,
-    );
-  }
-  const errorHtml = r.error
-    ? `<div class="run-repo-error mono" style="margin-bottom:0">${escapeHtml(r.error)}</div>`
-    : "";
-  return `<div class="run-card-body"><div class="run-generic-grid">${items.join("")}</div>${errorHtml}</div>`;
-}
-
-function renderRunsListCards(runs: RunListItem[]): string {
+function renderRunsListRows(runs: RunListItem[]): string {
   return runs
     .map((r) => {
       const doneCount = r.completedRepos;
@@ -1053,56 +763,55 @@ function renderRunsListCards(runs: RunListItem[]): string {
 
       const progressParts: string[] = [];
       if (total > 0) {
-        progressParts.push(`${doneCount}/${total} repos done`);
+        progressParts.push(`${doneCount}/${total} done`);
         if (activeCount > 0) progressParts.push(`${activeCount} active`);
         if (failCount > 0) progressParts.push(`${failCount} failed`);
+      } else if (r.phase) {
+        progressParts.push(r.phase);
+      } else if (r.source) {
+        progressParts.push(r.source);
       } else {
-        progressParts.push(`${r.totalFindings} findings`);
+        progressParts.push("-");
       }
 
-      const summaryBits: string[] = [];
-      if (r.totalFindings > 0) summaryBits.push(`${r.totalFindings} findings`);
-      if (r.totalPackages > 0) summaryBits.push(`${r.totalPackages} pkg`);
-      if (r.totalCves > 0) summaryBits.push(`${r.totalCves} CVEs`);
-
       return `
-        <article class="card run-card" data-run-id="${escapeHtml(r.runId)}" data-started-at="${escapeHtml(r.startedAt)}" data-finished-at="${escapeHtml(r.finishedAt ?? "")}">
-          <div class="run-card-head">
-            <div class="run-card-title">
-              <a class="run-id-link mono" href="${href}">${escapeHtml(r.runId)}</a>
-              <span class="type-pill ${isGeneric ? "type-pill-generic" : ""}">${escapeHtml(runTypeLabel(r.runType))}</span>
+        <tr class="run-row" data-href="${href}" data-run-id="${escapeHtml(r.runId)}" data-started-at="${escapeHtml(r.startedAt)}" data-finished-at="${escapeHtml(r.finishedAt ?? "")}">
+          <td><a class="run-id-link mono" href="${href}">${escapeHtml(r.runId)}</a></td>
+          <td><span class="type-pill ${isGeneric ? "type-pill-generic" : ""}">${escapeHtml(runTypeLabel(r.runType))}</span></td>
+          <td>
+            <div class="status-cell">
               <span class="badge badge-${escapeHtml(r.status)}">${escapeHtml(statusLabel(r.status))}</span>
               ${r.status === "running" ? `<button type="button" class="stop-btn" data-stop-run="${escapeHtml(r.runId)}" title="Mark this run as stopped">Stop</button>` : ""}
             </div>
-            <div class="run-card-meta">
-              ${renderRunSeverityChips(r)}
-              <span class="mono" data-role="duration">${escapeHtml(formatDuration(r.startedAt, r.finishedAt))}</span>
-              <span class="mono">${escapeHtml(r.startedAt.replace("T", " ").slice(0, 19))} UTC</span>
-              <a class="run-detail-link" href="${href}">Details →</a>
-            </div>
-          </div>
-          <div class="run-card-progress">
-            <div class="run-progress-row">
-              <div class="run-progress-left">
-                <span>${escapeHtml(progressParts.join(" · "))}</span>
-                ${total > 0 && summaryBits.length > 0 ? `<span class="muted mono">${escapeHtml(summaryBits.join(" · "))}</span>` : ""}
-              </div>
-              <span class="muted mono">stage: ${escapeHtml(r.currentStage ?? "-")}</span>
+          </td>
+          <td style="min-width:260px">
+            <div class="progress-head">
+              <span>${escapeHtml(progressParts.join(" · "))}</span>
+              <span class="stage-pill mono">${escapeHtml(r.currentStage ?? "-")}</span>
             </div>
             <div class="progress-track">
               <div class="progress-ok" style="width:${okPct}%"></div>
               <div class="progress-run" style="width:${runPct}%"></div>
               <div class="progress-fail" style="width:${failPct}%"></div>
             </div>
-          </div>
-          ${renderRunCardBody(r)}
-        </article>`;
+            ${renderRunProgressActivity(r)}
+          </td>
+          <td style="white-space:nowrap">${
+            r.totalCreditsUsed > 0 || (r.totalCreditBudget !== null && r.totalCreditBudget > 0)
+              ? `<span class="pill mono credit-pill">${escapeHtml(formatCreditsCell(r.totalCreditsUsed, r.totalCreditBudget))}</span>`
+              : `<span class="mono muted">-</span>`
+          }</td>
+          <td class="mono muted" data-role="duration" style="white-space:nowrap">${escapeHtml(formatDuration(r.startedAt, r.finishedAt))}</td>
+          <td class="mono muted" style="white-space:nowrap">${escapeHtml(r.startedAt.replace("T", " ").slice(0, 19))}</td>
+          <td class="col-right"><a class="run-detail-link" href="${href}">Details →</a></td>
+        </tr>`;
     })
     .join("");
 }
 
 function renderRunsListPage(runs: RunListItem[]): string {
-  const cards = renderRunsListCards(runs);
+  const rows = renderRunsListRows(runs);
+  const totalAllCredits = runs.reduce((sum, r) => sum + (r.totalCreditsUsed ?? 0), 0);
 
   return `<!doctype html>
 <html lang="en">
@@ -1119,7 +828,8 @@ function renderRunsListPage(runs: RunListItem[]): string {
         <span class="brand-dot"></span>
         <h1>TaskPilot Runs</h1>
       </div>
-      <div style="display:flex;align-items:center;gap:12px">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span id="runs-total-credits" class="pill mono credit-pill">AI Credits: ${totalAllCredits}</span>
         <span id="runs-count" class="muted">${runs.length} recent run(s)</span>
         <div class="live-pill">
           <span id="live-dot" class="live-dot"></span>
@@ -1127,8 +837,24 @@ function renderRunsListPage(runs: RunListItem[]): string {
         </div>
       </div>
     </div>
-    <div id="runs-empty" class="card empty" style="${runs.length === 0 ? "" : "display:none"}">No runs recorded yet. Trigger an n8n workflow or call <code>POST /api/vulnerabilities/ingest</code> to start one.</div>
-    <div id="runs-list" class="runs-list" style="${runs.length === 0 ? "display:none" : ""}">${cards}</div>
+    <div id="runs-card" class="card table-wrap">
+      <div id="runs-empty" class="empty" style="${runs.length === 0 ? "" : "display:none"}">No runs recorded yet. Trigger an n8n workflow or call <code>POST /api/vulnerabilities/ingest</code> to start one.</div>
+      <table id="runs-table" style="${runs.length === 0 ? "display:none" : ""}">
+        <thead>
+          <tr>
+            <th>Run ID</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>Progress</th>
+            <th>AI Credits</th>
+            <th>Duration</th>
+            <th>Started (UTC)</th>
+            <th class="col-right"></th>
+          </tr>
+        </thead>
+        <tbody id="runs-tbody">${rows}</tbody>
+      </table>
+    </div>
   </div>
 
   <script>
@@ -1147,15 +873,7 @@ function renderRunsListPage(runs: RunListItem[]): string {
       creating_pr: "Creating PR",
     };
 
-    const REPOS_LIMIT = ${CARD_DEFAULT_REPOS_LIMIT};
-    const PKGS_LIMIT = ${CARD_DEFAULT_PKGS_LIMIT};
-    const CVES_LIMIT = ${CARD_DEFAULT_CVES_LIMIT};
-
     const $ = (id) => document.getElementById(id);
-    let latestRuns = [];
-    const expandedRuns = new Set();
-    const expandedRepoPkgs = new Set();
-    const expandedPkgCves = new Set();
 
     function esc(s) {
       return String(s ?? "")
@@ -1181,191 +899,35 @@ function renderRunsListPage(runs: RunListItem[]): string {
       return t || "Workflow";
     }
 
-    function badgeClass(status) {
-      if (status === "completed") return "badge-completed";
-      if (status === "failed") return "badge-failed";
-      if (status === "cancelled") return "badge-cancelled";
-      if (status === "partial_failed") return "badge-partial_failed";
-      if (status === "pending") return "badge-pending";
-      return "badge-running";
+    function shortRepo(repo) {
+      const idx = String(repo || "").indexOf("/");
+      return idx >= 0 ? repo.slice(idx + 1) : (repo || "");
     }
 
-    function attributionText(repo) {
-      const consumers = (repo.consumers || []).filter((c) => c !== repo.targetRepo);
-      const roots = repo.rootComponents || [];
-      const parts = [];
-      if (consumers.length > 0) {
-        parts.push("from " + consumers[0] + (consumers.length > 1 ? " +" + (consumers.length - 1) : ""));
-      }
-      if (roots.length > 0) {
-        parts.push("via " + roots.slice(0, 2).join(", ") + (roots.length > 2 ? " +" + (roots.length - 2) : ""));
-      }
-      return parts.join(" · ");
-    }
-
-    function renderSevHtml(r) {
-      const counts = r.severityCounts || {};
-      const order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
-      const chips = [];
-      for (const sev of order) {
-        const c = counts[sev] || 0;
-        if (c > 0) {
-          const short = sev === "CRITICAL" ? "CRIT" : sev === "MEDIUM" ? "MED" : sev;
-          chips.push('<span class="sev sev-' + sev + '">' + c + ' ' + short + '</span>');
-        }
-      }
-      return chips.length > 0 ? '<div class="sev-stack" style="margin-top:0">' + chips.join("") + '</div>' : '';
-    }
-
-    function renderPkgRowHtml(runId, targetRepo, p) {
-      const pkgKey = runId + "::" + targetRepo + "::" + p.component + "@" + p.version;
-      const cveList = (p.cveDetails && p.cveDetails.length > 0)
-        ? p.cveDetails
-        : (p.cves || []).map((name) => ({ name, severity: p.severity || "UNKNOWN" }));
-      const expanded = expandedPkgCves.has(pkgKey);
-      const visibleCves = expanded ? cveList : cveList.slice(0, CVES_LIMIT);
-      const hiddenCount = cveList.length - visibleCves.length;
-
-      const cveChips = visibleCves.map((c) => {
-        const sev = c.severity || "UNKNOWN";
-        return '<span class="cve-chip sev-' + esc(sev) + '">' + esc(sev) + ' · ' + esc(c.name) + '</span>';
-      }).join("");
-
-      const moreBtn = hiddenCount > 0
-        ? '<button type="button" class="cve-more-btn" data-toggle-cves="' + esc(pkgKey) + '">+' + hiddenCount + ' more</button>'
-        : (expanded && cveList.length > CVES_LIMIT
-          ? '<button type="button" class="cve-more-btn" data-toggle-cves="' + esc(pkgKey) + '">Show less</button>'
-          : '');
-
-      const verHtml = p.fixVersion
-        ? esc(p.version) + ' → <span style="color:var(--text)">' + esc(p.fixVersion) + '</span>'
-        : esc(p.version || "-");
-
-      const kindCls = p.upgradeKind === "major" ? "pkg-kind pkg-kind-major" : "pkg-kind";
-      const kindHtml = p.upgradeKind && p.upgradeKind !== "unknown"
-        ? '<span class="' + kindCls + '">' + esc(p.upgradeKind) + '</span>'
-        : '';
-
-      return '<div class="pkg-row">' +
-        '<div class="pkg-left">' +
-          '<span class="pkg-name mono">' + esc(p.component) + '</span>' +
-          '<span class="pkg-ver mono">' + verHtml + '</span>' +
-          kindHtml +
-        '</div>' +
-        '<div class="pkg-cves">' + cveChips + moreBtn + '</div>' +
+    function renderActivityHtml(r) {
+      const first = (r.activeTargets || [])[0];
+      if (!first) return "";
+      const extraRepos = (r.activeRepos || 0) > 1 ? " +" + (r.activeRepos - 1) : "";
+      return '<div class="activity-sub">' +
+        '<span class="pill mono">' + esc(STATUS_LABELS[first.status] || first.status) + '</span>' +
+        '<span class="activity-repo mono" title="' + esc(first.targetRepo) + '">' + esc(shortRepo(first.targetRepo) + extraRepos) + '</span>' +
       '</div>';
-    }
-
-    function renderRepoBlockHtml(runId, repo) {
-      const attr = attributionText(repo);
-      const pkgWord = repo.packageCount === 1 ? "package" : "packages";
-      const cveWord = repo.cveCount === 1 ? "CVE" : "CVEs";
-      const metaParts = ['<span class="mono">' + repo.packageCount + ' ' + pkgWord + ' · ' + repo.cveCount + ' ' + cveWord + '</span>'];
-      if (attr) metaParts.push('<span class="pill mono">' + esc(attr) + '</span>');
-      if (repo.remediationBranch) {
-        metaParts.push('<span class="pill mono">' + esc(repo.branch) + ' → ' + esc(repo.remediationBranch) + '</span>');
-      }
-      if (repo.attempt > 0) {
-        metaParts.push('<span class="pill mono">Attempt ' + repo.attempt + (repo.maxRetries ? '/' + repo.maxRetries : '') + '</span>');
-      }
-      if (repo.creditsUsed > 0 || repo.creditBudget) {
-        metaParts.push('<span class="pill mono">' + repo.creditsUsed + (repo.creditBudget ? ' / ' + repo.creditBudget : '') + ' credits</span>');
-      }
-
-      let actionHtml = "";
-      if (repo.prUrl) {
-        actionHtml = '<a class="pill" style="color:var(--blue);border-color:rgba(79,143,247,0.4)" href="' + esc(repo.prUrl) + '" target="_blank" rel="noopener noreferrer">Open Draft PR ↗</a>';
-      } else if (repo.status === "completed" && repo.dryRun) {
-        actionHtml = '<span class="pill" style="color:var(--green)">Verified (Dry Run)</span>';
-      }
-
-      const errorHtml = repo.lastError
-        ? '<div class="run-repo-error mono">' + esc(repo.lastError) + '</div>'
-        : '';
-
-      const pkgs = repo.packages || [];
-      let pkgsHtml = "";
-      if (pkgs.length > 0) {
-        const repoKey = runId + "::" + repo.targetRepo;
-        const pkgsExpanded = expandedRepoPkgs.has(repoKey);
-        const visiblePkgs = pkgsExpanded ? pkgs : pkgs.slice(0, PKGS_LIMIT);
-        const hiddenPkgs = pkgs.length - visiblePkgs.length;
-        const pkgRows = visiblePkgs.map((p) => renderPkgRowHtml(runId, repo.targetRepo, p)).join("");
-        let togglePkgBtn = "";
-        if (hiddenPkgs > 0) {
-          togglePkgBtn = '<div style="margin-top:8px"><button type="button" class="expand-toggle-btn" data-toggle-pkgs="' + esc(repoKey) + '">+' + hiddenPkgs + ' more ' + (hiddenPkgs === 1 ? 'package' : 'packages') + '</button></div>';
-        } else if (pkgsExpanded && pkgs.length > PKGS_LIMIT) {
-          togglePkgBtn = '<div style="margin-top:8px"><button type="button" class="expand-toggle-btn" data-toggle-pkgs="' + esc(repoKey) + '">Show fewer packages</button></div>';
-        }
-        pkgsHtml = '<div class="pkg-list">' + pkgRows + '</div>' + togglePkgBtn;
-      }
-
-      return '<div class="run-repo-block">' +
-        '<div class="run-repo-head">' +
-          '<div class="run-repo-title">' +
-            '<span class="run-repo-name mono">' + esc(repo.targetRepo) + '</span>' +
-            '<span class="badge ' + badgeClass(repo.status) + '">' + esc(STATUS_LABELS[repo.status] || repo.status) + '</span>' +
-          '</div>' +
-          actionHtml +
-        '</div>' +
-        '<div class="run-repo-meta">' + metaParts.join("") + '</div>' +
-        errorHtml +
-        pkgsHtml +
-      '</div>';
-    }
-
-    function renderCardBodyHtml(r) {
-      const repos = r.repos || [];
-      const isWiz = r.runType === "wiz-remediation" || repos.length > 0;
-      if (isWiz) {
-        if (repos.length === 0) {
-          const note = r.error
-            ? '<div class="run-repo-error mono" style="margin-bottom:0">' + esc(r.error) + '</div>'
-            : (r.status === "running"
-              ? '<div class="run-body-note">Waiting for remediation plans...</div>'
-              : '<div class="run-body-note">No target repositories planned.</div>');
-          return '<div class="run-card-body">' + note + '</div>';
-        }
-
-        const reposExpanded = expandedRuns.has(r.runId);
-        const visibleRepos = reposExpanded ? repos : repos.slice(0, REPOS_LIMIT);
-        const hiddenRepos = repos.length - visibleRepos.length;
-        const repoBlocks = visibleRepos.map((repo) => renderRepoBlockHtml(r.runId, repo)).join("");
-        let toggleBtn = "";
-        if (hiddenRepos > 0) {
-          toggleBtn = '<button type="button" class="expand-toggle-btn" data-toggle-repos="' + esc(r.runId) + '">Show all ' + repos.length + ' repositories (+' + hiddenRepos + ' more)</button>';
-        } else if (reposExpanded && repos.length > REPOS_LIMIT) {
-          toggleBtn = '<button type="button" class="expand-toggle-btn" data-toggle-repos="' + esc(r.runId) + '">Show fewer repositories</button>';
-        }
-        return '<div class="run-card-body">' + repoBlocks + toggleBtn + '</div>';
-      }
-
-      const items = [
-        '<span class="run-generic-item">Source: <span class="run-generic-val mono">' + esc(r.source || "-") + '</span></span>',
-        '<span class="run-generic-item">Stage: <span class="run-generic-val mono">' + esc(r.currentStage || "-") + '</span></span>',
-        '<span class="run-generic-item">Items: <span class="run-generic-val mono">' + (r.totalFindings || 0) + '</span></span>',
-      ];
-      if (r.phase) {
-        items.push('<span class="run-generic-item">Phase: <span class="run-generic-val mono">' + esc(r.phase) + '</span></span>');
-      }
-      const errorHtml = r.error
-        ? '<div class="run-repo-error mono" style="margin-bottom:0">' + esc(r.error) + '</div>'
-        : '';
-      return '<div class="run-card-body"><div class="run-generic-grid">' + items.join("") + '</div>' + errorHtml + '</div>';
     }
 
     function renderRuns(runs) {
-      latestRuns = runs || [];
-      $("runs-count").textContent = latestRuns.length + " recent run(s)";
-      if (latestRuns.length === 0) {
+      const list = runs || [];
+      const totalAllCredits = list.reduce((sum, r) => sum + (r.totalCreditsUsed || 0), 0);
+      $("runs-total-credits").textContent = "AI Credits: " + totalAllCredits;
+      $("runs-count").textContent = list.length + " recent run(s)";
+      if (list.length === 0) {
         $("runs-empty").style.display = "block";
-        $("runs-list").style.display = "none";
+        $("runs-table").style.display = "none";
         return;
       }
       $("runs-empty").style.display = "none";
-      $("runs-list").style.display = "flex";
+      $("runs-table").style.display = "table";
 
-      const html = latestRuns.map((r) => {
+      const html = list.map((r) => {
         const total = r.totalRepos || 0;
         const done = r.completedRepos || 0;
         const active = r.activeRepos || 0;
@@ -1378,111 +940,93 @@ function renderRunsListPage(runs: RunListItem[]): string {
 
         const progressParts = [];
         if (total > 0) {
-          progressParts.push(done + "/" + total + " repos done");
+          progressParts.push(done + "/" + total + " done");
           if (active > 0) progressParts.push(active + " active");
           if (fail > 0) progressParts.push(fail + " failed");
+        } else if (r.phase) {
+          progressParts.push(r.phase);
+        } else if (r.source) {
+          progressParts.push(r.source);
         } else {
-          progressParts.push((r.totalFindings || 0) + " findings");
+          progressParts.push("-");
         }
 
-        const summaryBits = [];
-        if (r.totalFindings > 0) summaryBits.push(r.totalFindings + " findings");
-        if (r.totalPackages > 0) summaryBits.push(r.totalPackages + " pkg");
-        if (r.totalCves > 0) summaryBits.push(r.totalCves + " CVEs");
+        const usedCr = r.totalCreditsUsed || 0;
+        const budgetCr = r.totalCreditBudget;
+        const creditHtml = (usedCr > 0 || (budgetCr != null && budgetCr > 0))
+          ? '<span class="pill mono credit-pill">' + esc(budgetCr != null && budgetCr > 0 ? usedCr + ' / ' + budgetCr : String(usedCr)) + '</span>'
+          : '<span class="mono muted">-</span>';
 
-        return '<article class="card run-card" data-run-id="' + esc(r.runId) + '" data-started-at="' + esc(r.startedAt) + '" data-finished-at="' + esc(r.finishedAt || "") + '">' +
-          '<div class="run-card-head">' +
-            '<div class="run-card-title">' +
-              '<a class="run-id-link mono" href="' + href + '">' + esc(r.runId) + '</a>' +
-              '<span class="type-pill ' + (isGeneric ? 'type-pill-generic' : '') + '">' + esc(typeLabel(r.runType)) + '</span>' +
+        return '<tr class="run-row" data-href="' + href + '" data-run-id="' + esc(r.runId) + '" data-started-at="' + esc(r.startedAt) + '" data-finished-at="' + esc(r.finishedAt || "") + '">' +
+          '<td><a class="run-id-link mono" href="' + href + '">' + esc(r.runId) + '</a></td>' +
+          '<td><span class="type-pill ' + (isGeneric ? 'type-pill-generic' : '') + '">' + esc(typeLabel(r.runType)) + '</span></td>' +
+          '<td>' +
+            '<div class="status-cell">' +
               '<span class="badge badge-' + esc(r.status) + '">' + esc(STATUS_LABELS[r.status] || r.status) + '</span>' +
               (r.status === "running" ? '<button type="button" class="stop-btn" data-stop-run="' + esc(r.runId) + '" title="Mark this run as stopped">Stop</button>' : '') +
             '</div>' +
-            '<div class="run-card-meta">' +
-              renderSevHtml(r) +
-              '<span class="mono" data-role="duration">' + esc(fmtDuration(r.startedAt, r.finishedAt)) + '</span>' +
-              '<span class="mono">' + esc((r.startedAt || "").replace("T", " ").slice(0, 19)) + ' UTC</span>' +
-              '<a class="run-detail-link" href="' + href + '">Details →</a>' +
-            '</div>' +
-          '</div>' +
-          '<div class="run-card-progress">' +
-            '<div class="run-progress-row">' +
-              '<div class="run-progress-left">' +
-                '<span>' + esc(progressParts.join(" · ")) + '</span>' +
-                (total > 0 && summaryBits.length > 0 ? '<span class="muted mono">' + esc(summaryBits.join(" · ")) + '</span>' : '') +
-              '</div>' +
-              '<span class="muted mono">stage: ' + esc(r.currentStage || "-") + '</span>' +
+          '</td>' +
+          '<td style="min-width:260px">' +
+            '<div class="progress-head">' +
+              '<span>' + esc(progressParts.join(" · ")) + '</span>' +
+              '<span class="stage-pill mono">' + esc(r.currentStage || "-") + '</span>' +
             '</div>' +
             '<div class="progress-track">' +
               '<div class="progress-ok" style="width:' + okPct + '%"></div>' +
               '<div class="progress-run" style="width:' + runPct + '%"></div>' +
               '<div class="progress-fail" style="width:' + failPct + '%"></div>' +
             '</div>' +
-          '</div>' +
-          renderCardBodyHtml(r) +
-        '</article>';
+            renderActivityHtml(r) +
+          '</td>' +
+          '<td style="white-space:nowrap">' + creditHtml + '</td>' +
+          '<td class="mono muted" data-role="duration" style="white-space:nowrap">' + esc(fmtDuration(r.startedAt, r.finishedAt)) + '</td>' +
+          '<td class="mono muted" style="white-space:nowrap">' + esc((r.startedAt || "").replace("T", " ").slice(0, 19)) + '</td>' +
+          '<td class="col-right"><a class="run-detail-link" href="' + href + '">Details →</a></td>' +
+        '</tr>';
       }).join("");
 
-      $("runs-list").innerHTML = html;
+      $("runs-tbody").innerHTML = html;
     }
 
-    // Delegate clicks on "Stop" and expand/collapse buttons in run cards
+    // Delegate clicks on "Stop" button and clickable table rows
     document.addEventListener("click", async (ev) => {
       const target = ev.target;
       if (!target || !target.closest) return;
 
-      const repoToggle = target.closest("[data-toggle-repos]");
-      if (repoToggle) {
-        const key = repoToggle.getAttribute("data-toggle-repos");
-        if (expandedRuns.has(key)) expandedRuns.delete(key);
-        else expandedRuns.add(key);
-        if (latestRuns.length > 0) renderRuns(latestRuns);
-        return;
-      }
-
-      const pkgToggle = target.closest("[data-toggle-pkgs]");
-      if (pkgToggle) {
-        const key = pkgToggle.getAttribute("data-toggle-pkgs");
-        if (expandedRepoPkgs.has(key)) expandedRepoPkgs.delete(key);
-        else expandedRepoPkgs.add(key);
-        if (latestRuns.length > 0) renderRuns(latestRuns);
-        return;
-      }
-
-      const cveToggle = target.closest("[data-toggle-cves]");
-      if (cveToggle) {
-        const key = cveToggle.getAttribute("data-toggle-cves");
-        if (expandedPkgCves.has(key)) expandedPkgCves.delete(key);
-        else expandedPkgCves.add(key);
-        if (latestRuns.length > 0) renderRuns(latestRuns);
-        return;
-      }
-
       const btn = target.closest("[data-stop-run]");
-      if (!btn) return;
-      const runId = btn.getAttribute("data-stop-run");
-      if (!runId) return;
-      btn.disabled = true;
-      btn.textContent = "Stopping...";
-      try {
-        await fetch("/runs/" + encodeURIComponent(runId) + "/cancel", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ reason: "Manually marked stopped from dashboard" }),
-        });
-      } catch {
-        btn.disabled = false;
-        btn.textContent = "Stop";
+      if (btn) {
+        ev.stopPropagation();
+        const runId = btn.getAttribute("data-stop-run");
+        if (!runId) return;
+        btn.disabled = true;
+        btn.textContent = "Stopping...";
+        try {
+          await fetch("/runs/" + encodeURIComponent(runId) + "/cancel", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ reason: "Manually marked stopped from dashboard" }),
+          });
+        } catch {
+          btn.disabled = false;
+          btn.textContent = "Stop";
+        }
+        return;
+      }
+
+      if (target.closest("a, button")) return;
+      const row = target.closest("tr.run-row[data-href]");
+      if (row) {
+        window.location.href = row.getAttribute("data-href");
       }
     });
 
-    // Live 1s elapsed timer for running cards
+    // Live 1s elapsed timer for running rows
     setInterval(() => {
-      const cards = document.querySelectorAll("#runs-list .run-card");
-      for (const card of cards) {
-        if (!card.dataset.finishedAt && card.dataset.startedAt) {
-          const cell = card.querySelector('[data-role="duration"]');
-          if (cell) cell.textContent = fmtDuration(card.dataset.startedAt, null);
+      const rows = document.querySelectorAll("#runs-tbody tr");
+      for (const tr of rows) {
+        if (!tr.dataset.finishedAt && tr.dataset.startedAt) {
+          const cell = tr.querySelector('[data-role="duration"]');
+          if (cell) cell.textContent = fmtDuration(tr.dataset.startedAt, null);
         }
       }
     }, 1000);
@@ -1531,6 +1075,7 @@ function renderRunDetailPage(runId: string): string {
           <span id="run-type-pill" class="type-pill" style="display:none"></span>
           <span id="run-status" class="badge badge-pending">Connecting...</span>
           <span id="run-elapsed" class="pill mono">-</span>
+          <span id="run-total-credits" class="pill mono credit-pill" style="display:none"></span>
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:10px">
@@ -1765,9 +1310,12 @@ function renderRunDetailPage(runId: string): string {
       if (repo.attempt > 0) {
         metaPills.push('<span class="pill mono">Attempt ' + repo.attempt + (repo.maxRetries ? "/" + repo.maxRetries : "") + '</span>');
       }
-      if (repo.creditsUsed > 0 || repo.creditBudget) {
-        metaPills.push('<span class="pill mono">Credits ' + repo.creditsUsed + (repo.creditBudget ? "/" + repo.creditBudget : "") + '</span>');
-      }
+      metaPills.push(
+        '<span class="pill mono credit-pill">AI Credits: ' +
+          (repo.creditsUsed || 0) +
+          (repo.creditBudget ? " / " + repo.creditBudget : "") +
+        '</span>',
+      );
 
       let actionHtml = "";
       if (repo.prUrl) {
@@ -1901,9 +1449,9 @@ function renderRunDetailPage(runId: string): string {
           subLine = p.component + " " + p.version + (p.fixVersion ? " → " + p.fixVersion : "");
         }
         const attr = attributionText(repo);
-        const creditText = (repo.creditsUsed > 0 || repo.creditBudget)
-          ? repo.creditsUsed + (repo.creditBudget ? " / " + repo.creditBudget : "") + " cr"
-          : "";
+        const usedCr = repo.creditsUsed || 0;
+        const creditText = "AI: " + usedCr + (repo.creditBudget ? " / " + repo.creditBudget : "") + " cr";
+        const creditCls = usedCr > 0 ? "pill mono credit-pill" : "mono muted";
 
         return '<button type="button" class="repo-nav-item' + (isSel ? " selected" : "") + '" data-select-repo="' + esc(repo.targetRepo) + '">' +
           '<div class="repo-nav-top">' +
@@ -1914,7 +1462,7 @@ function renderRunDetailPage(runId: string): string {
           (attr ? '<div class="repo-nav-sub mono" style="font-size:11px">' + esc(attr) + '</div>' : '') +
           '<div class="repo-nav-foot">' +
             '<span class="sev sev-' + esc(repo.maxSeverity || "UNKNOWN") + '">' + esc(repo.maxSeverity || "UNKNOWN") + '</span>' +
-            '<span class="mono">' + esc(creditText) + '</span>' +
+            '<span class="' + creditCls + '">' + esc(creditText) + '</span>' +
           '</div>' +
         '</button>';
       }).join("");
@@ -1965,6 +1513,20 @@ function renderRunDetailPage(runId: string): string {
 
       setBadge($("run-status"), run.status);
       $("run-elapsed").textContent = fmtDuration(run.startedAt, run.finishedAt);
+
+      const totalCreditsUsed = repos.reduce((sum, r) => sum + (r.creditsUsed || 0), 0);
+      const hasBudget = repos.some((r) => r.creditBudget != null && r.creditBudget > 0);
+      const totalCreditBudget = hasBudget
+        ? repos.reduce((sum, r) => sum + (r.creditBudget || 0), 0)
+        : null;
+      const totalCreditsEl = $("run-total-credits");
+      if (totalCreditsEl) {
+        totalCreditsEl.style.display = "inline-flex";
+        totalCreditsEl.textContent =
+          "AI Credits: " +
+          totalCreditsUsed +
+          (totalCreditBudget != null ? " / " + totalCreditBudget : "");
+      }
 
       const stopBtn = $("stop-run-btn");
       if (stopBtn) {

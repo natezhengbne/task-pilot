@@ -373,6 +373,11 @@ describe("http/remediation", () => {
         hasGitChanges: boolean;
         fallbackToConsumers: boolean;
         fallbackReason: string | null;
+        fallbackPlans: Array<{
+          targetRepo: string;
+          ownership: string;
+          packages: Array<{ attributionSource: string; strategy: string }>;
+        }>;
         nextAction: string;
       };
       expect(body1.passed).toBe(false);
@@ -380,6 +385,60 @@ describe("http/remediation", () => {
       expect(body1.fallbackToConsumers).toBe(true);
       expect(body1.nextAction).toBe("fallback_to_consumers");
       expect(body1.fallbackReason).toContain("No upstream dependency changes");
+      expect(body1.fallbackPlans).toHaveLength(1);
+      expect(body1.fallbackPlans[0]?.targetRepo).toBe("acme-org/web-app");
+      expect(body1.fallbackPlans[0]?.ownership).toBe("consumer-repo");
+      expect(body1.fallbackPlans[0]?.packages[0]?.attributionSource).toBe(
+        "consumer-fallback",
+      );
+      expect(body1.fallbackPlans[0]?.packages[0]?.strategy).toBe("upgrade_direct");
+
+      // Case 1b: Copilot explicitly reports RANGE_ALREADY_SATISFIED with no edits
+      const res1b = await noChangesApp.request("/api/remediation/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-fallback-range-satisfied",
+          workspacePath: tempDir,
+          plan: samplePlan,
+          copilotStructuredOutput: {
+            status: "RANGE_ALREADY_SATISFIED",
+            impactScope: "PUBLISHED_RUNTIME",
+            repository: samplePlan.targetRepo,
+            vulnerablePackage: "shell-quote",
+            changedFiles: [],
+            validation: {
+              build: "passed",
+              tests: "passed",
+              dependencyCheck: "failed",
+            },
+            downstreamUpdateRequired: true,
+            prReady: false,
+            reason:
+              "Declared transitive ranges already permit patched shell-quote 1.11.0; refresh downstream consumer lockfile.",
+          },
+          persist: false,
+        }),
+      });
+      expect(res1b.status).toBe(200);
+      const body1b = (await res1b.json()) as {
+        passed: boolean;
+        copilotStatus: string | null;
+        fallbackToConsumers: boolean;
+        fallbackReason: string | null;
+        fallbackPlans: Array<{ targetRepo: string }>;
+        nextAction: string;
+      };
+      expect(body1b.passed).toBe(false);
+      expect(body1b.copilotStatus).toBe("RANGE_ALREADY_SATISFIED");
+      expect(body1b.fallbackToConsumers).toBe(true);
+      expect(body1b.nextAction).toBe("fallback_to_consumers");
+      expect(body1b.fallbackReason).toContain(
+        "Declared transitive ranges already permit patched shell-quote 1.11.0",
+      );
+      expect(body1b.fallbackPlans.map((p) => p.targetRepo)).toEqual([
+        "acme-org/web-app",
+      ]);
 
       // Case 2: Copilot added overrides-only patch for target package without changing dependencies
       await Bun.write(
@@ -505,6 +564,48 @@ describe("http/remediation", () => {
     expect(body.prUrl).toBeNull();
     expect(body.title).toContain("shell-quote");
     expect(body.body).toContain("CVE-2026-102422");
+  });
+
+  test("POST /api/remediation/pr embeds upstreamContext triage rationale into consumer PR body", async () => {
+    const app = createApp({ enableLogging: false });
+    const res = await app.request("/api/remediation/pr", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        runId: "test-pr-upstream-ctx",
+        workspacePath: "",
+        plan: {
+          ...samplePlan,
+          targetRepo: "acme-org/web-app",
+          ownership: "consumer-repo",
+          consumers: ["acme-org/web-app"],
+        },
+        remediationBranch: "fix/vuln-shell-quote-1-11-0-consumer",
+        copilotSummary: "Refreshed package-lock.json so shell-quote resolves to 1.12.0.",
+        upstreamContext: {
+          repository: "acme-org/shared-utils",
+          status: "RANGE_ALREADY_SATISFIED",
+          reason:
+            "webpack-dev-server@6.0.0 -> launch-editor@2.14.1 already allows shell-quote@^1.8.4; no library release needed.",
+          copilotSummary:
+            "$ Shell git status\n\n`RANGE_ALREADY_SATISFIED`: webpack-dev-server@6.0.0 -> launch-editor@2.14.1 allows shell-quote@^1.8.4 and 1.11.0 is published.\n\nChanges +0 -0",
+        },
+        dryRun: true,
+        persist: false,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; body: string };
+    expect(body.ok).toBe(true);
+    expect(body.body).toContain("## Upstream Triage Context");
+    expect(body.body).toContain("`acme-org/shared-utils`");
+    expect(body.body).toContain("`RANGE_ALREADY_SATISFIED`");
+    expect(body.body).toContain("no library release needed");
+    expect(body.body).toContain("### Upstream Analysis");
+    expect(body.body).toContain("1.11.0 is published");
+    expect(body.body).toContain("## Upgrade Rationale & Copilot Summary");
+    expect(body.body).toContain("Refreshed package-lock.json");
   });
 
   test("POST /api/remediation/workspaces/prepare defers npm install by default and reuses cached workspace", async () => {

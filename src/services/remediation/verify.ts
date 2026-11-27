@@ -1,15 +1,21 @@
 import { existsSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { RemediationPlan } from "../../domain/remediation-plan.ts";
+import {
+  buildConsumerFallbackPlans,
+  type RemediationPlan,
+} from "../../domain/remediation-plan.ts";
 import {
   inferImpactScope,
+  parseStructuredRemediationOutput,
   type DownstreamVerificationResult,
   type ImpactScope,
   type LockfilePackageVerification,
   type RemediationCommandResult,
   type RemediationNextAction,
+  type RemediationOutcomeStatus,
   type RemediationVerificationResult,
+  type StructuredRemediationOutput,
 } from "../../domain/remediation.ts";
 import { compareSemver, parseSemver } from "../npm/lockfile.ts";
 import { runCommand } from "../../shared/exec.ts";
@@ -29,6 +35,8 @@ export interface VerifyRemediationInput {
   verifyLockfile?: boolean;
   verifyDownstream?: boolean;
   downstreamRepos?: string[];
+  copilotOutput?: string | null;
+  copilotStructuredOutput?: StructuredRemediationOutput | null;
   commandTimeoutMs?: number;
   persist?: boolean;
 }
@@ -547,13 +555,31 @@ export async function verifyRemediationWorkspace(
     input.plan.ownership === "owned-library" && input.plan.consumers.length > 0;
   const downstreamFailed = downstreamChecks.some((dc) => !dc.passed);
 
+  const structuredOutput: StructuredRemediationOutput | null =
+    input.copilotStructuredOutput ??
+    (typeof input.copilotOutput === "string" && input.copilotOutput.trim()
+      ? parseStructuredRemediationOutput(input.copilotOutput)
+      : null);
+  const copilotStatus: RemediationOutcomeStatus | null =
+    structuredOutput?.status ?? null;
+
   let fallbackToConsumers = false;
   let fallbackReason: string | null = null;
   if (!passed && hasConsumers) {
     if (!gitChanges.hasChanges) {
       fallbackToConsumers = true;
-      fallbackReason =
-        "No upstream dependency changes were made in owned-library (parent upgrade unavailable or reverted); fall back to consumer remediation.";
+      if (copilotStatus === "RANGE_ALREADY_SATISFIED") {
+        fallbackReason =
+          structuredOutput?.reason?.trim() ||
+          "Declared dependency ranges in owned-library already satisfy the patched version; refresh downstream consumer lockfile(s).";
+      } else if (copilotStatus === "NO_UPSTREAM_FIX_AVAILABLE") {
+        fallbackReason =
+          structuredOutput?.reason?.trim() ||
+          "No compatible upstream fix is available in owned-library; fall back to consumer remediation.";
+      } else {
+        fallbackReason =
+          "No upstream dependency changes were made in owned-library (parent upgrade unavailable or reverted); fall back to consumer remediation.";
+      }
     } else if (!downstreamEffective) {
       fallbackToConsumers = true;
       fallbackReason = ownedLibraryIneffectiveReason;
@@ -563,6 +589,10 @@ export async function verifyRemediationWorkspace(
         "Downstream consumer validation failed after owned-library upgrade; fall back to consumer remediation.";
     }
   }
+
+  const fallbackPlans = fallbackToConsumers
+    ? buildConsumerFallbackPlans(input.plan)
+    : [];
 
   const nextAction: RemediationNextAction = passed
     ? "create_pr"
@@ -582,8 +612,10 @@ export async function verifyRemediationWorkspace(
     downstreamChecks,
     downstreamEffective,
     downstreamUpdateRequired,
+    copilotStatus,
     fallbackToConsumers,
     fallbackReason,
+    fallbackPlans,
     nextAction,
     failureSummary: passed ? null : failures.join("\n\n"),
   };

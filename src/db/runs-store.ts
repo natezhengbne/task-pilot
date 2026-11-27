@@ -97,6 +97,8 @@ export interface RunListItem extends RunRecord {
   pendingRepos: number;
   totalPackages: number;
   totalCves: number;
+  totalCreditsUsed: number;
+  totalCreditBudget: number | null;
   severityCounts: Record<string, number>;
   activeTargets: RunActiveRepoSummary[];
   repos: RunRepoRecord[];
@@ -1083,6 +1085,9 @@ export class RunsStore {
       let pendingRepos = 0;
       let totalPackages = 0;
       let totalCves = 0;
+      let totalCreditsUsed = 0;
+      let totalCreditBudgetSum = 0;
+      let hasCreditBudget = false;
       const severityCounts: Record<string, number> = {};
       const activeTargets: RunActiveRepoSummary[] = [];
 
@@ -1095,6 +1100,11 @@ export class RunsStore {
         }
         totalPackages += repo.packageCount;
         totalCves += repo.cveCount;
+        totalCreditsUsed += repo.creditsUsed ?? 0;
+        if (repo.creditBudget !== null && repo.creditBudget !== undefined) {
+          totalCreditBudgetSum += repo.creditBudget;
+          hasCreditBudget = true;
+        }
 
         if (repo.packages.length > 0) {
           for (const pkg of repo.packages) {
@@ -1145,6 +1155,8 @@ export class RunsStore {
         pendingRepos,
         totalPackages,
         totalCves,
+        totalCreditsUsed,
+        totalCreditBudget: hasCreditBudget ? totalCreditBudgetSum : null,
         severityCounts,
         activeTargets,
         repos,

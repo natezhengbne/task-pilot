@@ -1,7 +1,11 @@
 import { Hono } from "hono";
 import type { RunsStore, RunStatus } from "../../db/runs-store.ts";
 import type { RemediationPlan } from "../../domain/remediation-plan.ts";
-import type { RemediationVerificationResult } from "../../domain/remediation.ts";
+import type {
+  RemediationVerificationResult,
+  StructuredRemediationOutput,
+  UpstreamTriageContext,
+} from "../../domain/remediation.ts";
 import {
   getCopilotPatchHttpStatus,
   runCopilotRemediationPatch,
@@ -460,6 +464,14 @@ export function createRemediationRoute(
       downstreamRepos: Array.isArray(body.downstreamRepos)
         ? body.downstreamRepos.filter((x): x is string => typeof x === "string")
         : undefined,
+      copilotOutput:
+        typeof body.copilotOutput === "string" ? body.copilotOutput : undefined,
+      copilotStructuredOutput:
+        body.copilotStructuredOutput &&
+        typeof body.copilotStructuredOutput === "object" &&
+        !Array.isArray(body.copilotStructuredOutput)
+          ? (body.copilotStructuredOutput as StructuredRemediationOutput)
+          : undefined,
       commandTimeoutMs:
         typeof body.commandTimeoutMs === "number"
           ? body.commandTimeoutMs
@@ -484,21 +496,32 @@ export function createRemediationRoute(
     try {
       const result = await verifyRemediationWorkspace(input, exec);
       const durationMs = Math.round(performance.now() - startMs);
+      const isFallback = result.nextAction === "fallback_to_consumers";
+      const fallbackTargets = (result.fallbackPlans ?? [])
+        .map((p) => p.targetRepo)
+        .join(", ");
+
       runsStore?.updateRepo(runId, plan.targetRepo, {
         plan,
-        status: "verifying",
-        lastError: result.passed ? null : (result.failureSummary ?? "Verification failed"),
-        clearError: result.passed,
+        status: isFallback ? "completed" : "verifying",
+        lastError:
+          result.passed || isFallback
+            ? null
+            : (result.failureSummary ?? "Verification failed"),
+        clearError: result.passed || isFallback,
         currentStage: "verify",
+        autoFinalize: false,
       });
       runsStore?.recordEvent(runId, {
         targetRepo: plan.targetRepo,
         stage: "verify",
-        status: result.passed ? "succeeded" : "failed",
+        status: result.passed ? "succeeded" : isFallback ? "info" : "failed",
         durationMs,
         message: result.passed
           ? `Verification passed (${result.changedFiles.length} file(s) changed, ${result.commands.length} command(s))`
-          : `Verification failed: ${result.failureSummary ?? "checks did not pass"}`,
+          : isFallback
+            ? `Fallback to consumer(s)${fallbackTargets ? ` (${fallbackTargets})` : ""}${result.copilotStatus ? ` [${result.copilotStatus}]` : ""}: ${result.fallbackReason ?? "upstream change not required/available"}`
+            : `Verification failed: ${result.failureSummary ?? "checks did not pass"}`,
       });
       return c.json({
         ok: true,
@@ -562,6 +585,33 @@ export function createRemediationRoute(
         ? body.runId.trim()
         : createRunId("rem");
 
+    const rawUpstream =
+      body.upstreamContext &&
+      typeof body.upstreamContext === "object" &&
+      !Array.isArray(body.upstreamContext)
+        ? (body.upstreamContext as Record<string, unknown>)
+        : null;
+    const upstreamContext: UpstreamTriageContext | null =
+      rawUpstream &&
+      typeof rawUpstream.repository === "string" &&
+      rawUpstream.repository.trim()
+        ? {
+            repository: rawUpstream.repository.trim(),
+            status:
+              typeof rawUpstream.status === "string"
+                ? rawUpstream.status
+                : null,
+            reason:
+              typeof rawUpstream.reason === "string"
+                ? rawUpstream.reason
+                : null,
+            copilotSummary:
+              typeof rawUpstream.copilotSummary === "string"
+                ? rawUpstream.copilotSummary
+                : null,
+          }
+        : null;
+
     const input: CreateDraftPrInput = {
       runId,
       workspacePath,
@@ -577,6 +627,7 @@ export function createRemediationRoute(
           : null,
       copilotSummary:
         typeof body.copilotSummary === "string" ? body.copilotSummary : null,
+      upstreamContext,
       draft: typeof body.draft === "boolean" ? body.draft : true,
       dryRun,
       persist: typeof body.persist === "boolean" ? body.persist : true,
