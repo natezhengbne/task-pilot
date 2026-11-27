@@ -422,7 +422,7 @@ export class RunsStore {
         status TEXT NOT NULL DEFAULT 'pending',
         attempt INTEGER NOT NULL DEFAULT 0,
         max_retries INTEGER,
-        credits_used INTEGER NOT NULL DEFAULT 0,
+        credits_used REAL NOT NULL DEFAULT 0,
         credit_budget INTEGER,
         cache_hit INTEGER,
         dry_run INTEGER,
@@ -1110,7 +1110,7 @@ export class RunsStore {
         }
         totalPackages += repo.packageCount;
         totalCves += repo.cveCount;
-        totalCreditsUsed += repo.creditsUsed ?? 0;
+        totalCreditsUsed = Math.round((totalCreditsUsed + (repo.creditsUsed ?? 0)) * 100) / 100;
         if (repo.creditBudget !== null && repo.creditBudget !== undefined) {
           totalCreditBudgetSum += repo.creditBudget;
           hasCreditBudget = true;

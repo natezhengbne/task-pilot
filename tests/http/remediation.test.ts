@@ -810,8 +810,8 @@ describe("http/remediation", () => {
           return {
             exitCode: 0,
             stdout:
-              "\u001b[1muxEmbeddedOperationbar\u001b[39m (webpack 5.105.4) compiled with \u001b[1m\u001b[31m61 errors\u001b[39m\u001b[22m in 17741 ms\n",
-            stderr: "",
+              "ERROR in ./src/index.ts:1:1\nModule not found: Error: Can't resolve 'missing-dep'\n\u001b[1muxEmbeddedOperationbar\u001b[39m (webpack 5.105.4) compiled with \u001b[1m\u001b[31m61 errors\u001b[39m\u001b[22m in 17741 ms\n",
+            stderr: "(node:123) [DEP0187] DeprecationWarning: fs.existsSync\n",
             timedOut: false,
           };
         }
@@ -841,6 +841,7 @@ describe("http/remediation", () => {
       expect(body.commands[0]?.passed).toBe(false);
       expect(body.commands[0]?.stderrTail).toContain("61 compilation error(s)");
       expect(body.failureSummary).toContain("silent build/compilation error");
+      expect(body.failureSummary).toContain("Module not found: Error: Can't resolve 'missing-dep'");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

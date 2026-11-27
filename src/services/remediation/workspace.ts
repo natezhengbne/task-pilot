@@ -4,6 +4,10 @@ import { join, resolve } from "node:path";
 import type { RemediationPlan } from "../../domain/remediation-plan.ts";
 import { buildRemediationBranchName } from "../../domain/remediation.ts";
 import { runCommand, type ExecOptions, type ExecResult } from "../../shared/exec.ts";
+import {
+  loadDefaultOwnershipRules,
+  resolveConfiguredRepoBaseBranch,
+} from "../../shared/ownership-config.ts";
 
 export type CommandRunner = (
   cmd: string[],
@@ -192,7 +196,19 @@ export async function prepareRemediationWorkspace(
   exec: CommandRunner = runCommand,
 ): Promise<PrepareWorkspaceResult> {
   const targetRepo = input.plan.targetRepo.trim().replace(/^\/+|\/+$/g, "");
-  const baseBranch = (input.baseBranch ?? input.plan.branch ?? "main").trim() || "main";
+  let configuredBaseBranch: string | null = null;
+  if (!input.baseBranch && input.plan.branchSource !== "config") {
+    const defaultRules = await loadDefaultOwnershipRules().catch(
+      () => ({ repoBaseBranches: undefined }),
+    );
+    configuredBaseBranch = resolveConfiguredRepoBaseBranch(
+      targetRepo,
+      defaultRules.repoBaseBranches,
+    );
+  }
+  const baseBranch =
+    (input.baseBranch ?? configuredBaseBranch ?? input.plan.branch ?? "main").trim() ||
+    "main";
   const remediationBranch =
     input.remediationBranch?.trim() ||
     buildRemediationBranchName(input.plan, input.branchPrefix);
@@ -236,6 +252,20 @@ export async function prepareRemediationWorkspace(
       throw new Error(
         `Failed to clean cached workspace ${targetRepo}: ${(cleanRes.stderr || cleanRes.stdout).trim()}`,
       );
+    }
+
+    // If a previous npm install aborted mid-extraction (e.g. JFrog 403 or timeout),
+    // npm never wrote node_modules/.package-lock.json; purge the half-extracted tree
+    // so subsequent incremental installs do not skip corrupted packages.
+    const nodeModulesDir = join(workspacePath, "node_modules");
+    if (
+      existsSync(nodeModulesDir) &&
+      !existsSync(join(nodeModulesDir, ".package-lock.json"))
+    ) {
+      process.stderr.write(
+        `[workspace] removing incomplete node_modules in ${targetRepo} (missing .package-lock.json — likely interrupted install or 403 abort)\n`,
+      );
+      await rm(nodeModulesDir, { recursive: true, force: true });
     }
 
     const fetchRes = await exec(

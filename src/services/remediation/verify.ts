@@ -19,6 +19,7 @@ import {
 } from "../../domain/remediation.ts";
 import { compareSemver, parseSemver } from "../npm/lockfile.ts";
 import { runCommand } from "../../shared/exec.ts";
+import { loadDefaultOwnershipRules } from "../../shared/ownership-config.ts";
 import { ensureRunDir, saveRunArtifact } from "../../shared/runs.ts";
 import {
   getWorkspaceGitChanges,
@@ -562,8 +563,15 @@ export async function verifyRemediationWorkspace(
         step.exitCode === 0 && !step.timedOut
           ? "exit 0, silent build/compilation error"
           : `exit ${step.exitCode}${step.timedOut ? ", timed out" : ""}`;
+      const cleanStderr = stripAnsi(step.stderrTail).trim();
+      const cleanStdout = stripAnsi(step.stdoutTail).trim();
+      const outputParts: string[] = [];
+      if (cleanStderr) outputParts.push(cleanStderr);
+      if (cleanStdout && cleanStdout !== cleanStderr) {
+        outputParts.push(cleanStderr ? `--- stdout ---\n${cleanStdout}` : cleanStdout);
+      }
       failures.push(
-        `Command '${trimmed}' failed (${detail}):\n${step.stderrTail || step.stdoutTail}`,
+        `Command '${trimmed}' failed (${detail}):\n${outputParts.join("\n")}`,
       );
       break;
     }
@@ -611,8 +619,16 @@ export async function verifyRemediationWorkspace(
         fallbackReason =
           structuredOutput?.reason?.trim() ||
           "No compatible upstream fix is available in owned-library; fall back to consumer remediation.";
+      } else if (
+        copilotStatus === "REGISTRY_BLOCKED_UNRELATED" ||
+        copilotStatus === "ENVIRONMENT_BLOCKED"
+      ) {
+        fallbackReason =
+          structuredOutput?.reason?.trim() ||
+          `Upstream owned-library remediation blocked (${copilotStatus}); fall back to consumer remediation.`;
       } else {
         fallbackReason =
+          structuredOutput?.reason?.trim() ||
           "No upstream dependency changes were made in owned-library (parent upgrade unavailable or reverted); fall back to consumer remediation.";
       }
     } else if (!downstreamEffective) {
@@ -625,9 +641,31 @@ export async function verifyRemediationWorkspace(
     }
   }
 
-  const fallbackPlans = fallbackToConsumers
-    ? buildConsumerFallbackPlans(input.plan)
-    : [];
+  // Surface Copilot's structured blocker/failure diagnosis (e.g. JFrog HTTP 403
+  // REGISTRY_BLOCKED_UNRELATED or ENVIRONMENT_BLOCKED) at the top of failureSummary
+  // so operators immediately see the root cause in the Dashboard.
+  if (
+    !passed &&
+    copilotStatus &&
+    (copilotStatus === "REGISTRY_BLOCKED_UNRELATED" ||
+      copilotStatus === "ENVIRONMENT_BLOCKED" ||
+      copilotStatus === "MANUAL_REVIEW_REQUIRED" ||
+      copilotStatus === "VALIDATION_FAILED") &&
+    structuredOutput?.reason?.trim()
+  ) {
+    failures.unshift(`[${copilotStatus}] ${structuredOutput.reason.trim()}`);
+  }
+
+  let fallbackPlans: RemediationPlan[] = [];
+  if (fallbackToConsumers) {
+    const defaultRules = await loadDefaultOwnershipRules().catch(
+      () => ({ repoBaseBranches: undefined }),
+    );
+    fallbackPlans = buildConsumerFallbackPlans(
+      input.plan,
+      defaultRules.repoBaseBranches,
+    );
+  }
 
   const nextAction: RemediationNextAction = passed
     ? "create_pr"

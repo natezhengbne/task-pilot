@@ -242,6 +242,10 @@ export async function checkCopilotCliStatus(
   }
 }
 
+function roundCredits(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
 /**
  * Parses credit / premium request usage from Copilot CLI output when present;
  * falls back to `defaultCost` per attempt so budget limits are always enforced.
@@ -256,7 +260,7 @@ export function parseCreditsFromOutput(
   if (match?.[1]) {
     const parsed = Number(match[1]);
     if (Number.isFinite(parsed) && parsed > 0) {
-      return Math.ceil(parsed);
+      return roundCredits(parsed);
     }
   }
   return defaultCost;
@@ -273,7 +277,7 @@ export async function runCopilotRemediationPatch(
   const attempt = Math.max(1, Math.floor(input.attempt ?? 1));
   const maxRetries = Math.max(1, Math.floor(input.maxRetries ?? 2));
   const creditBudget = Math.max(1, Math.floor(input.creditBudget ?? 30));
-  const priorCredits = Math.max(0, Math.floor(input.creditsUsed ?? 0));
+  const priorCredits = roundCredits(Math.max(0, Number(input.creditsUsed ?? 0) || 0));
   const creditsPerAttempt = Math.max(1, Math.floor(input.creditsPerAttempt ?? 1));
   const dryRun = Boolean(input.dryRun);
   const persist = input.persist ?? true;
@@ -483,8 +487,8 @@ export async function runCopilotRemediationPatch(
   const spent = isEnvError
     ? 0
     : parseCreditsFromOutput(combinedOutput, creditsPerAttempt);
-  const creditsUsed = priorCredits + spent;
-  const creditsRemaining = Math.max(0, creditBudget - creditsUsed);
+  const creditsUsed = roundCredits(priorCredits + spent);
+  const creditsRemaining = roundCredits(Math.max(0, creditBudget - creditsUsed));
 
   const gitChanges = await getWorkspaceGitChanges(input.workspacePath, exec);
   const structuredOutput = parseStructuredRemediationOutput(combinedOutput);

@@ -832,9 +832,14 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 }
 `;
 
+function formatCreditValue(n: number): string {
+  return String(Math.round((Number(n) || 0) * 100) / 100);
+}
+
 function formatCreditsCell(used: number, budget: number | null): string {
   if (used > 0 || (budget !== null && budget > 0)) {
-    return budget !== null && budget > 0 ? `${used} / ${budget}` : `${used}`;
+    const usedText = formatCreditValue(used);
+    return budget !== null && budget > 0 ? `${usedText} / ${budget}` : usedText;
   }
   return "-";
 }
@@ -980,7 +985,9 @@ function renderRunsListRows(runs: RunListItem[]): string {
 
 function renderRunsListPage(runs: RunListItem[]): string {
   const rows = renderRunsListRows(runs);
-  const totalAllCredits = runs.reduce((sum, r) => sum + (r.totalCreditsUsed ?? 0), 0);
+  const totalAllCredits = formatCreditValue(
+    runs.reduce((sum, r) => sum + (r.totalCreditsUsed ?? 0), 0),
+  );
 
   return `<!doctype html>
 <html lang="en">
@@ -1141,9 +1148,13 @@ function renderRunsListPage(runs: RunListItem[]): string {
       return m ? (m[1] + m[2]) : (runId || "");
     }
 
+    function fmtCr(n) {
+      return String(Math.round((Number(n) || 0) * 100) / 100);
+    }
+
     function renderRuns(runs) {
       const list = runs || [];
-      const totalAllCredits = list.reduce((sum, r) => sum + (r.totalCreditsUsed || 0), 0);
+      const totalAllCredits = fmtCr(list.reduce((sum, r) => sum + (r.totalCreditsUsed || 0), 0));
       $("runs-total-credits").textContent = "AI Credits: " + totalAllCredits;
       $("runs-count").textContent = list.length + " recent run(s)";
       if (list.length === 0) {
@@ -1195,7 +1206,7 @@ function renderRunsListPage(runs: RunListItem[]): string {
         const usedCr = r.totalCreditsUsed || 0;
         const budgetCr = r.totalCreditBudget;
         const creditHtml = (usedCr > 0 || (budgetCr != null && budgetCr > 0))
-          ? '<span class="pill mono credit-pill">' + esc(budgetCr != null && budgetCr > 0 ? usedCr + ' / ' + budgetCr : String(usedCr)) + '</span>'
+          ? '<span class="pill mono credit-pill">' + esc(budgetCr != null && budgetCr > 0 ? fmtCr(usedCr) + ' / ' + budgetCr : fmtCr(usedCr)) + '</span>'
           : '<span class="mono muted">-</span>';
 
         const displayRunId = formatDisplayRunId(r.runId);
@@ -1648,7 +1659,7 @@ function renderRunDetailPage(runId: string): string {
       }
       metaPills.push(
         '<span class="pill mono credit-pill">AI Credits: ' +
-          (repo.creditsUsed || 0) +
+          (Math.round((Number(repo.creditsUsed) || 0) * 100) / 100) +
           (repo.creditBudget ? " / " + repo.creditBudget : "") +
         '</span>',
       );
@@ -1792,7 +1803,7 @@ function renderRunDetailPage(runId: string): string {
           subLine = p.component + " " + p.version + (p.fixVersion ? " → " + p.fixVersion : "");
         }
         const attr = attributionText(repo);
-        const usedCr = repo.creditsUsed || 0;
+        const usedCr = Math.round((Number(repo.creditsUsed) || 0) * 100) / 100;
         const creditText = "AI: " + usedCr + (repo.creditBudget ? " / " + repo.creditBudget : "") + " cr";
         const creditCls = usedCr > 0 ? "pill mono credit-pill" : "mono muted";
         const displayStatus = getRepoDisplayStatus(repo);
@@ -1921,7 +1932,8 @@ function renderRunDetailPage(runId: string): string {
         }
       }
 
-      const totalCreditsUsed = repos.reduce((sum, r) => sum + (r.creditsUsed || 0), 0);
+      const totalCreditsUsed =
+        Math.round(repos.reduce((sum, r) => sum + (r.creditsUsed || 0), 0) * 100) / 100;
       const hasBudget = repos.some((r) => r.creditBudget != null && r.creditBudget > 0);
       const totalCreditBudget = hasBudget
         ? repos.reduce((sum, r) => sum + (r.creditBudget || 0), 0)

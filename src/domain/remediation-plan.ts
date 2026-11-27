@@ -683,6 +683,7 @@ export async function planRemediations(
  */
 export function buildConsumerFallbackPlans(
   plan: RemediationPlan,
+  repoBaseBranches?: Record<string, string>,
 ): RemediationPlan[] {
   if (plan.ownership !== "owned-library" || !Array.isArray(plan.consumers)) {
     return [];
@@ -705,10 +706,15 @@ export function buildConsumerFallbackPlans(
     return [];
   }
 
-  const branch = plan.branch?.trim() || "main";
+  const fallbackBranch = plan.branch?.trim() || "main";
   const fallbackPlans: RemediationPlan[] = [];
 
   for (const consumerRepo of distinctConsumers) {
+    const configuredBranch = resolveConfiguredRepoBaseBranch(
+      consumerRepo,
+      repoBaseBranches,
+    );
+    const branch = configuredBranch ?? fallbackBranch;
     const consumerLower = consumerRepo.toLowerCase();
     const matchingPackages = plan.packages.filter(
       (pkg) =>
@@ -787,6 +793,7 @@ export function buildConsumerFallbackPlans(
       dedupKey,
       targetRepo: consumerRepo,
       branch,
+      ...(configuredBranch ? { branchSource: "config" as const } : {}),
       ownership: "consumer-repo",
       maxSeverity: maxSeverity === "UNKNOWN" ? plan.maxSeverity : maxSeverity,
       packageCount: pkgPlans.length,

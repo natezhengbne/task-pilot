@@ -318,7 +318,8 @@ describe("domain/remediation", () => {
   test("parses credit usage from Copilot output or falls back to default", () => {
     expect(parseCreditsFromOutput("Done. Premium requests used: 3", 1)).toBe(3);
     expect(parseCreditsFromOutput("Done. Credits: 5", 1)).toBe(5);
-    expect(parseCreditsFromOutput("AI Credits 12.66 (5m 13s)", 1)).toBe(13);
+    expect(parseCreditsFromOutput("AI Credits 12.66 (5m 13s)", 1)).toBe(12.66);
+    expect(parseCreditsFromOutput("AI Credits 0.77 (1m 48s)", 1)).toBe(0.77);
     expect(parseCreditsFromOutput("Done without credit footer", 2)).toBe(2);
   });
 

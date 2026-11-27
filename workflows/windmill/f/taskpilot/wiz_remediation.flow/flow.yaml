@@ -451,63 +451,94 @@ value:
                                 const consumerResults: Record<string, any>[] = [];
                                 for (const consumerWs of (fallbackBatch.workspaces ??
                                   []) as PreparedWorkspace[]) {
-                                  const consumerPatch = await postJson(
-                                    apiUrl,
-                                    "/api/remediation/patch",
-                                    {
-                                      runId: consumerWs.runId || runId,
-                                      workspacePath: consumerWs.workspacePath,
-                                      plan: consumerWs.plan,
-                                      attempt: 1,
-                                      maxRetries,
-                                      creditBudget,
-                                      creditsUsed: patch.creditsUsed || 0,
-                                      previousError: null,
-                                      depsInstalled: Boolean(
-                                        consumerWs.depsInstalled,
-                                      ),
-                                      extraInstructions: upstreamNote,
-                                    },
-                                    660_000,
-                                    true,
-                                  );
+                                  let consumerAttempt = 1;
+                                  let consumerCredits = 0;
+                                  let consumerPrevError: string | null = null;
 
-                                  const consumerVerify = await postJson(
-                                    apiUrl,
-                                    "/api/remediation/verify",
-                                    {
-                                      runId: consumerWs.runId || runId,
-                                      workspacePath: consumerWs.workspacePath,
-                                      plan: consumerWs.plan,
-                                      verifyDownstream: false,
-                                      copilotOutput: consumerPatch.copilotOutput,
-                                      copilotStructuredOutput:
-                                        consumerPatch.structuredOutput,
-                                    },
-                                    240_000,
-                                  );
-
-                                  if (consumerVerify.passed) {
-                                    const consumerPr = await postJson(
+                                  while (true) {
+                                    const consumerPatch = await postJson(
                                       apiUrl,
-                                      "/api/remediation/pr",
+                                      "/api/remediation/patch",
                                       {
                                         runId: consumerWs.runId || runId,
                                         workspacePath: consumerWs.workspacePath,
                                         plan: consumerWs.plan,
-                                        remediationBranch:
-                                          consumerWs.remediationBranch,
-                                        baseBranch: consumerWs.baseBranch,
-                                        verification: consumerVerify,
-                                        copilotSummary: consumerPatch.copilotOutput,
-                                        upstreamContext,
-                                        draft: true,
-                                        dryRun,
+                                        attempt: consumerAttempt,
+                                        maxRetries,
+                                        creditBudget,
+                                        creditsUsed: consumerCredits,
+                                        previousError: consumerPrevError,
+                                        depsInstalled: Boolean(
+                                          consumerWs.depsInstalled,
+                                        ),
+                                        extraInstructions: upstreamNote,
                                       },
-                                      120_000,
+                                      660_000,
+                                      true,
                                     );
-                                    consumerResults.push(consumerPr);
-                                  } else {
+
+                                    const consumerVerify = await postJson(
+                                      apiUrl,
+                                      "/api/remediation/verify",
+                                      {
+                                        runId: consumerWs.runId || runId,
+                                        workspacePath: consumerWs.workspacePath,
+                                        plan: consumerWs.plan,
+                                        verifyDownstream: false,
+                                        copilotOutput:
+                                          consumerPatch.copilotOutput,
+                                        copilotStructuredOutput:
+                                          consumerPatch.structuredOutput,
+                                      },
+                                      240_000,
+                                    );
+
+                                    if (consumerVerify.passed) {
+                                      const consumerPr = await postJson(
+                                        apiUrl,
+                                        "/api/remediation/pr",
+                                        {
+                                          runId: consumerWs.runId || runId,
+                                          workspacePath:
+                                            consumerWs.workspacePath,
+                                          plan: consumerWs.plan,
+                                          remediationBranch:
+                                            consumerWs.remediationBranch,
+                                          baseBranch: consumerWs.baseBranch,
+                                          verification: consumerVerify,
+                                          copilotSummary:
+                                            consumerPatch.copilotOutput,
+                                          upstreamContext,
+                                          draft: true,
+                                          dryRun,
+                                        },
+                                        120_000,
+                                      );
+                                      consumerResults.push(consumerPr);
+                                      break;
+                                    }
+
+                                    const curConsumerAttempt = Number(
+                                      consumerPatch.attempt || consumerAttempt,
+                                    );
+                                    const curConsumerCredits = Number(
+                                      consumerPatch.creditsUsed ||
+                                        consumerCredits,
+                                    );
+                                    const canRetryConsumer =
+                                      curConsumerAttempt < maxRetries &&
+                                      curConsumerCredits < creditBudget;
+
+                                    if (canRetryConsumer) {
+                                      consumerAttempt = curConsumerAttempt + 1;
+                                      consumerCredits = curConsumerCredits;
+                                      consumerPrevError =
+                                        consumerVerify.failureSummary ||
+                                        consumerPatch.error ||
+                                        "Consumer fallback verification failed.";
+                                      continue;
+                                    }
+
                                     const failure = {
                                       ok: false,
                                       status: "failed",
@@ -515,9 +546,9 @@ value:
                                       targetRepo: consumerWs.targetRepo,
                                       remediationBranch:
                                         consumerWs.remediationBranch,
-                                      attempts: consumerPatch.attempt,
-                                      creditsUsed: consumerPatch.creditsUsed,
-                                      creditBudget: consumerPatch.creditBudget,
+                                      attempts: curConsumerAttempt,
+                                      creditsUsed: curConsumerCredits,
+                                      creditBudget,
                                       reason:
                                         "Consumer fallback verification failed",
                                       failureSummary:
@@ -532,7 +563,8 @@ value:
                                         runId: failure.runId,
                                         targetRepo: failure.targetRepo,
                                         reason:
-                                          failure.failureSummary || failure.reason,
+                                          failure.failureSummary ||
+                                          failure.reason,
                                         attempt: failure.attempts,
                                         creditsUsed: failure.creditsUsed,
                                         creditBudget: failure.creditBudget,
@@ -540,6 +572,7 @@ value:
                                       10_000,
                                     );
                                     consumerResults.push(failure);
+                                    break;
                                   }
                                 }
                                 return consumerResults;
@@ -668,10 +701,27 @@ value:
                       });
                       const finalize = await res.json();
 
+                      const failedItems = items.filter(
+                        (d) => d?.ok === false || d?.status === "failed",
+                      );
+                      const finalStatus =
+                        finalize?.status ||
+                        (failedItems.length > 0 ? "failed" : "completed");
+
+                      if (
+                        failedItems.length > 0 ||
+                        finalStatus === "failed" ||
+                        finalStatus === "partial_failed"
+                      ) {
+                        throw new Error(
+                          `Remediation run ${runId} finished with status '${finalStatus}' (${failedItems.length} failed):\n\n${summary}`,
+                        );
+                      }
+
                       return {
                         runId,
                         dashboardUrl: finalize?.dashboardUrl || dashboardUrl,
-                        status: finalize?.status || "completed",
+                        status: finalStatus,
                         processedCount: items.length,
                         summary,
                         results: items,
