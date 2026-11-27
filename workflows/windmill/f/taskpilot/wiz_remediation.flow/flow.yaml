@@ -775,7 +775,7 @@ schema:
   properties:
     report_file:
       type: string
-      format: base64
+      contentEncoding: base64
       description: "Upload a vulnerability export JSON file (e.g. Wiz GraphQL JSON)"
     source:
       type: string
