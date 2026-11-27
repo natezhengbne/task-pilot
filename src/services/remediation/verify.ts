@@ -2,12 +2,14 @@ import { existsSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { RemediationPlan } from "../../domain/remediation-plan.ts";
-import type {
-  DownstreamVerificationResult,
-  LockfilePackageVerification,
-  RemediationCommandResult,
-  RemediationNextAction,
-  RemediationVerificationResult,
+import {
+  inferImpactScope,
+  type DownstreamVerificationResult,
+  type ImpactScope,
+  type LockfilePackageVerification,
+  type RemediationCommandResult,
+  type RemediationNextAction,
+  type RemediationVerificationResult,
 } from "../../domain/remediation.ts";
 import { compareSemver, parseSemver } from "../npm/lockfile.ts";
 import { runCommand } from "../../shared/exec.ts";
@@ -317,6 +319,23 @@ function collectOverrideTargets(
   return out;
 }
 
+function hasPackageInRuntimeDeps(
+  pkg: Record<string, unknown>,
+  pkgName: string,
+): boolean {
+  for (const field of [
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+  ] as const) {
+    const map = pkg[field];
+    if (isRecord(map) && typeof map[pkgName] === "string") {
+      return true;
+    }
+  }
+  return false;
+}
+
 export interface OwnedLibraryChangeEvaluation {
   downstreamEffective: boolean;
   reason: string | null;
@@ -324,16 +343,20 @@ export interface OwnedLibraryChangeEvaluation {
 
 /**
  * Evaluates whether `package.json` changes in an `owned-library` repo will
- * propagate to downstream consumers. Returns `downstreamEffective: false` if
- * runtime dependency maps (`dependencies`, `optionalDependencies`, `peerDependencies`)
- * were untouched while target vulnerable package(s) were patched solely via npm `overrides`.
+ * propagate cleanly to downstream consumers. Returns `downstreamEffective: false` if:
+ * 1. A transitive target vulnerable package was newly added directly into runtime
+ *    dependencies (phantom direct dependency injection), OR
+ * 2. Runtime dependency maps (`dependencies`, `optionalDependencies`, `peerDependencies`)
+ *    were untouched (e.g. patched only via npm `overrides`, `devDependencies`, or lockfile).
  */
 export function evaluateOwnedLibraryPackageJsonChange(
   basePkgText: string | null,
   currentPkgText: string | null,
   plan: RemediationPlan,
+  impactScope?: ImpactScope,
 ): OwnedLibraryChangeEvaluation {
-  if (plan.ownership !== "owned-library") {
+  const scope = impactScope ?? inferImpactScope(plan);
+  if (plan.ownership !== "owned-library" || scope !== "PUBLISHED_RUNTIME") {
     return { downstreamEffective: true, reason: null };
   }
   if (!basePkgText?.trim() || !currentPkgText?.trim()) {
@@ -352,6 +375,22 @@ export function evaluateOwnedLibraryPackageJsonChange(
     currentPkg = parsedCurrent;
   } catch {
     return { downstreamEffective: true, reason: null };
+  }
+
+  const newlyAddedTargetRuntimeDeps = plan.packages
+    .map((p) => p.component)
+    .filter(
+      (pkgName) =>
+        !hasPackageInRuntimeDeps(basePkg, pkgName) &&
+        hasPackageInRuntimeDeps(currentPkg, pkgName),
+    );
+
+  if (newlyAddedTargetRuntimeDeps.length > 0) {
+    const list = newlyAddedTargetRuntimeDeps.map((p) => `\`${p}\``).join(", ");
+    return {
+      downstreamEffective: false,
+      reason: `Owned-library patch added transitive vulnerable package(s) ${list} directly into runtime dependencies instead of upgrading or removing the parent dependency; this pollutes the library's dependency contract and does not reliably fix downstream consumer lockfiles.`,
+    };
   }
 
   const runtimeDepsUnchanged =
@@ -380,7 +419,11 @@ export function evaluateOwnedLibraryPackageJsonChange(
     };
   }
 
-  return { downstreamEffective: true, reason: null };
+  return {
+    downstreamEffective: false,
+    reason:
+      "Owned-library patch did not modify `dependencies`, `optionalDependencies`, or `peerDependencies`; changes outside runtime dependencies (such as `overrides`, `devDependencies`, or `package-lock.json`) do not propagate to downstream consumers.",
+  };
 }
 
 /**
@@ -411,29 +454,38 @@ export async function verifyRemediationWorkspace(
     failures.push("No git file changes were detected in the workspace after patch.");
   }
 
+  const impactScope = inferImpactScope(input.plan);
   let downstreamEffective = true;
   let ownedLibraryIneffectiveReason: string | null = null;
   const packageJsonPath = join(input.workspacePath, "package.json");
   if (
     input.plan.ownership === "owned-library" &&
-    gitChanges.changedFiles.includes("package.json") &&
-    existsSync(packageJsonPath)
+    impactScope === "PUBLISHED_RUNTIME" &&
+    gitChanges.hasChanges
   ) {
-    const basePkgRes = await exec(["git", "show", "HEAD:package.json"], {
-      cwd: input.workspacePath,
-      timeoutMs: 10_000,
-    });
-    const basePkgText = basePkgRes.exitCode === 0 ? basePkgRes.stdout : null;
-    const currentPkgText = await Bun.file(packageJsonPath).text();
-    const evalRes = evaluateOwnedLibraryPackageJsonChange(
-      basePkgText,
-      currentPkgText,
-      input.plan,
-    );
-    downstreamEffective = evalRes.downstreamEffective;
-    ownedLibraryIneffectiveReason = evalRes.reason;
-    if (!downstreamEffective && ownedLibraryIneffectiveReason) {
+    if (!gitChanges.changedFiles.includes("package.json")) {
+      downstreamEffective = false;
+      ownedLibraryIneffectiveReason =
+        "Owned-library patch did not modify `package.json`; lockfile-only changes do not propagate to downstream consumers.";
       failures.push(ownedLibraryIneffectiveReason);
+    } else if (existsSync(packageJsonPath)) {
+      const basePkgRes = await exec(["git", "show", "HEAD:package.json"], {
+        cwd: input.workspacePath,
+        timeoutMs: 10_000,
+      });
+      const basePkgText = basePkgRes.exitCode === 0 ? basePkgRes.stdout : null;
+      const currentPkgText = await Bun.file(packageJsonPath).text();
+      const evalRes = evaluateOwnedLibraryPackageJsonChange(
+        basePkgText,
+        currentPkgText,
+        input.plan,
+        impactScope,
+      );
+      downstreamEffective = evalRes.downstreamEffective;
+      ownedLibraryIneffectiveReason = evalRes.reason;
+      if (!downstreamEffective && ownedLibraryIneffectiveReason) {
+        failures.push(ownedLibraryIneffectiveReason);
+      }
     }
   }
 
@@ -518,6 +570,8 @@ export async function verifyRemediationWorkspace(
       ? "fallback_to_consumers"
       : "retry_patch";
 
+  const downstreamUpdateRequired = passed && impactScope === "PUBLISHED_RUNTIME";
+
   const result: RemediationVerificationResult = {
     passed,
     hasGitChanges: gitChanges.hasChanges,
@@ -527,6 +581,7 @@ export async function verifyRemediationWorkspace(
     commands: commandResults,
     downstreamChecks,
     downstreamEffective,
+    downstreamUpdateRequired,
     fallbackToConsumers,
     fallbackReason,
     nextAction,

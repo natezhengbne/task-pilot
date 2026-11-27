@@ -326,6 +326,16 @@ export function createRemediationRoute(
         typeof body.previousError === "string" ? body.previousError : null,
       depsInstalled:
         typeof body.depsInstalled === "boolean" ? body.depsInstalled : undefined,
+      impactScope:
+        body.impactScope === "PUBLISHED_RUNTIME" ||
+        body.impactScope === "BUILD_OR_DEV" ||
+        body.impactScope === "UNKNOWN"
+          ? body.impactScope
+          : undefined,
+      allowUnrelated403Overrides:
+        typeof body.allowUnrelated403Overrides === "boolean"
+          ? body.allowUnrelated403Overrides
+          : undefined,
       model: typeof body.model === "string" ? body.model : undefined,
       extraInstructions:
         typeof body.extraInstructions === "string"

@@ -1,4 +1,30 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { RemediationPlan } from "./remediation-plan.ts";
+
+export const DEFAULT_REMEDIATION_SKILL_PATH = resolve(
+  import.meta.dir,
+  "../../skills/npm-remediation/SKILL.md",
+);
+
+const skillCache = new Map<string, string>();
+
+/**
+ * Loads the Markdown remediation skill playbook (stripping YAML frontmatter)
+ * so prompt rules live in a single human-reviewable `SKILL.md` file.
+ */
+export function loadRemediationSkill(
+  skillPath = DEFAULT_REMEDIATION_SKILL_PATH,
+): string {
+  const cached = skillCache.get(skillPath);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const raw = readFileSync(skillPath, "utf8").replace(/\r\n/g, "\n");
+  const stripped = raw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  skillCache.set(skillPath, stripped);
+  return stripped;
+}
 
 export interface RemediationCommandResult {
   command: string;
@@ -28,6 +54,49 @@ export interface DownstreamVerificationResult {
   error?: string;
 }
 
+export type ImpactScope = "PUBLISHED_RUNTIME" | "BUILD_OR_DEV" | "UNKNOWN";
+
+export const REMEDIATION_OUTCOME_STATUSES = [
+  "UPSTREAM_PARENT_UPGRADED",
+  "MOVED_TO_DEV_DEPENDENCIES",
+  "LOCKFILE_REFRESHED",
+  "UPSTREAM_LIBRARY_UPGRADED",
+  "OVERRIDES_APPLIED",
+  "RANGE_ALREADY_SATISFIED",
+  "NO_UPSTREAM_FIX_AVAILABLE",
+  "REGISTRY_BLOCKED_UNRELATED",
+  "ENVIRONMENT_BLOCKED",
+  "MANUAL_REVIEW_REQUIRED",
+  "VALIDATION_FAILED",
+] as const;
+
+export type RemediationOutcomeStatus =
+  (typeof REMEDIATION_OUTCOME_STATUSES)[number];
+
+export type ValidationCheckStatus =
+  | "passed"
+  | "failed"
+  | "not_run"
+  | "not_configured";
+
+export interface StructuredRemediationOutput {
+  status: RemediationOutcomeStatus;
+  impactScope: ImpactScope;
+  repository: string;
+  vulnerablePackage: string;
+  advisories?: string[];
+  changedFiles: string[];
+  validation: {
+    build: ValidationCheckStatus;
+    lint?: ValidationCheckStatus;
+    tests: ValidationCheckStatus;
+    dependencyCheck: ValidationCheckStatus;
+  };
+  downstreamUpdateRequired: boolean;
+  prReady: boolean;
+  reason?: string;
+}
+
 export type RemediationNextAction =
   | "create_pr"
   | "retry_patch"
@@ -42,6 +111,7 @@ export interface RemediationVerificationResult {
   commands: RemediationCommandResult[];
   downstreamChecks: DownstreamVerificationResult[];
   downstreamEffective?: boolean;
+  downstreamUpdateRequired?: boolean;
   fallbackToConsumers?: boolean;
   fallbackReason?: string | null;
   nextAction?: RemediationNextAction;
@@ -54,7 +124,25 @@ export interface CopilotPromptOptions {
   previousError?: string | null;
   detectedScripts?: string[];
   depsInstalled?: boolean;
+  impactScope?: ImpactScope;
+  allowUnrelated403Overrides?: boolean;
   extraInstructions?: string;
+  skillPath?: string;
+}
+
+/**
+ * Infers the vulnerability impact scope from the remediation plan:
+ * - `PUBLISHED_RUNTIME` when an owned library has downstream consumer repo(s) affected.
+ * - `UNKNOWN` otherwise (so the agent inspects `package.json` / scan scope rather than assuming).
+ */
+export function inferImpactScope(plan: RemediationPlan): ImpactScope {
+  if (
+    plan.ownership === "owned-library" &&
+    plan.consumers.some((c) => c !== plan.targetRepo)
+  ) {
+    return "PUBLISHED_RUNTIME";
+  }
+  return "UNKNOWN";
 }
 
 function slugify(input: string, maxLen = 32): string {
@@ -87,9 +175,75 @@ export function buildRemediationBranchName(
   return `${cleanPrefix}-batch-${plan.packages.length}pkgs-${shortHash}`;
 }
 
+export interface DirectParentInsight {
+  directParents: string[];
+  localChains: string[];
+  isDirectDependency: boolean;
+}
+
 /**
- * Builds a structured, deterministic prompt for GitHub Copilot CLI to remediate
- * all vulnerable packages in a repository-level `RemediationPlan`.
+ * Extracts the direct dependency (parent) inside `plan.targetRepo` from lockfile
+ * dependency paths so Copilot immediately knows which parent package (e.g.
+ * `webpack-dev-server`) to inspect and upgrade first.
+ */
+export function extractDirectParentInsight(
+  plan: RemediationPlan,
+  pkg: RemediationPlan["packages"][number],
+): DirectParentInsight {
+  const directParents = new Set<string>();
+  const localChains = new Set<string>();
+  let isDirectDependency = false;
+
+  const repoLower = plan.targetRepo.toLowerCase();
+  const repoShort = repoLower.split("/").pop() ?? repoLower;
+  const scopedTarget = `@${repoLower}`;
+  const rootComponentSet = new Set(
+    plan.rootComponents.map((c) => c.toLowerCase()),
+  );
+
+  for (const path of pkg.paths) {
+    if (path.length === 0) continue;
+
+    let startIdx = -1;
+    if (plan.ownership === "owned-library") {
+      startIdx = path.findIndex((seg) => {
+        const lower = seg.toLowerCase();
+        return (
+          lower === scopedTarget ||
+          lower === repoLower ||
+          lower === repoShort ||
+          lower.endsWith(`/${repoShort}`) ||
+          rootComponentSet.has(lower)
+        );
+      });
+    } else {
+      startIdx = 0;
+    }
+
+    if (startIdx >= 0 && startIdx + 1 < path.length) {
+      const localSlice = path.slice(startIdx + 1);
+      const firstDep = localSlice[0];
+      if (!firstDep) continue;
+      if (firstDep === pkg.component) {
+        isDirectDependency = true;
+      } else {
+        directParents.add(firstDep);
+        localChains.add(localSlice.join(" -> "));
+      }
+    }
+  }
+
+  return {
+    directParents: [...directParents],
+    localChains: [...localChains],
+    isDirectDependency,
+  };
+}
+
+/**
+ * Builds a structured, deterministic prompt for GitHub Copilot CLI by combining
+ * the dynamic repository task brief with the shared `skills/npm-remediation/SKILL.md`
+ * playbook.
  */
 export function buildCopilotRemediationPrompt(
   plan: RemediationPlan,
@@ -99,26 +253,69 @@ export function buildCopilotRemediationPrompt(
   const maxRetries = options.maxRetries ?? 1;
   const lines: string[] = [];
 
+  const pkgInsights = plan.packages.map((pkg) => ({
+    pkg,
+    insight: extractDirectParentInsight(plan, pkg),
+  }));
+
+  const impactScope = options.impactScope ?? inferImpactScope(plan);
+  const allowUnrelated403 = Boolean(options.allowUnrelated403Overrides);
+
+  lines.push("# Task Brief");
+  lines.push("");
   lines.push(
-    `You are remediating security vulnerabilities in repository \`${plan.targetRepo}\` (base branch \`${plan.branch}\`).`,
+    `- **Repository**: \`${plan.targetRepo}\` (base branch: \`${plan.branch}\`)`,
   );
   lines.push(
-    `Ownership role: \`${plan.ownership}\`${
+    `- **Ownership Role**: \`${plan.ownership}\`${
       plan.consumers.length > 0
-        ? ` (affected consumer repos: ${plan.consumers.join(", ")})`
+        ? ` — downstream consumer(s): ${plan.consumers.map((c) => `\`${c}\``).join(", ")}`
         : ""
-    }.`,
+    }`,
   );
+  lines.push(`- **Impact Scope**: \`${impactScope}\``);
+  lines.push("- **Package Manager**: `npm`");
+  lines.push(
+    options.depsInstalled
+      ? "- **Install Mode**: `pre-installed` (`node_modules` is already present in this cached workspace; do NOT delete `node_modules`)."
+      : "- **Install Mode**: `deferred` (dependencies were intentionally NOT installed before patching; do NOT run `npm install` before editing `package.json`).",
+  );
+  lines.push(
+    allowUnrelated403
+      ? "- **Unrelated 403 Scope Expansion**: `allowed` (same-major scoped `overrides` permitted only for HTTP 403 registry-blocked unrelated transitive packages; must be listed separately for PR audit)."
+      : "- **Unrelated 403 Scope Expansion**: `forbidden` (default — if `npm install` fails with HTTP 403 on an unrelated package, stop and report `STATUS: REGISTRY_BLOCKED_UNRELATED` instead of expanding PR scope).",
+  );
+  if (options.detectedScripts && options.detectedScripts.length > 0) {
+    lines.push(
+      `- **Verification Scripts**: ${options.detectedScripts.map((s) => `\`npm run ${s}\``).join(", ")}`,
+    );
+  } else {
+    lines.push(
+      "- **Verification Scripts**: run the repository's build/lint/test scripts if present.",
+    );
+  }
+
   lines.push("");
   lines.push("## Target Vulnerable Packages");
   lines.push("");
 
-  for (const pkg of plan.packages) {
+  for (const { pkg, insight } of pkgInsights) {
     const target = pkg.fixVersion ? `>= ${pkg.fixVersion}` : "latest patched version";
     const cveList = pkg.cves.length > 0 ? pkg.cves.join(", ") : "N/A";
     lines.push(
       `- **${pkg.component}**: \`${pkg.version || "unknown"}\` -> \`${target}\` (severity: ${pkg.severity}, upgrade: ${pkg.upgradeKind}, strategy: ${pkg.strategy}, CVEs: ${cveList})`,
     );
+    if (insight.directParents.length > 0) {
+      const parents = insight.directParents.map((p) => `\`${p}\``).join(", ");
+      const chains = insight.localChains.slice(0, 3).map((c) => `\`${c}\``).join(" ; ");
+      lines.push(
+        `  - **Direct parent to inspect first**: ${parents}${chains ? ` (local chain: ${chains})` : ""}`,
+      );
+    } else if (insight.isDirectDependency) {
+      lines.push(
+        `  - **Direct dependency**: \`${pkg.component}\` is declared directly in this repository; upgrade it directly in \`package.json\`.`,
+      );
+    }
     if (pkg.paths.length > 0) {
       const samplePaths = pkg.paths
         .slice(0, 3)
@@ -129,49 +326,9 @@ export function buildCopilotRemediationPrompt(
   }
 
   lines.push("");
-  lines.push("## Remediation Rules");
-  lines.push(
-    "1. Inspect `package.json` and `package-lock.json` first to understand how each vulnerable package is pulled in.",
-  );
-  lines.push(
-    "2. **Check direct/parent upgrades with evidence before using `overrides`**: Before concluding a transitive vulnerability cannot be fixed via a parent upgrade, you MUST inspect the direct parent dependency (and key intermediate dependencies in the chain) using `npm view <parent> versions --json` and `npm view <parent>@<version> dependencies` to verify whether a same-major release already tightens the vulnerable package range to the fixed version or removes it. If a compatible same-major parent upgrade resolves the vulnerability cleanly, upgrade the direct dependency in `package.json` instead of jumping straight to `overrides`. Avoid cross-major bumps of direct dependencies unless unavoidable and verified non-breaking.",
-  );
-  if (plan.ownership === "owned-library") {
-    const consumerNote =
-      plan.consumers.length > 0
-        ? ` (${plan.consumers.join(", ")})`
-        : "";
-    lines.push(
-      `3. **Owned-library optimal-fix rule**: This repository is published as a shared library consumed downstream${consumerNote}. Your goal is to find the optimal upstream fix so that all downstream repositories automatically get fixed when they upgrade this library. Remember that npm \`overrides\` and \`package-lock.json\` do NOT propagate to downstream consumers when they install this package. Therefore, you MUST fix the vulnerability via \`package.json\` \`dependencies\` (e.g. upgrading the direct parent dependency such as \`webpack-dev-server\`, or moving a dev-only tool out of \`dependencies\` if genuinely unused at runtime and safe to move). Do NOT add an \`overrides\` entry for the target vulnerable package(s) as a workaround. If you verify via \`npm view\` that no compatible upstream parent version eliminates the vulnerable range, OR if upgrading the parent dependency causes build/lint/test failures that cannot be safely resolved, revert any unsuccessful edits so the workspace stays clean and report the exact evidence and reason clearly.`,
-    );
-  } else {
-    lines.push(
-      "3. **Transitive fallback**: If a vulnerable package is strictly transitive and you have verified via `npm view` that no compatible same-major parent upgrade tightens the range, add a minimal npm `overrides` entry in `package.json` and regenerate `package-lock.json`.",
-    );
-  }
-  if (options.depsInstalled) {
-    lines.push(
-      "4. `node_modules` is already pre-installed in this cached workspace; do NOT delete `node_modules`. Ensure `package-lock.json` is updated and consistent with `package.json` by running an incremental `npm install` or `npm update`.",
-    );
-  } else {
-    lines.push(
-      "4. Dependencies were intentionally NOT installed before patching (corporate registries such as JFrog Xray/Curation may block Critical vulnerable versions with HTTP 403). Do NOT run `npm install` before editing `package.json`. First update `package.json` to eliminate the vulnerable version(s), then refresh the lockfile with `npm install --package-lock-only --no-audit --no-fund` so no blocked vulnerable versions remain, and finally run `npm install --no-audit --no-fund` (preserve any existing cached `node_modules` unless corrupted).",
-    );
-  }
-  lines.push(
-    "5. **Handling unrelated HTTP 403 registry blocks**: If `npm install` fails with HTTP 403 (e.g. JFrog Curation blocking an older transitive dependency not listed above), you MAY add a minimal npm `overrides` entry to bump that blocked transitive package to the smallest unblocked safe version **within the same major version** (e.g. `7.29.0` -> `7.30.1`), regenerate `package-lock.json`, and re-run `npm install`. Do NOT perform cross-major upgrades on unrelated packages and do NOT bump direct dependencies across majors. If no same-major unblocked version exists, stop and report the exact blocked package(s) and version(s) clearly.",
-  );
-  lines.push(
-    "6. Keep changes minimal and strictly scoped to resolving these CVEs (plus any same-major 403 unblock above). Do NOT disable, skip, or delete existing tests or linters.",
-  );
-
-  if (options.detectedScripts && options.detectedScripts.length > 0) {
-    lines.push(
-      `7. Before finishing, verify the repository using available scripts: ${options.detectedScripts.map((s) => `\`npm run ${s}\``).join(", ")}.`,
-    );
-  } else {
-    lines.push("7. Before finishing, run the repository's build/test scripts if present.");
-  }
+  lines.push("---");
+  lines.push("");
+  lines.push(loadRemediationSkill(options.skillPath));
 
   if (options.extraInstructions?.trim()) {
     lines.push("");
@@ -182,16 +339,13 @@ export function buildCopilotRemediationPrompt(
   if (attempt > 1 && options.previousError?.trim()) {
     lines.push("");
     lines.push(`## Previous Verification Failure (Attempt ${attempt - 1} of ${maxRetries})`);
-    lines.push("The previous remediation attempt failed automated verification with the following output. Fix the root cause without reverting the security upgrades:");
+    lines.push(
+      "The previous remediation attempt failed automated verification with the following output. Fix the root cause without reverting valid security upgrades (or revert cleanly with `STATUS: NO_UPSTREAM_FIX_AVAILABLE` if no valid upstream parent fix exists):",
+    );
     lines.push("```text");
     lines.push(options.previousError.trim().slice(0, 4000));
     lines.push("```");
   }
-
-  lines.push("");
-  lines.push(
-    "When finished, summarize: (a) the exact dependency changes made, (b) the parent-upgrade check evidence (which direct/intermediate parent versions were checked via `npm view` and why a parent upgrade was or was not used), and (c) the verification commands you ran. If you had to add any same-major `overrides` to unblock an unrelated HTTP 403 registry error, list them under a separate `### Additional Registry-Blocked Dependencies Upgraded` section with old -> new version and reason so the Draft PR reviewer can audit them easily.",
-  );
 
   return lines.join("\n");
 }
@@ -221,6 +375,118 @@ export interface DraftPrBodyInput {
   remediationBranch: string;
   verification?: RemediationVerificationResult | null;
   copilotSummary?: string | null;
+}
+
+const VALID_OUTCOME_STATUS_SET = new Set<string>(REMEDIATION_OUTCOME_STATUSES);
+
+function normalizeValidationStatus(value: unknown): ValidationCheckStatus {
+  if (
+    value === "passed" ||
+    value === "failed" ||
+    value === "not_run" ||
+    value === "not_configured"
+  ) {
+    return value;
+  }
+  return "not_run";
+}
+
+function normalizeImpactScope(value: unknown): ImpactScope {
+  if (
+    value === "PUBLISHED_RUNTIME" ||
+    value === "BUILD_OR_DEV" ||
+    value === "UNKNOWN"
+  ) {
+    return value;
+  }
+  return "UNKNOWN";
+}
+
+/**
+ * Extracts and validates the trailing machine-readable JSON remediation summary
+ * emitted by Copilot CLI (per `skills/npm-remediation/SKILL.md`), so n8n and
+ * TaskPilot can branch deterministically without re-parsing natural language.
+ */
+export function parseStructuredRemediationOutput(
+  raw: string,
+): StructuredRemediationOutput | null {
+  if (!raw.trim()) return null;
+
+  const fenceRegex = /```(?:json)?\s*\r?\n([\s\S]*?)```/gi;
+  const candidates: string[] = [];
+  for (const match of raw.matchAll(fenceRegex)) {
+    if (match[1]?.trim()) {
+      candidates.push(match[1].trim());
+    }
+  }
+
+  // Evaluate from last fenced block backwards so the final summary wins
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidates[i]!);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      continue;
+    }
+    const obj = parsed as Record<string, unknown>;
+    if (
+      typeof obj.status !== "string" ||
+      !VALID_OUTCOME_STATUS_SET.has(obj.status)
+    ) {
+      continue;
+    }
+
+    const rawVal =
+      obj.validation && typeof obj.validation === "object" && !Array.isArray(obj.validation)
+        ? (obj.validation as Record<string, unknown>)
+        : {};
+
+    const validation: StructuredRemediationOutput["validation"] = {
+      build: normalizeValidationStatus(rawVal.build),
+      ...(rawVal.lint !== undefined
+        ? { lint: normalizeValidationStatus(rawVal.lint) }
+        : {}),
+      tests: normalizeValidationStatus(rawVal.tests),
+      dependencyCheck: normalizeValidationStatus(rawVal.dependencyCheck),
+    };
+
+    const validationChecks: ValidationCheckStatus[] = [
+      validation.build,
+      validation.tests,
+      validation.dependencyCheck,
+      ...(validation.lint ? [validation.lint] : []),
+    ];
+    const hasBlockingValidation = validationChecks.some(
+      (s) => s === "failed" || s === "not_run",
+    );
+
+    const advisories = Array.isArray(obj.advisories)
+      ? obj.advisories.filter((a): a is string => typeof a === "string" && a.trim().length > 0)
+      : undefined;
+
+    return {
+      status: obj.status as RemediationOutcomeStatus,
+      impactScope: normalizeImpactScope(obj.impactScope),
+      repository: typeof obj.repository === "string" ? obj.repository : "",
+      vulnerablePackage:
+        typeof obj.vulnerablePackage === "string" ? obj.vulnerablePackage : "",
+      ...(advisories && advisories.length > 0 ? { advisories } : {}),
+      changedFiles: Array.isArray(obj.changedFiles)
+        ? obj.changedFiles.filter((f): f is string => typeof f === "string")
+        : [],
+      validation,
+      downstreamUpdateRequired: Boolean(obj.downstreamUpdateRequired),
+      prReady: Boolean(obj.prReady) && !hasBlockingValidation,
+      ...(typeof obj.reason === "string" && obj.reason.trim()
+        ? { reason: obj.reason.trim() }
+        : {}),
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -324,6 +590,11 @@ export function buildDraftPrBody(input: DraftPrBodyInput): string {
     lines.push("");
     lines.push(`- **Overall Status**: ${verification.passed ? "PASSED" : "FAILED"}`);
     lines.push(`- **Lockfile Verification**: ${verification.lockfilePassed ? "PASSED" : "FAILED"}`);
+    if (verification.downstreamUpdateRequired) {
+      lines.push(
+        `- **Follow-up**: \`DOWNSTREAM_UPDATE_REQUIRED\` (after merging & publishing this library, update affected consumer repo(s) and verify the original vulnerable version is absent).`,
+      );
+    }
     if (verification.changedFiles.length > 0) {
       lines.push(
         `- **Changed Files (${verification.changedFiles.length})**: ${verification.changedFiles
@@ -377,6 +648,11 @@ export function buildDraftPrBody(input: DraftPrBodyInput): string {
   lines.push("- [ ] Confirm upgraded dependency versions introduce no breaking runtime behavior");
   lines.push("- [ ] Confirm CI checks pass on this Draft PR");
   lines.push("- [ ] Mark Ready for Review, merge, and publish via the normal release process");
+  if (verification?.downstreamUpdateRequired && plan.consumers.length > 0) {
+    lines.push(
+      `- [ ] Post-publish closure (\`DOWNSTREAM_UPDATE_REQUIRED\`): update ${plan.consumers.map((c) => `\`${c}\``).join(", ")}, regenerate lockfile, and verify the vulnerable package version is absent`,
+    );
+  }
 
   return lines.join("\n");
 }

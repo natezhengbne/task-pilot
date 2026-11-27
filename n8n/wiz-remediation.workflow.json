@@ -59,7 +59,7 @@
             {
               "fieldLabel": "Max Retries",
               "fieldType": "number",
-              "placeholder": "3",
+              "placeholder": "1",
               "requiredField": false
             },
             {
@@ -219,7 +219,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const form = $('1. Upload Vulnerability Report').first().json;\nconst batch = $input.first().json;\nconst workspaces = batch.workspaces || [];\nconst maxRetries = Number(form['Max Retries']) > 0 ? Number(form['Max Retries']) : 3;\nconst creditBudget = Number(form['Credit Budget']) > 0 ? Number(form['Credit Budget']) : 30;\nconst verifyDownstream = form['Verify Downstream'] === 'Yes';\nconst phase = form.Phase || 'Phase 3 - Full Remediation + Draft PR';\n\nreturn workspaces.map((ws) => ({\n  json: {\n    runId: ws.runId || batch.runId,\n    phase,\n    maxRetries,\n    creditBudget,\n    verifyDownstream,\n    plan: ws.plan,\n    targetRepo: ws.targetRepo,\n    baseBranch: ws.baseBranch,\n    remediationBranch: ws.remediationBranch,\n    workspacePath: ws.workspacePath,\n    cacheHit: Boolean(ws.cacheHit),\n    depsInstalled: Boolean(ws.depsInstalled),\n  },\n}));"
+        "jsCode": "const form = $('1. Upload Vulnerability Report').first().json;\nconst batch = $input.first().json;\nconst workspaces = batch.workspaces || [];\nconst maxRetries = Number(form['Max Retries']) > 0 ? Math.min(Number(form['Max Retries']), 2) : 1;\nconst creditBudget = Number(form['Credit Budget']) > 0 ? Number(form['Credit Budget']) : 30;\nconst verifyDownstream = form['Verify Downstream'] === 'Yes';\nconst phase = form.Phase || 'Phase 3 - Full Remediation + Draft PR';\n\nreturn workspaces.map((ws) => ({\n  json: {\n    runId: ws.runId || batch.runId,\n    phase,\n    maxRetries,\n    creditBudget,\n    verifyDownstream,\n    plan: ws.plan,\n    targetRepo: ws.targetRepo,\n    baseBranch: ws.baseBranch,\n    remediationBranch: ws.remediationBranch,\n    workspacePath: ws.workspacePath,\n    cacheHit: Boolean(ws.cacheHit),\n    depsInstalled: Boolean(ws.depsInstalled),\n  },\n}));"
       },
       "id": "code-expand-plans",
       "name": "7. Expand Prepared Workspaces",

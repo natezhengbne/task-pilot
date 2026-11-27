@@ -1,6 +1,11 @@
 import { existsSync } from "node:fs";
 import type { RemediationPlan } from "../../domain/remediation-plan.ts";
-import { buildCopilotRemediationPrompt } from "../../domain/remediation.ts";
+import {
+  buildCopilotRemediationPrompt,
+  parseStructuredRemediationOutput,
+  type ImpactScope,
+  type StructuredRemediationOutput,
+} from "../../domain/remediation.ts";
 import { runCommand } from "../../shared/exec.ts";
 import { saveRunArtifact } from "../../shared/runs.ts";
 import {
@@ -35,6 +40,8 @@ export interface RunCopilotPatchInput {
   creditsPerAttempt?: number;
   previousError?: string | null;
   depsInstalled?: boolean;
+  impactScope?: ImpactScope;
+  allowUnrelated403Overrides?: boolean;
   model?: string;
   extraInstructions?: string;
   timeoutMs?: number;
@@ -63,6 +70,7 @@ export interface RunCopilotPatchResult {
   diffStat: string;
   prompt: string;
   copilotOutput: string;
+  structuredOutput?: StructuredRemediationOutput | null;
   code?: CopilotErrorCode;
   error?: string;
   hint?: string;
@@ -263,7 +271,7 @@ export async function runCopilotRemediationPatch(
   exec: CommandRunner = runCommand,
 ): Promise<RunCopilotPatchResult> {
   const attempt = Math.max(1, Math.floor(input.attempt ?? 1));
-  const maxRetries = Math.max(1, Math.floor(input.maxRetries ?? 3));
+  const maxRetries = Math.max(1, Math.floor(input.maxRetries ?? 2));
   const creditBudget = Math.max(1, Math.floor(input.creditBudget ?? 30));
   const priorCredits = Math.max(0, Math.floor(input.creditsUsed ?? 0));
   const creditsPerAttempt = Math.max(1, Math.floor(input.creditsPerAttempt ?? 1));
@@ -285,6 +293,8 @@ export async function runCopilotRemediationPatch(
     previousError: input.previousError,
     detectedScripts: pkgInfo.detectedScripts,
     depsInstalled: input.depsInstalled,
+    impactScope: input.impactScope,
+    allowUnrelated403Overrides: input.allowUnrelated403Overrides,
     extraInstructions: input.extraInstructions,
   });
 
@@ -477,6 +487,7 @@ export async function runCopilotRemediationPatch(
   const creditsRemaining = Math.max(0, creditBudget - creditsUsed);
 
   const gitChanges = await getWorkspaceGitChanges(input.workspacePath, exec);
+  const structuredOutput = parseStructuredRemediationOutput(combinedOutput);
 
   if (persist) {
     const promptPath = await saveRunArtifact(input.runId, promptFile, `${prompt}\n`);
@@ -489,7 +500,7 @@ export async function runCopilotRemediationPatch(
   }
 
   process.stderr.write(
-    `[copilot] <-- ${input.plan.targetRepo} exit=${res.exitCode}${failure ? ` code=${failure.code}` : ""} (${durationMs}ms, changedFiles=${gitChanges.changedFiles.length}, credits=${creditsUsed}/${creditBudget})\n`,
+    `[copilot] <-- ${input.plan.targetRepo} exit=${res.exitCode}${failure ? ` code=${failure.code}` : ""}${structuredOutput ? ` status=${structuredOutput.status}` : ""} (${durationMs}ms, changedFiles=${gitChanges.changedFiles.length}, credits=${creditsUsed}/${creditBudget})\n`,
   );
 
   return {
@@ -513,6 +524,7 @@ export async function runCopilotRemediationPatch(
     diffStat: gitChanges.diffStat,
     prompt,
     copilotOutput: combinedOutput,
+    structuredOutput,
     ...(failure
       ? { code: failure.code, error: failure.error, hint: failure.hint }
       : {}),

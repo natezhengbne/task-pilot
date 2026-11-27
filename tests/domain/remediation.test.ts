@@ -6,6 +6,9 @@ import {
   buildDraftPrTitle,
   buildRemediationBranchName,
   extractCopilotSummaryForPr,
+  extractDirectParentInsight,
+  loadRemediationSkill,
+  parseStructuredRemediationOutput,
 } from "../../src/domain/remediation.ts";
 import { parseCreditsFromOutput } from "../../src/services/remediation/copilot.ts";
 import {
@@ -61,7 +64,24 @@ describe("domain/remediation", () => {
     expect(b1).toMatch(/^fix\/vuln-shell-quote-1-11-0-[a-f0-9]{8}$/);
   });
 
-  test("builds Copilot prompt with CVEs, dependency paths, and retry error context", () => {
+  test("loads skills/npm-remediation/SKILL.md with frontmatter stripped", () => {
+    const skill = loadRemediationSkill();
+    expect(skill.startsWith("# NPM Vulnerability Remediation Skill")).toBe(true);
+    expect(skill).not.toContain("name: npm-remediation");
+    expect(skill).toContain("## Task Brief Input Contract");
+    expect(skill).toContain("## Impact Scope Rules");
+    expect(skill).toContain("## Owned-Library (`PUBLISHED_RUNTIME`) Hard Rules & Enforcement");
+    expect(skill).toContain("## Prove It Works");
+    expect(skill).toContain("RANGE_ALREADY_SATISFIED");
+    expect(skill).toContain("`owned-library` (`BUILD_OR_DEV`)");
+    expect(skill).toContain("not_configured");
+    expect(skill).toContain("REGISTRY_BLOCKED_UNRELATED");
+    expect(skill).toContain("ENVIRONMENT_BLOCKED");
+    expect(skill).toContain("MANUAL_REVIEW_REQUIRED");
+    expect(skill).toContain("VALIDATION_FAILED");
+  });
+
+  test("builds Copilot prompt with CVEs, dependency paths, shared SKILL.md, and retry error context", () => {
     const prompt = buildCopilotRemediationPrompt(samplePlan, {
       attempt: 2,
       maxRetries: 3,
@@ -76,29 +96,71 @@ describe("domain/remediation", () => {
     expect(prompt).toContain("Previous Verification Failure (Attempt 1 of 3)");
     expect(prompt).toContain("FAIL tests/quote.test.ts");
     expect(prompt).toContain("`npm run typecheck`");
-    expect(prompt).toContain("Do NOT run `npm install` before editing `package.json`");
+    expect(prompt).toContain("**Impact Scope**: `PUBLISHED_RUNTIME`");
+    expect(prompt).toContain("**Install Mode**: `deferred`");
+    expect(prompt).toContain("**Unrelated 403 Scope Expansion**: `forbidden`");
     expect(prompt).toContain("npm install --package-lock-only --no-audit --no-fund");
-    expect(prompt).toContain("within the same major version");
+    expect(prompt).toContain("same-major scoped `overrides`");
     expect(prompt).toContain("Additional Registry-Blocked Dependencies Upgraded");
     expect(prompt).toContain("npm view <parent> versions --json");
-    expect(prompt).toContain("Owned-library optimal-fix rule");
-    expect(prompt).toContain("do NOT propagate to downstream consumers");
-    expect(prompt).toContain("Do NOT add an `overrides` entry for the target vulnerable package(s)");
-    expect(prompt).toContain("revert any unsuccessful edits so the workspace stays clean");
-    expect(prompt).toContain("parent-upgrade check evidence");
+    expect(prompt).toContain("evaluateOwnedLibraryPackageJsonChange");
+    expect(prompt).toContain("no phantom direct dependencies");
+    expect(prompt).toContain("NO_UPSTREAM_FIX_AVAILABLE");
+    expect(prompt).toContain("range triage & parent-upgrade evidence");
+    expect(prompt).toContain('"prReady": true');
   });
 
-  test("builds consumer-repo prompt without owned-library constraint", () => {
+  test("extracts direct parent dependency from lockfile paths and spotlights it in prompt", () => {
+    const transitivePlan: RemediationPlan = {
+      ...samplePlan,
+      targetRepo: "komatsu-mts/ux-core",
+      rootComponents: ["@komatsu-mts/ux-core"],
+      consumers: ["komatsu-mts/ux-embedded-operation-bar"],
+      packages: [
+        {
+          ...samplePlan.packages[0]!,
+          paths: [
+            [
+              "ux-embedded-operation-bar",
+              "@komatsu-mts/ux-core",
+              "webpack-dev-server",
+              "launch-editor",
+              "shell-quote",
+            ],
+          ],
+        },
+      ],
+    };
+
+    const insight = extractDirectParentInsight(
+      transitivePlan,
+      transitivePlan.packages[0]!,
+    );
+    expect(insight.isDirectDependency).toBe(false);
+    expect(insight.directParents).toEqual(["webpack-dev-server"]);
+    expect(insight.localChains).toEqual([
+      "webpack-dev-server -> launch-editor -> shell-quote",
+    ]);
+
+    const prompt = buildCopilotRemediationPrompt(transitivePlan);
+    expect(prompt).toContain("**Direct parent to inspect first**: `webpack-dev-server`");
+    expect(prompt).toContain(
+      "(local chain: `webpack-dev-server -> launch-editor -> shell-quote`)",
+    );
+  });
+
+  test("builds consumer-repo prompt with consumer-repo ownership role", () => {
     const consumerPlan: RemediationPlan = {
       ...samplePlan,
       ownership: "consumer-repo",
       consumers: [],
     };
-    const prompt = buildCopilotRemediationPrompt(consumerPlan);
+    const consumerPrompt = buildCopilotRemediationPrompt(consumerPlan);
 
-    expect(prompt).toContain("npm view <parent> versions --json");
-    expect(prompt).toContain("Transitive fallback");
-    expect(prompt).not.toContain("Owned-library optimal-fix rule");
+    expect(consumerPrompt).toContain("**Ownership Role**: `consumer-repo`");
+    expect(consumerPrompt).toContain("**Impact Scope**: `UNKNOWN`");
+    expect(consumerPrompt).toContain("npm view <parent> versions --json");
+    expect(consumerPrompt).toContain("RANGE_ALREADY_SATISFIED");
   });
 
   test("extracts final Copilot summary by stripping shell traces and CLI telemetry footer", () => {
@@ -134,8 +196,8 @@ describe("domain/remediation", () => {
       depsInstalled: true,
     });
 
-    expect(prompt).toContain("`node_modules` is already pre-installed");
-    expect(prompt).not.toContain("Do NOT run `npm install` before editing `package.json`");
+    expect(prompt).toContain("**Install Mode**: `pre-installed`");
+    expect(prompt).not.toContain("**Install Mode**: `deferred`");
   });
 
   test("builds Draft PR title and Markdown body with verification details", () => {
@@ -228,7 +290,7 @@ describe("domain/remediation", () => {
     expect(parseCreditsFromOutput("Done without credit footer", 2)).toBe(2);
   });
 
-  test("flags owned-library overrides-only patch as downstream-ineffective", () => {
+  test("flags owned-library overrides-only, phantom direct dep, or no-runtime-dep changes as downstream-ineffective", () => {
     const basePkg = JSON.stringify({
       name: "@acme-org/shared-utils",
       dependencies: { "webpack-dev-server": "^5.2.5" },
@@ -239,18 +301,157 @@ describe("domain/remediation", () => {
       dependencies: { "webpack-dev-server": "^5.2.5" },
       overrides: { koa: "^3.0.1", "shell-quote": "^1.11.0" },
     });
+    const phantomDirectDepPkg = JSON.stringify({
+      name: "@acme-org/shared-utils",
+      dependencies: {
+        "webpack-dev-server": "^5.2.5",
+        "shell-quote": "^1.11.0",
+      },
+      overrides: { koa: "^3.0.1" },
+    });
+    const unrelatedOverrideOnlyPkg = JSON.stringify({
+      name: "@acme-org/shared-utils",
+      dependencies: { "webpack-dev-server": "^5.2.5" },
+      overrides: { koa: "^3.0.1", undici: "7.30.1" },
+    });
     const depUpgradedPkg = JSON.stringify({
       name: "@acme-org/shared-utils",
       dependencies: { "webpack-dev-server": "^5.2.7" },
       overrides: { koa: "^3.0.1" },
     });
 
-    const bad = evaluateOwnedLibraryPackageJsonChange(basePkg, overridesOnlyPkg, samplePlan);
-    expect(bad.downstreamEffective).toBe(false);
-    expect(bad.reason).toContain("shell-quote");
+    const badOverride = evaluateOwnedLibraryPackageJsonChange(
+      basePkg,
+      overridesOnlyPkg,
+      samplePlan,
+    );
+    expect(badOverride.downstreamEffective).toBe(false);
+    expect(badOverride.reason).toContain("shell-quote");
 
-    const good = evaluateOwnedLibraryPackageJsonChange(basePkg, depUpgradedPkg, samplePlan);
+    const badPhantom = evaluateOwnedLibraryPackageJsonChange(
+      basePkg,
+      phantomDirectDepPkg,
+      samplePlan,
+    );
+    expect(badPhantom.downstreamEffective).toBe(false);
+    expect(badPhantom.reason).toContain("transitive vulnerable package(s)");
+    expect(badPhantom.reason).toContain("shell-quote");
+
+    const badUnrelatedOverride = evaluateOwnedLibraryPackageJsonChange(
+      basePkg,
+      unrelatedOverrideOnlyPkg,
+      samplePlan,
+    );
+    expect(badUnrelatedOverride.downstreamEffective).toBe(false);
+    expect(badUnrelatedOverride.reason).toContain("did not modify `dependencies`");
+
+    const good = evaluateOwnedLibraryPackageJsonChange(
+      basePkg,
+      depUpgradedPkg,
+      samplePlan,
+    );
     expect(good.downstreamEffective).toBe(true);
     expect(good.reason).toBeNull();
+
+    const devOnlyPkg = JSON.stringify({
+      name: "@acme-org/shared-utils",
+      dependencies: { "webpack-dev-server": "^5.2.5" },
+      devDependencies: { eslint: "^9.1.0" },
+      overrides: { koa: "^3.0.1" },
+    });
+    const movedToDevDepsPkg = JSON.stringify({
+      name: "@acme-org/shared-utils",
+      dependencies: {},
+      devDependencies: { "webpack-dev-server": "^5.2.5" },
+      overrides: { koa: "^3.0.1" },
+    });
+    const allowedMovedToDev = evaluateOwnedLibraryPackageJsonChange(
+      basePkg,
+      movedToDevDepsPkg,
+      samplePlan,
+      "PUBLISHED_RUNTIME",
+    );
+    expect(allowedMovedToDev.downstreamEffective).toBe(true);
+    expect(allowedMovedToDev.reason).toBeNull();
+
+    const allowedDevFix = evaluateOwnedLibraryPackageJsonChange(
+      basePkg,
+      devOnlyPkg,
+      samplePlan,
+      "BUILD_OR_DEV",
+    );
+    expect(allowedDevFix.downstreamEffective).toBe(true);
+    expect(allowedDevFix.reason).toBeNull();
+  });
+
+  test("parses trailing machine-readable JSON remediation output for n8n branching", () => {
+    const raw = [
+      "Upgraded webpack-dev-server from 5.2.5 to 5.2.7.",
+      "```json",
+      JSON.stringify({ unrelated: true }),
+      "```",
+      "Final structured result:",
+      "```json",
+      JSON.stringify(
+        {
+          status: "UPSTREAM_PARENT_UPGRADED",
+          impactScope: "PUBLISHED_RUNTIME",
+          repository: "komatsu-mts/ux-core",
+          vulnerablePackage: "js-cookie",
+          advisories: ["CVE-AAAA", "CVE-BBBB"],
+          changedFiles: ["package.json", "package-lock.json"],
+          validation: {
+            build: "passed",
+            lint: "passed",
+            tests: "not_configured",
+            dependencyCheck: "passed",
+          },
+          downstreamUpdateRequired: true,
+          prReady: true,
+          reason: "Upgraded direct parent cleanly.",
+        },
+        null,
+        2,
+      ),
+      "```",
+    ].join("\n");
+
+    const parsed = parseStructuredRemediationOutput(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.status).toBe("UPSTREAM_PARENT_UPGRADED");
+    expect(parsed?.impactScope).toBe("PUBLISHED_RUNTIME");
+    expect(parsed?.repository).toBe("komatsu-mts/ux-core");
+    expect(parsed?.vulnerablePackage).toBe("js-cookie");
+    expect(parsed?.advisories).toEqual(["CVE-AAAA", "CVE-BBBB"]);
+    expect(parsed?.changedFiles).toEqual(["package.json", "package-lock.json"]);
+    expect(parsed?.validation).toEqual({
+      build: "passed",
+      lint: "passed",
+      tests: "not_configured",
+      dependencyCheck: "passed",
+    });
+    expect(parsed?.downstreamUpdateRequired).toBe(true);
+    expect(parsed?.prReady).toBe(true);
+    expect(parsed?.reason).toBe("Upgraded direct parent cleanly.");
+
+    // A configured check marked not_run must force prReady to false even if AI claimed true
+    const skippedTestsRaw = `\`\`\`json\n${JSON.stringify({
+      status: "UPSTREAM_PARENT_UPGRADED",
+      impactScope: "PUBLISHED_RUNTIME",
+      repository: "komatsu-mts/ux-core",
+      vulnerablePackage: "js-cookie",
+      changedFiles: ["package.json"],
+      validation: {
+        build: "passed",
+        tests: "not_run",
+        dependencyCheck: "passed",
+      },
+      downstreamUpdateRequired: true,
+      prReady: true,
+    })}\n\`\`\``;
+    const blocked = parseStructuredRemediationOutput(skippedTestsRaw);
+    expect(blocked?.prReady).toBe(false);
+
+    expect(parseStructuredRemediationOutput("Plain text without JSON")).toBeNull();
   });
 });
