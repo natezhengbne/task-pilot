@@ -1,0 +1,22 @@
+services:
+  dagu:
+    image: ${DAGU_IMAGE:-ghcr.io/dagucloud/dagu:latest}
+    container_name: ${DAGU_CONTAINER_NAME:-taskpilot-dagu}
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ../workflows/dagu:/var/lib/dagu/dags
+      - taskpilot_dagu_data:/var/lib/dagu/data
+    environment:
+      - DAGU_HOST=${DAGU_HOST:-0.0.0.0}
+      - DAGU_PORT=${DAGU_PORT:-8080}
+      - DAGU_DAGS_DIR=/var/lib/dagu/dags
+      - DAGU_DATA_DIR=/var/lib/dagu/data
+      - DAGU_TZ=${DAGU_TZ:-UTC}
+      - TASKPILOT_API_URL=${TASKPILOT_API_URL:-http://127.0.0.1:3456}
+      - TASKPILOT_API_TOKEN=${TASKPILOT_API_TOKEN:-}
+    command: ["dagu", "start-all"]
+
+volumes:
+  taskpilot_dagu_data:
+    name: taskpilot_dagu_data

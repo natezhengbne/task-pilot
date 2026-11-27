@@ -32,3 +32,18 @@ export async function saveRunArtifact(
   await Bun.write(fullPath, content);
   return fullPath;
 }
+
+export async function readRunArtifactJson<T = unknown>(
+  runId: string,
+  filename: string,
+): Promise<T | null> {
+  const safeId = sanitizeSegment(runId);
+  const safeFile = sanitizeSegment(filename);
+  const fullPath = join(RUNS_ROOT, safeId, safeFile);
+  const file = Bun.file(fullPath);
+  if (!(await file.exists())) {
+    return null;
+  }
+  const text = await file.text();
+  return JSON.parse(text) as T;
+}

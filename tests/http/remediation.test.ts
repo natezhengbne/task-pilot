@@ -847,6 +847,99 @@ describe("http/remediation", () => {
     }
   });
 
+  test("POST /api/remediation/verify short-circuits build commands and returns stop_blocked on REGISTRY_BLOCKED_UNRELATED with no changes", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-verify-blocked-"));
+    try {
+      await Bun.write(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "ux-embedded-operation-bar",
+          scripts: { build: "mmscore build", test: "jest" },
+        }),
+      );
+      await Bun.write(
+        join(tempDir, "package-lock.json"),
+        JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { name: "ux-embedded-operation-bar" },
+            "node_modules/shell-quote": { version: "1.8.4" },
+          },
+        }),
+      );
+
+      const consumerPlan: RemediationPlan = {
+        ...samplePlan,
+        targetRepo: "komatsu-mts/ux-embedded-operation-bar",
+        ownership: "consumer-repo",
+        consumers: ["komatsu-mts/ux-embedded-operation-bar"],
+      };
+
+      const executedCommands: string[][] = [];
+      const mockExec: CommandRunner = async (cmd) => {
+        executedCommands.push(cmd);
+        if (cmd[0] === "git" && cmd[1] === "status") {
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        }
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      };
+
+      const app = createApp({ exec: mockExec, enableLogging: false });
+      const res = await app.request("/api/remediation/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-verify-blocked",
+          workspacePath: tempDir,
+          plan: consumerPlan,
+          copilotStructuredOutput: {
+            status: "REGISTRY_BLOCKED_UNRELATED",
+            impactScope: "BUILD_OR_DEV",
+            repository: consumerPlan.targetRepo,
+            vulnerablePackage: "shell-quote",
+            changedFiles: [],
+            validation: {
+              build: "not_run",
+              tests: "not_run",
+              dependencyCheck: "not_run",
+            },
+            downstreamUpdateRequired: false,
+            prReady: false,
+            blockedPackages: [
+              "websocket-driver@0.7.5 -> 0.8.0",
+              "i18next-http-backend@2.7.3 -> 3.0.5",
+            ],
+            reason:
+              "Lockfile refresh selected shell-quote 1.12.0, but npm install was blocked by JFrog 403.",
+          },
+          persist: false,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        passed: boolean;
+        copilotStatus: string | null;
+        nextAction: string;
+        commands: unknown[];
+        failureSummary: string | null;
+      };
+      expect(body.passed).toBe(false);
+      expect(body.copilotStatus).toBe("REGISTRY_BLOCKED_UNRELATED");
+      expect(body.nextAction).toBe("stop_blocked");
+      expect(body.commands).toEqual([]);
+      expect(
+        executedCommands.some((c) => c.join(" ").includes("npm run build")),
+      ).toBe(false);
+      expect(body.failureSummary).toContain("[REGISTRY_BLOCKED_UNRELATED]");
+      expect(body.failureSummary).toContain("websocket-driver@0.7.5 -> 0.8.0");
+      expect(body.failureSummary).not.toContain("mmscore");
+      expect(body.failureSummary).not.toContain("No git file changes");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("POST /api/remediation/pr force-pushes, updates existing open PR in-place, and persists pr-result artifact", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-pr-update-"));
     const runId = `test-pr-update-${Date.now()}`;
@@ -960,6 +1053,460 @@ describe("http/remediation", () => {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
       await rm(join(process.cwd(), ".runs", runId), { recursive: true, force: true });
+    }
+  });
+
+  test("POST /api/remediation/run-repo stops early on stop_blocked (forbidden) and escalates on escalate_on_retry", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-run-repo-403-"));
+    try {
+      await Bun.write(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "ux-embedded-operation-bar",
+          scripts: { build: "mmscore build" },
+        }),
+      );
+      await Bun.write(
+        join(tempDir, "package-lock.json"),
+        JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { name: "ux-embedded-operation-bar" },
+            "node_modules/shell-quote": { version: "1.8.4" },
+          },
+        }),
+      );
+
+      const consumerPlan: RemediationPlan = {
+        ...samplePlan,
+        targetRepo: "komatsu-mts/ux-embedded-operation-bar",
+        ownership: "consumer-repo",
+        consumers: ["komatsu-mts/ux-embedded-operation-bar"],
+      };
+
+      const workspace = {
+        runId: "test-run-repo",
+        targetRepo: consumerPlan.targetRepo,
+        baseBranch: "develop",
+        remediationBranch: "fix/vuln-shell-quote-1-11-0-test",
+        workspacePath: tempDir,
+        cacheHit: true,
+        depsInstalled: false,
+        installDurationMs: 0,
+        packageName: "ux-embedded-operation-bar",
+        detectedScripts: ["build"],
+        recommendedVerifyCommands: ["npm run build"],
+        plan: consumerPlan,
+      };
+
+      const blockedOutput = `\`\`\`json\n${JSON.stringify({
+        status: "REGISTRY_BLOCKED_UNRELATED",
+        impactScope: "BUILD_OR_DEV",
+        repository: consumerPlan.targetRepo,
+        vulnerablePackage: "shell-quote",
+        changedFiles: [],
+        validation: {
+          build: "not_run",
+          tests: "not_run",
+          dependencyCheck: "not_run",
+        },
+        downstreamUpdateRequired: false,
+        prReady: false,
+        blockedPackages: ["websocket-driver@0.7.5 -> 0.8.0"],
+        reason: "Blocked by JFrog 403 on websocket-driver@0.7.5.",
+      })}\n\`\`\`\nAI Credits 2.5`;
+
+      // Case 1: forbidden -> stops after 1 attempt even with maxRetries=3
+      const promptsForbidden: string[] = [];
+      const app1 = createApp({
+        exec: async (cmd) => {
+          if (cmd[0] === "copilot") {
+            const pIdx = cmd.indexOf("-p");
+            promptsForbidden.push(pIdx >= 0 ? (cmd[pIdx + 1] ?? "") : "");
+            return { exitCode: 0, stdout: blockedOutput, stderr: "", timedOut: false };
+          }
+          if (cmd[0] === "git" && cmd[1] === "status") {
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+        enableLogging: false,
+      });
+
+      const res1 = await app1.request("/api/remediation/run-repo", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-run-repo-forbidden",
+          workspace,
+          maxRetries: 3,
+          creditBudget: 30,
+          unrelated403Policy: "forbidden",
+          dryRun: true,
+          persist: false,
+        }),
+      });
+      expect(res1.status).toBe(422);
+      expect(promptsForbidden).toHaveLength(1);
+      expect(promptsForbidden[0]).toContain("**Unrelated 403 Scope Expansion**: `forbidden`");
+
+      // Case 2: escalate_on_retry -> attempt 1 forbidden, attempt 2 escalates to allowed, then stops if still blocked
+      const promptsEscalate: string[] = [];
+      const app2 = createApp({
+        exec: async (cmd) => {
+          if (cmd[0] === "copilot") {
+            const pIdx = cmd.indexOf("-p");
+            promptsEscalate.push(pIdx >= 0 ? (cmd[pIdx + 1] ?? "") : "");
+            return { exitCode: 0, stdout: blockedOutput, stderr: "", timedOut: false };
+          }
+          if (cmd[0] === "git" && cmd[1] === "status") {
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+        enableLogging: false,
+      });
+
+      const res2 = await app2.request("/api/remediation/run-repo", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-run-repo-escalate",
+          workspace,
+          maxRetries: 3,
+          creditBudget: 30,
+          unrelated403Policy: "escalate_on_retry",
+          dryRun: true,
+          persist: false,
+        }),
+      });
+      expect(res2.status).toBe(422);
+      expect(promptsEscalate).toHaveLength(2);
+      expect(promptsEscalate[0]).toContain("**Unrelated 403 Scope Expansion**: `forbidden`");
+      expect(promptsEscalate[1]).toContain("**Unrelated 403 Scope Expansion**: `allowed`");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("POST /api/remediation/rescue enforces per-hook (10 cr) and total repo credit limits", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-rescue-budget-"));
+    try {
+      const app = createApp({
+        exec: async () => ({
+          exitCode: 0,
+          stdout: [
+            "Fixed npm cache.",
+            "```json",
+            JSON.stringify({
+              outcome: "RECOVERED",
+              summary: "Cleared broken npm cache and reinstalled cleanly.",
+            }),
+            "```",
+            "AI Credits 3.2",
+          ].join("\n"),
+          stderr: "",
+          timedOut: false,
+        }),
+        enableLogging: false,
+      });
+
+      // Remaining repo budget is 6 (30 - 24), so effectiveCreditLimit is min(10, 6) = 6
+      const okRes = await app.request("/api/remediation/rescue", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-rescue-ok",
+          stage: "prepare",
+          workspacePath: tempDir,
+          plan: samplePlan,
+          errorOutput: "npm ERR! ENOENT",
+          rescueCreditBudget: 10,
+          creditBudget: 30,
+          creditsUsed: 24,
+          persist: false,
+        }),
+      });
+      expect(okRes.status).toBe(200);
+      const okBody = (await okRes.json()) as {
+        ok: boolean;
+        outcome: string;
+        effectiveCreditLimit: number;
+        creditsSpent: number;
+        creditsUsed: number;
+        creditsRemaining: number;
+      };
+      expect(okBody.ok).toBe(true);
+      expect(okBody.outcome).toBe("RECOVERED");
+      expect(okBody.effectiveCreditLimit).toBe(6);
+      expect(okBody.creditsSpent).toBe(3.2);
+      expect(okBody.creditsUsed).toBe(27.2);
+      expect(okBody.creditsRemaining).toBe(2.8);
+
+      // Exhausted repo budget -> 429 BUDGET_EXCEEDED without invoking Copilot
+      const exhaustedRes = await app.request("/api/remediation/rescue", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-rescue-exhausted",
+          stage: "verify",
+          workspacePath: tempDir,
+          plan: samplePlan,
+          errorOutput: "sh: 1: mmscore: not found",
+          rescueCreditBudget: 10,
+          creditBudget: 30,
+          creditsUsed: 30,
+          persist: false,
+        }),
+      });
+      expect(exhaustedRes.status).toBe(429);
+      const exhaustedBody = (await exhaustedRes.json()) as {
+        ok: boolean;
+        budgetExceeded: boolean;
+        code: string;
+        creditsSpent: number;
+      };
+      expect(exhaustedBody.ok).toBe(false);
+      expect(exhaustedBody.budgetExceeded).toBe(true);
+      expect(exhaustedBody.code).toBe("BUDGET_EXCEEDED");
+      expect(exhaustedBody.creditsSpent).toBe(0);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("POST /api/remediation/workspace/prepare invokes AI prepare rescue on npm install failure and defers 403 to patch", async () => {
+    const cacheRoot = await mkdtemp(join(tmpdir(), "task-pilot-prepare-rescue-"));
+    try {
+      let rescueCalled = false;
+      const mockExec: CommandRunner = async (cmd) => {
+        if (cmd[0] === "gh" && cmd[1] === "repo" && cmd[2] === "clone") {
+          const targetDir = cmd[4]!;
+          await mkdir(join(targetDir, ".git"), { recursive: true });
+          await Bun.write(
+            join(targetDir, "package.json"),
+            JSON.stringify({ name: "@acme-org/shared-utils", scripts: { test: "echo ok" } }),
+          );
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        }
+        if (cmd[0] === "npm" && cmd[1] === "install") {
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr: "npm error 403 Forbidden - websocket-driver-0.7.5.tgz",
+            timedOut: false,
+          };
+        }
+        if (cmd[0] === "copilot") {
+          rescueCalled = true;
+          return {
+            exitCode: 0,
+            stdout: [
+              "JFrog 403 blocked websocket-driver@0.7.5; deferring to patch.",
+              "```json",
+              JSON.stringify({
+                outcome: "DEFER_TO_PATCH",
+                summary: "JFrog 403 blocked websocket-driver@0.7.5; defer install to patch stage.",
+                nextHints: "Upgrade websocket-driver to 0.8.0 alongside target package.",
+                blockedPackages: ["websocket-driver@0.7.5 -> 0.8.0"],
+              }),
+              "```",
+              "AI Credits 1.8",
+            ].join("\n"),
+            stderr: "",
+            timedOut: false,
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      };
+
+      const app = createApp({ exec: mockExec, enableLogging: false });
+      const res = await app.request("/api/remediation/workspace/prepare", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-prepare-rescue",
+          plan: samplePlan,
+          workspacesRoot: cacheRoot,
+          installDeps: true,
+          enableAiRescue: true,
+          rescueCreditBudget: 10,
+          creditBudget: 30,
+          persist: false,
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(rescueCalled).toBe(true);
+      const body = (await res.json()) as {
+        ok: boolean;
+        depsInstalled: boolean;
+        rescueOutcome: string;
+        rescueCreditsSpent: number;
+        rescueHints: string;
+      };
+      expect(body.ok).toBe(true);
+      expect(body.depsInstalled).toBe(false);
+      expect(body.rescueOutcome).toBe("DEFER_TO_PATCH");
+      expect(body.rescueCreditsSpent).toBe(1.8);
+      expect(body.rescueHints).toContain("websocket-driver@0.7.5 -> 0.8.0");
+    } finally {
+      await rm(cacheRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("POST /api/remediation/run-repo triggers bounded verify rescue on build failure and re-verifies to Draft PR", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-verify-rescue-"));
+    try {
+      await Bun.write(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "ux-embedded-operation-bar",
+          scripts: { build: "mmscore build" },
+        }),
+      );
+      await Bun.write(
+        join(tempDir, "package-lock.json"),
+        JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { name: "ux-embedded-operation-bar" },
+            "node_modules/shell-quote": { version: "1.12.0" },
+          },
+        }),
+      );
+
+      const consumerPlan: RemediationPlan = {
+        ...samplePlan,
+        targetRepo: "komatsu-mts/ux-embedded-operation-bar",
+        ownership: "consumer-repo",
+        consumers: ["komatsu-mts/ux-embedded-operation-bar"],
+      };
+
+      const workspace = {
+        runId: "test-verify-rescue",
+        targetRepo: consumerPlan.targetRepo,
+        baseBranch: "develop",
+        remediationBranch: "fix/vuln-shell-quote-1-11-0-rescue",
+        workspacePath: tempDir,
+        cacheHit: true,
+        depsInstalled: false,
+        installDurationMs: 0,
+        packageName: "ux-embedded-operation-bar",
+        detectedScripts: ["build"],
+        recommendedVerifyCommands: ["npm run build"],
+        plan: consumerPlan,
+      };
+
+      let copilotCalls = 0;
+      let buildCalls = 0;
+      let rescuePromptSeen = "";
+
+      const app = createApp({
+        exec: async (cmd) => {
+          if (cmd[0] === "copilot") {
+            copilotCalls += 1;
+            const pIdx = cmd.indexOf("-p");
+            const promptText = pIdx >= 0 ? (cmd[pIdx + 1] ?? "") : "";
+            if (copilotCalls === 1) {
+              // Normal patch attempt
+              return {
+                exitCode: 0,
+                stdout: [
+                  "Updated lockfile.",
+                  "```json",
+                  JSON.stringify({
+                    status: "LOCKFILE_REFRESHED",
+                    impactScope: "BUILD_OR_DEV",
+                    repository: consumerPlan.targetRepo,
+                    vulnerablePackage: "shell-quote",
+                    changedFiles: ["package-lock.json"],
+                    validation: { build: "passed", tests: "not_configured", dependencyCheck: "passed" },
+                    downstreamUpdateRequired: false,
+                    prReady: true,
+                    reason: "Refreshed shell-quote to 1.12.0.",
+                  }),
+                  "```",
+                  "AI Credits 3.0",
+                ].join("\n"),
+                stderr: "",
+                timedOut: false,
+              };
+            }
+            // Second copilot call is the Verify Rescue Hook
+            rescuePromptSeen = promptText;
+            return {
+              exitCode: 0,
+              stdout: [
+                "Re-synced node_modules so mmscore binary is installed.",
+                "```json",
+                JSON.stringify({
+                  outcome: "RECOVERED",
+                  summary: "Installed missing mmscore binary and verified npm run build.",
+                }),
+                "```",
+                "AI Credits 2.0",
+              ].join("\n"),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (cmd[0] === "git" && cmd[1] === "status") {
+            return {
+              exitCode: 0,
+              stdout: " M package-lock.json\n",
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (cmd.join(" ").includes("npm run build")) {
+            buildCalls += 1;
+            if (buildCalls === 1) {
+              return {
+                exitCode: 127,
+                stdout: "",
+                stderr: "sh: 1: mmscore: not found",
+                timedOut: false,
+              };
+            }
+            return {
+              exitCode: 0,
+              stdout: "Build succeeded",
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+        enableLogging: false,
+      });
+
+      const res = await app.request("/api/remediation/run-repo", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-verify-rescue",
+          workspace,
+          maxRetries: 2,
+          creditBudget: 30,
+          enableAiRescue: true,
+          rescueCreditBudget: 10,
+          dryRun: true,
+          persist: false,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { ok: boolean; status: string };
+      expect(body.ok).toBe(true);
+      expect(body.status).toBe("completed");
+      expect(copilotCalls).toBe(2);
+      expect(buildCalls).toBe(2);
+      expect(rescuePromptSeen).toContain("# AI Rescue Escalation (remediation / verify)");
+      expect(rescuePromptSeen).toContain("# NPM Remediation Rescue Playbook");
+      expect(rescuePromptSeen).not.toContain("name: npm-remediation-rescue");
+      expect(rescuePromptSeen).toContain("max **10 credits**");
+      expect(rescuePromptSeen).toContain("mmscore: not found");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
     }
   });
 });

@@ -100,7 +100,8 @@ describe("domain/remediation", () => {
     expect(prompt).toContain("**Install Mode**: `deferred`");
     expect(prompt).toContain("**Unrelated 403 Scope Expansion**: `forbidden`");
     expect(prompt).toContain("npm install --package-lock-only --no-audit --no-fund");
-    expect(prompt).toContain("same-major scoped `overrides`");
+    expect(prompt).toContain("minimal compliant version");
+    expect(prompt).toContain("scoped `overrides`");
     expect(prompt).toContain("Additional Registry-Blocked Dependencies Upgraded");
     expect(prompt).toContain("npm view <parent> versions --json");
     expect(prompt).toContain("evaluateOwnedLibraryPackageJsonChange");
@@ -484,6 +485,32 @@ describe("domain/remediation", () => {
     })}\n\`\`\``;
     const blocked = parseStructuredRemediationOutput(skippedTestsRaw);
     expect(blocked?.prReady).toBe(false);
+
+    const registryBlockedRaw = `\`\`\`json\n${JSON.stringify({
+      status: "REGISTRY_BLOCKED_UNRELATED",
+      impactScope: "BUILD_OR_DEV",
+      repository: "komatsu-mts/ux-embedded-operation-bar",
+      vulnerablePackage: "shell-quote",
+      changedFiles: [],
+      validation: {
+        build: "not_run",
+        tests: "not_run",
+        dependencyCheck: "not_run",
+      },
+      downstreamUpdateRequired: false,
+      prReady: false,
+      blockedPackages: [
+        "websocket-driver@0.7.5 -> 0.8.0",
+        "i18next-http-backend@2.7.3 -> 3.0.5",
+      ],
+      reason: "Installation blocked by JFrog 403 on unrelated packages.",
+    })}\n\`\`\``;
+    const registryBlocked = parseStructuredRemediationOutput(registryBlockedRaw);
+    expect(registryBlocked?.status).toBe("REGISTRY_BLOCKED_UNRELATED");
+    expect(registryBlocked?.blockedPackages).toEqual([
+      "websocket-driver@0.7.5 -> 0.8.0",
+      "i18next-http-backend@2.7.3 -> 3.0.5",
+    ]);
 
     expect(parseStructuredRemediationOutput("Plain text without JSON")).toBeNull();
   });

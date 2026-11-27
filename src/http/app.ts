@@ -4,6 +4,7 @@ import {
   GitHubClientError,
   type GitHubRepoClient,
 } from "../services/github/client.ts";
+import { createAiRoute } from "./routes/ai.ts";
 import { createDashboardRoute } from "./routes/dashboard.ts";
 import { createGitHubRoute } from "./routes/github.ts";
 import { createPreflightRoute } from "./routes/preflight.ts";
@@ -178,6 +179,7 @@ export function createApp(config: AppConfig = {}): Hono {
     await next();
   });
 
+  app.route("/api/ai", createAiRoute({ exec: config.exec, runsStore }));
   app.route("/api/github", createGitHubRoute());
   app.route("/api/preflight", createPreflightRoute({ exec: config.exec }));
   app.route(

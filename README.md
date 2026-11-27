@@ -1,8 +1,8 @@
 # TaskPilot
 
-A TypeScript (Bun + Hono) **capability API server** designed to be orchestrated by **n8n** (compatible with both local n8n v2 and Docker n8n v3) or **Windmill** (OpenFlow YAML + Bun workers).
+A TypeScript (Bun + Hono) **capability API server** designed to be orchestrated by **Dagu** (lightweight single-binary YAML DAG runner), **n8n** (local v2 / Docker v3), or **Windmill** (OpenFlow YAML + Bun workers).
 
-* **n8n / Windmill** owns the **Workflow** (form upload, branching, retries, approvals, notifications).
+* **Dagu / n8n / Windmill** owns the **Workflow** (triggers, branching, per-repo fan-out, approvals, run history).
 * **TaskPilot** runs natively on Windows (direct access to local `gh`, Copilot CLI, Git, and npm) and exposes **source-agnostic domain HTTP APIs**.
 
 ## Architecture
@@ -62,8 +62,17 @@ bun run dev:wsl
 # Terminal 2: Start Windmill (Postgres + Server + Worker) via Docker Compose
 .\scripts\start-windmill-docker.ps1   # or in WSL: ./scripts/start-windmill-docker.sh
 # or: docker compose -f scripts/docker-compose.windmill.yml up -d
+
+# Option D (Lightweight): Windows Bun + Docker Dagu (zero DB, Git-native YAML)
+# Terminal 1: Start TaskPilot HTTP API
+bun run dev:wsl
+
+# Terminal 2: Start Dagu via Docker Compose (mounts workflows/dagu directly)
+.\scripts\start-dagu-docker.ps1       # or in WSL: ./scripts/start-dagu-docker.sh
+# or: docker compose -f scripts/docker-compose.dagu.yml up -d
 ```
 
+* **Dagu**: Open `http://localhost:8080` and run `wiz-remediation` (`workflows/dagu/wiz-remediation.yaml`, mounted directly — no sync/import needed). Steps pass only `runId` and `targetRepo`; TaskPilot persists artifacts under `.runs/<runId>/` and handles the inner per-repo patch/verify retry & fallback loop via `POST /api/remediation/run-repo`.
 * **n8n**: Import `workflows/n8n/wiz-remediation.workflow.json` into n8n (`http://localhost:5678`). It is a single-file, vertically layered 3-phase workflow (Row 1: Phase 1 upload/ingest/plan, Row 2: Phase 2 per-repo workspace + Copilot patch/verify retry loop, Row 3: Phase 3 Draft PR / report & final summary).
 * **Windmill**: Open `http://localhost:8000` (default login: `admin@windmill.dev` / `changeme`), then run `./workflows/windmill/sync.sh` (or `bun run windmill:sync`) to one-click sync `workflows/windmill/f/taskpilot/wiz_remediation.flow/flow.yaml` via Windmill REST API — or import the YAML in the Flow editor / run `cd workflows/windmill && wmill sync push`.
 

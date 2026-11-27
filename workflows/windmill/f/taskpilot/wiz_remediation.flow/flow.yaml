@@ -251,6 +251,9 @@ value:
                       apiUrl: string,
                       runId: string,
                       plans: unknown[],
+                      enable_ai_rescue: boolean = true,
+                      rescue_credit_budget: number = 10,
+                      credit_budget: number = 30,
                     ) {
                       const res = await fetch(
                         `${apiUrl}/api/remediation/workspaces/prepare`,
@@ -262,6 +265,9 @@ value:
                             plans,
                             reuseExisting: true,
                             installDeps: false,
+                            enableAiRescue: Boolean(enable_ai_rescue),
+                            rescueCreditBudget: Number(rescue_credit_budget) || 10,
+                            creditBudget: Number(credit_budget) || 30,
                           }),
                           signal: AbortSignal.timeout(900_000),
                         },
@@ -285,6 +291,15 @@ value:
                     plans:
                       type: javascript
                       expr: results.plan_remediation_targets.plans || []
+                    enable_ai_rescue:
+                      type: javascript
+                      expr: flow_input.enable_ai_rescue ?? true
+                    rescue_credit_budget:
+                      type: javascript
+                      expr: flow_input.rescue_credit_budget ?? 10
+                    credit_budget:
+                      type: javascript
+                      expr: flow_input.credit_budget ?? 30
 
               - id: remediate_repos
                 summary: "3c. Remediate Each Repository"
@@ -351,23 +366,30 @@ value:
                             defaultRunId: string,
                             workspace: PreparedWorkspace,
                             phase: string = "Phase 3 - Full Remediation + Draft PR",
-                            max_retries: number = 1,
+                            max_retries: number = 2,
                             credit_budget: number = 30,
                             verify_downstream: boolean = false,
+                            unrelated_403_policy: string = "allowed",
                           ) {
                             const runId = workspace.runId || defaultRunId;
                             const maxRetries =
                               Number(max_retries) > 0
-                                ? Math.min(Number(max_retries), 2)
-                                : 1;
+                                ? Math.min(Number(max_retries), 5)
+                                : 2;
                             const creditBudget =
                               Number(credit_budget) > 0 ? Number(credit_budget) : 30;
                             const dryRun =
                               phase !== "Phase 3 - Full Remediation + Draft PR";
+                            const policy403 =
+                              unrelated_403_policy === "escalate_on_retry" ||
+                              unrelated_403_policy === "forbidden"
+                                ? unrelated_403_policy
+                                : "allowed";
 
                             let attempt = 1;
                             let creditsUsed = 0;
                             let previousError: string | null = null;
+                            let allowUnrelated403Overrides = policy403 === "allowed";
 
                             while (true) {
                               const patch = await postJson(
@@ -383,6 +405,7 @@ value:
                                   creditsUsed,
                                   previousError,
                                   depsInstalled: Boolean(workspace.depsInstalled),
+                                  allowUnrelated403Overrides,
                                 },
                                 660_000,
                                 true,
@@ -454,6 +477,7 @@ value:
                                   let consumerAttempt = 1;
                                   let consumerCredits = 0;
                                   let consumerPrevError: string | null = null;
+                                  let consumerAllow403 = policy403 === "allowed";
 
                                   while (true) {
                                     const consumerPatch = await postJson(
@@ -471,6 +495,8 @@ value:
                                         depsInstalled: Boolean(
                                           consumerWs.depsInstalled,
                                         ),
+                                        allowUnrelated403Overrides:
+                                          consumerAllow403,
                                         extraInstructions: upstreamNote,
                                       },
                                       660_000,
@@ -525,11 +551,26 @@ value:
                                       consumerPatch.creditsUsed ||
                                         consumerCredits,
                                     );
-                                    const canRetryConsumer =
+                                    const shouldEscalateConsumer403 =
+                                      consumerVerify.copilotStatus ===
+                                        "REGISTRY_BLOCKED_UNRELATED" &&
+                                      policy403 === "escalate_on_retry" &&
+                                      !consumerAllow403 &&
                                       curConsumerAttempt < maxRetries &&
                                       curConsumerCredits < creditBudget;
+                                    const isConsumerBlocked =
+                                      consumerVerify.nextAction ===
+                                      "stop_blocked";
+                                    const canRetryConsumer =
+                                      shouldEscalateConsumer403 ||
+                                      (!isConsumerBlocked &&
+                                        curConsumerAttempt < maxRetries &&
+                                        curConsumerCredits < creditBudget);
 
                                     if (canRetryConsumer) {
+                                      if (shouldEscalateConsumer403) {
+                                        consumerAllow403 = true;
+                                      }
                                       consumerAttempt = curConsumerAttempt + 1;
                                       consumerCredits = curConsumerCredits;
                                       consumerPrevError =
@@ -549,8 +590,9 @@ value:
                                       attempts: curConsumerAttempt,
                                       creditsUsed: curConsumerCredits,
                                       creditBudget,
-                                      reason:
-                                        "Consumer fallback verification failed",
+                                      reason: isConsumerBlocked
+                                        ? `Remediation blocked (${consumerVerify.copilotStatus || "stop_blocked"})`
+                                        : "Consumer fallback verification failed",
                                       failureSummary:
                                         consumerVerify.failureSummary ||
                                         consumerPatch.error ||
@@ -582,11 +624,24 @@ value:
                               const currentCredits = Number(
                                 patch.creditsUsed || creditsUsed,
                               );
-                              const canRetry =
+                              const shouldEscalate403 =
+                                verify.copilotStatus ===
+                                  "REGISTRY_BLOCKED_UNRELATED" &&
+                                policy403 === "escalate_on_retry" &&
+                                !allowUnrelated403Overrides &&
                                 currentAttempt < maxRetries &&
                                 currentCredits < creditBudget;
+                              const isBlocked = verify.nextAction === "stop_blocked";
+                              const canRetry =
+                                shouldEscalate403 ||
+                                (!isBlocked &&
+                                  currentAttempt < maxRetries &&
+                                  currentCredits < creditBudget);
 
                               if (canRetry) {
+                                if (shouldEscalate403) {
+                                  allowUnrelated403Overrides = true;
+                                }
                                 attempt = currentAttempt + 1;
                                 creditsUsed = currentCredits;
                                 previousError =
@@ -605,8 +660,9 @@ value:
                                 attempts: currentAttempt,
                                 creditsUsed: currentCredits,
                                 creditBudget,
-                                reason:
-                                  "Verification failed; retry or credit limit reached",
+                                reason: isBlocked
+                                  ? `Remediation blocked (${verify.copilotStatus || "stop_blocked"})`
+                                  : "Verification failed; retry or credit limit reached",
                                 failureSummary:
                                   verify.failureSummary || patch.error || null,
                               };
@@ -642,13 +698,16 @@ value:
                             expr: flow_input.phase || 'Phase 3 - Full Remediation + Draft PR'
                           max_retries:
                             type: javascript
-                            expr: flow_input.max_retries ?? 1
+                            expr: flow_input.max_retries ?? 2
                           credit_budget:
                             type: javascript
                             expr: flow_input.credit_budget ?? 30
                           verify_downstream:
                             type: javascript
                             expr: Boolean(flow_input.verify_downstream)
+                          unrelated_403_policy:
+                            type: javascript
+                            expr: flow_input.unrelated_403_policy || 'allowed'
 
               - id: summarize_and_finalize_remediation
                 summary: "3d. Remediation Summary & Finalize Run"
@@ -821,6 +880,9 @@ schema:
     - phase
     - max_retries
     - credit_budget
+    - unrelated_403_policy
+    - enable_ai_rescue
+    - rescue_credit_budget
     - verify_downstream
     - taskpilot_api_url
   properties:
@@ -857,15 +919,32 @@ schema:
       description: "Execution phase"
     max_retries:
       type: integer
-      default: 1
+      default: 2
       minimum: 1
-      maximum: 2
-      description: "Maximum Copilot remediation attempts per repository (capped at 2)"
+      maximum: 5
+      description: "Maximum Copilot remediation attempts per repository (also bounded by credit_budget and stop_blocked early exit)"
     credit_budget:
       type: integer
       default: 30
       minimum: 1
       description: "Copilot credit budget per repository"
+    unrelated_403_policy:
+      type: string
+      default: "allowed"
+      enum:
+        - "allowed"
+        - "escalate_on_retry"
+        - "forbidden"
+      description: "Policy when npm install hits HTTP 403 on unrelated registry-blocked packages: allowed (default — resolve to minimal compliant version and list in PR audit section), escalate_on_retry, or forbidden"
+    enable_ai_rescue:
+      type: boolean
+      default: true
+      description: "Enable bounded AI rescue hooks when prepare or verify steps fail unexpectedly"
+    rescue_credit_budget:
+      type: integer
+      default: 10
+      minimum: 1
+      description: "Dedicated credit cap per AI rescue invocation (also bounded by credit_budget)"
     verify_downstream:
       type: boolean
       default: false

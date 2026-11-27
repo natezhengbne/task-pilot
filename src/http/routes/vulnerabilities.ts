@@ -23,21 +23,26 @@ import {
   extractOwnedScopes,
   loadDefaultOwnershipRules,
 } from "../../shared/ownership-config.ts";
-import { createRunId, saveRunArtifact } from "../../shared/runs.ts";
+import {
+  createRunId,
+  readRunArtifactJson,
+  saveRunArtifact,
+} from "../../shared/runs.ts";
 
 interface IngestRequestBody {
   source?: string;
   runId?: string;
   phase?: string;
   persist?: boolean;
+  reportPath?: string;
   policy?: {
     minSeverity?: string;
     onlyOpen?: boolean;
     requireFixVersion?: boolean;
     allowlistRepos?: string[];
-    ownedScopes?: string[];
+    ownedScopes?: string[] | string;
   };
-  payload: unknown;
+  payload?: unknown;
 }
 
 interface PlanRequestBody {
@@ -45,10 +50,25 @@ interface PlanRequestBody {
   persist?: boolean;
   useGitHub?: boolean;
   strictGitHub?: boolean;
-  ownedScopes?: string[];
+  ownedScopes?: string[] | string;
   repoBaseBranches?: Record<string, string>;
   ownershipRules?: OwnershipRules;
-  findings: VulnerabilityFinding[];
+  findings?: VulnerabilityFinding[];
+}
+
+function normalizeStringList(value: string[] | string | undefined): string[] | undefined {
+  if (Array.isArray(value)) {
+    const cleaned = value.map((s) => s.trim()).filter(Boolean);
+    return cleaned.length > 0 ? cleaned : undefined;
+  }
+  if (typeof value === "string") {
+    const cleaned = value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return cleaned.length > 0 ? cleaned : undefined;
+  }
+  return undefined;
 }
 
 export interface VulnerabilitiesRouteDeps {
@@ -95,6 +115,8 @@ export function createVulnerabilitiesRoute(
 
     const body = parsedBody as Partial<IngestRequestBody>;
     const hasEnvelope = "payload" in body && body.payload !== undefined;
+    const reportPath =
+      typeof body.reportPath === "string" ? body.reportPath.trim() : "";
 
     const source = (body.source ?? c.req.query("source") ?? "wiz-graphql").trim();
     const adapter = getVulnerabilitySourceAdapter(source);
@@ -108,7 +130,29 @@ export function createVulnerabilitiesRoute(
       );
     }
 
-    const payload = hasEnvelope ? body.payload : parsedBody;
+    let payload: unknown;
+    if (hasEnvelope) {
+      payload = body.payload;
+    } else if (reportPath) {
+      const file = Bun.file(reportPath);
+      if (!(await file.exists())) {
+        return c.json(
+          { ok: false, error: `Report file not found: ${reportPath}` },
+          400,
+        );
+      }
+      try {
+        payload = JSON.parse(await file.text());
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return c.json(
+          { ok: false, error: `Invalid JSON in report file "${reportPath}": ${msg}` },
+          400,
+        );
+      }
+    } else {
+      payload = parsedBody;
+    }
     const runId = body.runId?.trim() || createRunId("vuln");
     const persist = body.persist ?? true;
 
@@ -120,7 +164,9 @@ export function createVulnerabilitiesRoute(
       onlyOpen: body.policy?.onlyOpen,
       requireFixVersion: body.policy?.requireFixVersion,
       allowlistRepos: body.policy?.allowlistRepos,
-      ownedScopes: body.policy?.ownedScopes ?? extractOwnedScopes(defaultRules),
+      ownedScopes:
+        normalizeStringList(body.policy?.ownedScopes) ??
+        extractOwnedScopes(defaultRules),
     };
 
     const startMs = performance.now();
@@ -183,14 +229,27 @@ export function createVulnerabilitiesRoute(
     }
 
     const body = parsedBody as Partial<PlanRequestBody>;
-    if (!Array.isArray(body.findings)) {
+    const runId = body.runId?.trim() || createRunId("plan");
+    let findings = body.findings;
+    if (findings === undefined && body.runId?.trim()) {
+      const stored = await readRunArtifactJson<{
+        findings?: VulnerabilityFinding[];
+      }>(runId, "vulnerabilities.json");
+      if (stored && Array.isArray(stored.findings)) {
+        findings = stored.findings;
+      }
+    }
+    if (!Array.isArray(findings)) {
       return c.json(
-        { ok: false, error: "Field `findings` must be an array of normalized VulnerabilityFinding." },
+        {
+          ok: false,
+          error:
+            "Field `findings` must be an array of normalized VulnerabilityFinding (or provide `runId` with stored vulnerabilities.json).",
+        },
         400,
       );
     }
 
-    const runId = body.runId?.trim() || createRunId("plan");
     const persist = body.persist ?? true;
     const useGitHub = body.useGitHub ?? true;
     const strictGitHub = body.strictGitHub ?? true;
@@ -207,6 +266,7 @@ export function createVulnerabilitiesRoute(
           }
         : undefined;
 
+    const normalizedOwnedScopes = normalizeStringList(body.ownedScopes);
     const ownershipRules: OwnershipRules = body.ownershipRules
       ? {
           ...body.ownershipRules,
@@ -214,9 +274,9 @@ export function createVulnerabilitiesRoute(
             ? { repoBaseBranches: mergedRepoBaseBranches }
             : {}),
         }
-      : body.ownedScopes && body.ownedScopes.length > 0
+      : normalizedOwnedScopes && normalizedOwnedScopes.length > 0
         ? {
-            ...ownershipRulesFromScopes(body.ownedScopes),
+            ...ownershipRulesFromScopes(normalizedOwnedScopes),
             ...(mergedRepoBaseBranches
               ? { repoBaseBranches: mergedRepoBaseBranches }
               : {}),
@@ -232,7 +292,7 @@ export function createVulnerabilitiesRoute(
     const releaseActivity = runsStore?.trackRunActivity(runId);
     runsStore?.ensureRun(runId, { currentStage: "plan" });
     try {
-      const result = await planRemediations(body.findings, {
+      const result = await planRemediations(findings, {
         ownershipRules,
         github: useGitHub ? createGitHubClient() : undefined,
         strictGitHub,
@@ -254,6 +314,7 @@ export function createVulnerabilitiesRoute(
         ok: true,
         runId,
         dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
+        targetRepos: result.plans.map((p) => p.targetRepo),
         ...(artifacts ? { artifacts } : {}),
         ...result,
       });

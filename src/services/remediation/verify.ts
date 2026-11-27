@@ -466,11 +466,27 @@ export function evaluateOwnedLibraryPackageJsonChange(
   };
 }
 
+const CLEAN_ABORT_SKIP_COMMANDS_STATUSES = new Set<RemediationOutcomeStatus>([
+  "REGISTRY_BLOCKED_UNRELATED",
+  "ENVIRONMENT_BLOCKED",
+  "NO_UPSTREAM_FIX_AVAILABLE",
+  "MANUAL_REVIEW_REQUIRED",
+  "RANGE_ALREADY_SATISFIED",
+]);
+
+const STOP_BLOCKED_STATUSES = new Set<RemediationOutcomeStatus>([
+  "REGISTRY_BLOCKED_UNRELATED",
+  "ENVIRONMENT_BLOCKED",
+  "NO_UPSTREAM_FIX_AVAILABLE",
+  "MANUAL_REVIEW_REQUIRED",
+]);
+
 /**
  * Verifies a remediation workspace:
  * 1. Confirms git changes exist.
  * 2. Confirms `package-lock.json` resolves vulnerable packages to `>= fixVersion`.
- * 3. Executes repository verification commands (typecheck/build/test).
+ * 3. Executes repository verification commands (typecheck/build/test), unless
+ *    Copilot cleanly aborted with no workspace changes (e.g. `REGISTRY_BLOCKED_UNRELATED`).
  * 4. Optionally validates downstream consumer repos against a packed candidate tarball.
  */
 export async function verifyRemediationWorkspace(
@@ -486,6 +502,14 @@ export async function verifyRemediationWorkspace(
   const verifyDownstream = input.verifyDownstream ?? false;
   const timeoutMs = input.commandTimeoutMs ?? 180_000;
   const persist = input.persist ?? true;
+
+  const structuredOutput: StructuredRemediationOutput | null =
+    input.copilotStructuredOutput ??
+    (typeof input.copilotOutput === "string" && input.copilotOutput.trim()
+      ? parseStructuredRemediationOutput(input.copilotOutput)
+      : null);
+  const copilotStatus: RemediationOutcomeStatus | null =
+    structuredOutput?.status ?? null;
 
   const gitChanges = await getWorkspaceGitChanges(input.workspacePath, exec);
   const failures: string[] = [];
@@ -544,36 +568,47 @@ export async function verifyRemediationWorkspace(
     }
   }
 
-  const pkgInfo = await inspectPackageScripts(input.workspacePath);
-  const commandsToRun =
-    input.commands !== undefined ? input.commands : pkgInfo.recommendedVerifyCommands;
+  const shouldShortCircuitCommands =
+    !gitChanges.hasChanges &&
+    copilotStatus !== null &&
+    CLEAN_ABORT_SKIP_COMMANDS_STATUSES.has(copilotStatus);
 
   const commandResults: RemediationCommandResult[] = [];
-  for (const cmd of commandsToRun) {
-    const trimmed = cmd.trim();
-    if (!trimmed) continue;
-    process.stderr.write(`[verify] --> ${input.plan.targetRepo}: ${trimmed}\n`);
-    const step = await execShellStep(trimmed, input.workspacePath, timeoutMs, exec);
-    commandResults.push(step);
+  if (shouldShortCircuitCommands) {
     process.stderr.write(
-      `[verify] <-- ${input.plan.targetRepo}: ${trimmed} exit=${step.exitCode} (${step.durationMs}ms)\n`,
+      `[verify] skipping repository commands for ${input.plan.targetRepo} (no git changes; copilotStatus=${copilotStatus})\n`,
     );
-    if (!step.passed) {
-      const detail =
-        step.exitCode === 0 && !step.timedOut
-          ? "exit 0, silent build/compilation error"
-          : `exit ${step.exitCode}${step.timedOut ? ", timed out" : ""}`;
-      const cleanStderr = stripAnsi(step.stderrTail).trim();
-      const cleanStdout = stripAnsi(step.stdoutTail).trim();
-      const outputParts: string[] = [];
-      if (cleanStderr) outputParts.push(cleanStderr);
-      if (cleanStdout && cleanStdout !== cleanStderr) {
-        outputParts.push(cleanStderr ? `--- stdout ---\n${cleanStdout}` : cleanStdout);
-      }
-      failures.push(
-        `Command '${trimmed}' failed (${detail}):\n${outputParts.join("\n")}`,
+  } else {
+    const pkgInfo = await inspectPackageScripts(input.workspacePath);
+    const commandsToRun =
+      input.commands !== undefined ? input.commands : pkgInfo.recommendedVerifyCommands;
+
+    for (const cmd of commandsToRun) {
+      const trimmed = cmd.trim();
+      if (!trimmed) continue;
+      process.stderr.write(`[verify] --> ${input.plan.targetRepo}: ${trimmed}\n`);
+      const step = await execShellStep(trimmed, input.workspacePath, timeoutMs, exec);
+      commandResults.push(step);
+      process.stderr.write(
+        `[verify] <-- ${input.plan.targetRepo}: ${trimmed} exit=${step.exitCode} (${step.durationMs}ms)\n`,
       );
-      break;
+      if (!step.passed) {
+        const detail =
+          step.exitCode === 0 && !step.timedOut
+            ? "exit 0, silent build/compilation error"
+            : `exit ${step.exitCode}${step.timedOut ? ", timed out" : ""}`;
+        const cleanStderr = stripAnsi(step.stderrTail).trim();
+        const cleanStdout = stripAnsi(step.stdoutTail).trim();
+        const outputParts: string[] = [];
+        if (cleanStderr) outputParts.push(cleanStderr);
+        if (cleanStdout && cleanStdout !== cleanStderr) {
+          outputParts.push(cleanStderr ? `--- stdout ---\n${cleanStdout}` : cleanStdout);
+        }
+        failures.push(
+          `Command '${trimmed}' failed (${detail}):\n${outputParts.join("\n")}`,
+        );
+        break;
+      }
     }
   }
 
@@ -597,14 +632,6 @@ export async function verifyRemediationWorkspace(
   const hasConsumers =
     input.plan.ownership === "owned-library" && input.plan.consumers.length > 0;
   const downstreamFailed = downstreamChecks.some((dc) => !dc.passed);
-
-  const structuredOutput: StructuredRemediationOutput | null =
-    input.copilotStructuredOutput ??
-    (typeof input.copilotOutput === "string" && input.copilotOutput.trim()
-      ? parseStructuredRemediationOutput(input.copilotOutput)
-      : null);
-  const copilotStatus: RemediationOutcomeStatus | null =
-    structuredOutput?.status ?? null;
 
   let fallbackToConsumers = false;
   let fallbackReason: string | null = null;
@@ -641,19 +668,49 @@ export async function verifyRemediationWorkspace(
     }
   }
 
-  // Surface Copilot's structured blocker/failure diagnosis (e.g. JFrog HTTP 403
-  // REGISTRY_BLOCKED_UNRELATED or ENVIRONMENT_BLOCKED) at the top of failureSummary
-  // so operators immediately see the root cause in the Dashboard.
-  if (
+  const isTerminalBlocked =
     !passed &&
-    copilotStatus &&
-    (copilotStatus === "REGISTRY_BLOCKED_UNRELATED" ||
-      copilotStatus === "ENVIRONMENT_BLOCKED" ||
-      copilotStatus === "MANUAL_REVIEW_REQUIRED" ||
-      copilotStatus === "VALIDATION_FAILED") &&
-    structuredOutput?.reason?.trim()
-  ) {
-    failures.unshift(`[${copilotStatus}] ${structuredOutput.reason.trim()}`);
+    !fallbackToConsumers &&
+    !gitChanges.hasChanges &&
+    copilotStatus !== null &&
+    STOP_BLOCKED_STATUSES.has(copilotStatus);
+
+  // Surface Copilot's structured blocker/failure diagnosis cleanly at the top of
+  // failureSummary so operators immediately see the root cause in the Dashboard.
+  let failureSummary: string | null = null;
+  if (!passed) {
+    const reasonText = structuredOutput?.reason?.trim() ?? "";
+    const blockedList =
+      structuredOutput?.blockedPackages &&
+      structuredOutput.blockedPackages.length > 0
+        ? `Blocked packages: ${structuredOutput.blockedPackages.join(", ")}`
+        : "";
+
+    if (isTerminalBlocked) {
+      const parts = [
+        reasonText
+          ? `[${copilotStatus}] ${reasonText}`
+          : `[${copilotStatus}] Remediation stopped cleanly without workspace changes.`,
+        ...(blockedList ? [blockedList] : []),
+      ];
+      failureSummary = parts.join("\n");
+    } else {
+      if (
+        copilotStatus &&
+        (copilotStatus === "REGISTRY_BLOCKED_UNRELATED" ||
+          copilotStatus === "ENVIRONMENT_BLOCKED" ||
+          copilotStatus === "MANUAL_REVIEW_REQUIRED" ||
+          copilotStatus === "VALIDATION_FAILED") &&
+        reasonText
+      ) {
+        failures.unshift(
+          blockedList
+            ? `[${copilotStatus}] ${reasonText}\n${blockedList}`
+            : `[${copilotStatus}] ${reasonText}`,
+        );
+      }
+      failureSummary = failures.join("\n\n");
+    }
   }
 
   let fallbackPlans: RemediationPlan[] = [];
@@ -671,7 +728,9 @@ export async function verifyRemediationWorkspace(
     ? "create_pr"
     : fallbackToConsumers
       ? "fallback_to_consumers"
-      : "retry_patch";
+      : isTerminalBlocked
+        ? "stop_blocked"
+        : "retry_patch";
 
   const downstreamUpdateRequired = passed && impactScope === "PUBLISHED_RUNTIME";
 
@@ -690,7 +749,7 @@ export async function verifyRemediationWorkspace(
     fallbackReason,
     fallbackPlans,
     nextAction,
-    failureSummary: passed ? null : failures.join("\n\n"),
+    failureSummary,
   };
 
   let artifacts: { verificationPath: string } | undefined;

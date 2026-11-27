@@ -16,6 +16,11 @@ import {
   type CreateDraftPrInput,
 } from "../../services/remediation/pr.ts";
 import {
+  DEFAULT_RESCUE_CREDIT_BUDGET,
+  runAiRescueHook,
+  type RunAiRescueInput,
+} from "../../services/remediation/rescue.ts";
+import {
   verifyRemediationWorkspace,
   type VerifyRemediationInput,
 } from "../../services/remediation/verify.ts";
@@ -24,10 +29,15 @@ import {
   prepareRemediationWorkspacesBatch,
   type CommandRunner,
   type PrepareWorkspaceInput,
+  type PrepareWorkspaceResult,
   type PrepareWorkspacesBatchInput,
 } from "../../services/remediation/workspace.ts";
 import { runCommand } from "../../shared/exec.ts";
-import { createRunId } from "../../shared/runs.ts";
+import {
+  createRunId,
+  readRunArtifactJson,
+  saveRunArtifact,
+} from "../../shared/runs.ts";
 
 export interface RemediationRouteDeps {
   exec?: CommandRunner;
@@ -109,6 +119,21 @@ export function createRemediationRoute(
         typeof body.installTimeoutMs === "number"
           ? body.installTimeoutMs
           : undefined,
+      enableAiRescue:
+        typeof body.enableAiRescue === "boolean"
+          ? body.enableAiRescue
+          : undefined,
+      rescueCreditBudget:
+        typeof body.rescueCreditBudget === "number"
+          ? body.rescueCreditBudget
+          : undefined,
+      totalCreditBudget:
+        typeof body.creditBudget === "number"
+          ? body.creditBudget
+          : typeof body.totalCreditBudget === "number"
+            ? body.totalCreditBudget
+            : undefined,
+      persist: typeof body.persist === "boolean" ? body.persist : undefined,
     };
 
     const startMs = performance.now();
@@ -133,6 +158,9 @@ export function createRemediationRoute(
         status: "prepared",
         remediationBranch: result.remediationBranch,
         cacheHit: result.cacheHit,
+        ...(result.rescueCreditsSpent
+          ? { creditsUsed: result.rescueCreditsSpent }
+          : {}),
         currentStage: "prepare",
       });
       runsStore?.recordEvent(runId, {
@@ -140,7 +168,9 @@ export function createRemediationRoute(
         stage: "prepare",
         status: "succeeded",
         durationMs: Math.round(performance.now() - startMs),
-        message: `Workspace ready (${result.cacheHit ? "cache hit" : "fresh clone"}, branch ${result.remediationBranch})`,
+        message: result.rescueOutcome
+          ? `Workspace ready via AI rescue (${result.rescueOutcome}, ${result.rescueCreditsSpent ?? 0} cr, branch ${result.remediationBranch})`
+          : `Workspace ready (${result.cacheHit ? "cache hit" : "fresh clone"}, branch ${result.remediationBranch})`,
       });
       return c.json({
         ok: true,
@@ -177,17 +207,33 @@ export function createRemediationRoute(
    */
   route.post("/workspaces/prepare", async (c) => {
     const body = await parseJsonObject(await c.req.text());
-    if (!Array.isArray(body.plans)) {
-      return c.json(
-        { ok: false, error: "Invalid JSON body: `plans` must be an array." },
-        400,
-      );
-    }
-    const plans = body.plans.map((p) => assertPlan(p));
     const runId =
       typeof body.runId === "string" && body.runId.trim()
         ? body.runId.trim()
         : createRunId("rem");
+
+    let rawPlans: unknown = body.plans;
+    if (rawPlans === undefined && typeof body.runId === "string" && body.runId.trim()) {
+      const stored = await readRunArtifactJson<{ plans?: unknown[] }>(
+        runId,
+        "plans.json",
+      );
+      if (stored && Array.isArray(stored.plans)) {
+        rawPlans = stored.plans;
+      }
+    }
+    if (!Array.isArray(rawPlans)) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            "Invalid JSON body: `plans` must be an array (or provide `runId` with stored plans.json).",
+        },
+        400,
+      );
+    }
+    const plans = rawPlans.map((p) => assertPlan(p));
+    const persist = typeof body.persist === "boolean" ? body.persist : true;
 
     const input: PrepareWorkspacesBatchInput = {
       runId,
@@ -205,6 +251,21 @@ export function createRemediationRoute(
         typeof body.installTimeoutMs === "number"
           ? body.installTimeoutMs
           : undefined,
+      enableAiRescue:
+        typeof body.enableAiRescue === "boolean"
+          ? body.enableAiRescue
+          : undefined,
+      rescueCreditBudget:
+        typeof body.rescueCreditBudget === "number"
+          ? body.rescueCreditBudget
+          : undefined,
+      totalCreditBudget:
+        typeof body.creditBudget === "number"
+          ? body.creditBudget
+          : typeof body.totalCreditBudget === "number"
+            ? body.totalCreditBudget
+            : undefined,
+      persist: typeof body.persist === "boolean" ? body.persist : undefined,
     };
 
     const releaseActivity = runsStore?.trackRunActivity(runId);
@@ -281,8 +342,17 @@ export function createRemediationRoute(
         });
       }
 
+      if (persist) {
+        await saveRunArtifact(
+          runId,
+          "workspaces.json",
+          `${JSON.stringify(result, null, 2)}\n`,
+        );
+      }
+
       return c.json({
         ok: true,
+        targetRepos: result.workspaces.map((w) => w.targetRepo),
         ...result,
       });
     } finally {
@@ -698,6 +768,559 @@ export function createRemediationRoute(
     } finally {
       releaseActivity?.();
     }
+  });
+
+  /**
+   * POST /api/remediation/run-repo
+   * Self-contained per-repository Phase 2 & 3 execution (patch -> verify -> retry /
+   * consumer fallback -> Draft PR / finalize). Designed for lightweight DAG orchestrators
+   * (e.g. Dagu) that only pass `runId` + `targetRepo` instead of large JSON payloads.
+   */
+  route.post("/run-repo", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    const runId = typeof body.runId === "string" ? body.runId.trim() : "";
+    if (!runId) {
+      return c.json({ ok: false, error: "Field `runId` is required." }, 400);
+    }
+
+    const requestedTargetRepo =
+      typeof body.targetRepo === "string" ? body.targetRepo.trim() : "";
+
+    type StoredWorkspace = PrepareWorkspaceResult & { plan: RemediationPlan };
+    let workspace: StoredWorkspace | null = null;
+
+    if (
+      body.workspace &&
+      typeof body.workspace === "object" &&
+      !Array.isArray(body.workspace)
+    ) {
+      const candidate = body.workspace as Partial<StoredWorkspace>;
+      workspace = {
+        ...(candidate as StoredWorkspace),
+        plan: assertPlan(candidate.plan),
+        targetRepo:
+          typeof candidate.targetRepo === "string" && candidate.targetRepo.trim()
+            ? candidate.targetRepo.trim()
+            : assertPlan(candidate.plan).targetRepo,
+      };
+    } else {
+      if (!requestedTargetRepo) {
+        return c.json(
+          {
+            ok: false,
+            error: "Field `targetRepo` is required when `workspace` is not provided.",
+          },
+          400,
+        );
+      }
+      const stored = await readRunArtifactJson<{ workspaces?: StoredWorkspace[] }>(
+        runId,
+        "workspaces.json",
+      );
+      workspace =
+        stored?.workspaces?.find((w) => w.targetRepo === requestedTargetRepo) ?? null;
+      if (!workspace) {
+        return c.json(
+          {
+            ok: false,
+            error: `Prepared workspace for "${requestedTargetRepo}" not found in run "${runId}".`,
+          },
+          404,
+        );
+      }
+    }
+
+    const phase =
+      typeof body.phase === "string" && body.phase.trim()
+        ? body.phase.trim()
+        : "Phase 3 - Full Remediation + Draft PR";
+    const dryRun =
+      typeof body.dryRun === "boolean"
+        ? body.dryRun
+        : phase !== "Phase 3 - Full Remediation + Draft PR";
+    const maxRetries =
+      typeof body.maxRetries === "number" && body.maxRetries > 0
+        ? Math.min(Math.floor(body.maxRetries), 5)
+        : 2;
+    const creditBudget =
+      typeof body.creditBudget === "number" && body.creditBudget > 0
+        ? Math.floor(body.creditBudget)
+        : 30;
+    const policy403: "forbidden" | "escalate_on_retry" | "allowed" =
+      body.unrelated403Policy === "allowed" ||
+      body.unrelated403Policy === "forbidden" ||
+      body.unrelated403Policy === "escalate_on_retry"
+        ? body.unrelated403Policy
+        : body.allowUnrelated403Overrides === true
+          ? "allowed"
+          : body.allowUnrelated403Overrides === false
+            ? "forbidden"
+            : "allowed";
+    const enableAiRescue =
+      typeof body.enableAiRescue === "boolean" ? body.enableAiRescue : true;
+    const rescueCreditBudget =
+      typeof body.rescueCreditBudget === "number" && body.rescueCreditBudget > 0
+        ? Math.floor(body.rescueCreditBudget)
+        : DEFAULT_RESCUE_CREDIT_BUDGET;
+    const verifyDownstream = Boolean(body.verifyDownstream);
+    const persist = typeof body.persist === "boolean" ? body.persist : true;
+    const workspacesRoot =
+      typeof body.workspacesRoot === "string" ? body.workspacesRoot : undefined;
+
+    const executeSingleWorkspace = async (
+      ws: StoredWorkspace,
+      opts: {
+        allowConsumerFallback: boolean;
+        verifyDownstream: boolean;
+        extraInstructions?: string;
+        upstreamContext?: UpstreamTriageContext | null;
+      },
+    ): Promise<Record<string, unknown>[]> => {
+      let attempt = 1;
+      let creditsUsed = ws.rescueCreditsSpent ?? 0;
+      let previousError: string | null = null;
+      let allowUnrelated403Overrides = policy403 === "allowed";
+      let verifyRescueUsed = false;
+      const mergedExtraInstructions = [
+        opts.extraInstructions?.trim(),
+        ws.rescueHints?.trim()
+          ? `Prepare AI rescue notes: ${ws.rescueHints.trim()}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
+      while (true) {
+        const patchStartMs = performance.now();
+        runsStore?.updateRepo(runId, ws.plan.targetRepo, {
+          plan: ws.plan,
+          status: "patching",
+          attempt,
+          maxRetries,
+          creditsUsed,
+          creditBudget,
+          currentStage: "patch",
+          clearError: true,
+        });
+        runsStore?.recordEvent(runId, {
+          targetRepo: ws.plan.targetRepo,
+          stage: "patch",
+          status: "started",
+          attempt,
+          message: `Copilot patch started (attempt ${attempt}/${maxRetries})`,
+        });
+
+        const patch = await runCopilotRemediationPatch(
+          {
+            runId,
+            workspacePath: ws.workspacePath,
+            plan: ws.plan,
+            attempt,
+            maxRetries,
+            creditBudget,
+            creditsUsed,
+            previousError,
+            depsInstalled: Boolean(ws.depsInstalled),
+            allowUnrelated403Overrides,
+            extraInstructions: mergedExtraInstructions || undefined,
+            persist,
+          },
+          exec,
+        );
+        const patchDurationMs = Math.round(performance.now() - patchStartMs);
+        runsStore?.updateRepo(runId, ws.plan.targetRepo, {
+          plan: ws.plan,
+          status: "patching",
+          attempt: patch.attempt,
+          maxRetries: patch.maxRetries,
+          creditsUsed: patch.creditsUsed,
+          creditBudget: patch.creditBudget,
+          lastError: patch.ok ? null : (patch.error ?? patch.code ?? "Copilot patch failed"),
+          clearError: patch.ok,
+          currentStage: "patch",
+          event: {
+            targetRepo: ws.plan.targetRepo,
+            stage: "patch",
+            status: patch.ok ? "succeeded" : "failed",
+            attempt: patch.attempt,
+            durationMs: patchDurationMs,
+            message: patch.ok
+              ? `Copilot patch finished (${patch.changedFiles.length} file(s) changed, credits ${patch.creditsUsed}/${patch.creditBudget})`
+              : `Copilot patch failed (${patch.code ?? "ERROR"}): ${patch.error ?? "unknown error"}`,
+          },
+        });
+
+        const verifyStartMs = performance.now();
+        runsStore?.updateRepo(runId, ws.plan.targetRepo, {
+          plan: ws.plan,
+          status: "verifying",
+          currentStage: "verify",
+        });
+        runsStore?.recordEvent(runId, {
+          targetRepo: ws.plan.targetRepo,
+          stage: "verify",
+          status: "started",
+          message: `Verifying lockfile & tests for ${ws.plan.targetRepo}`,
+        });
+
+        let verify = await verifyRemediationWorkspace(
+          {
+            runId,
+            workspacePath: ws.workspacePath,
+            plan: ws.plan,
+            verifyDownstream: opts.verifyDownstream,
+            copilotOutput: patch.copilotOutput,
+            copilotStructuredOutput: patch.structuredOutput ?? undefined,
+            persist,
+          },
+          exec,
+        );
+        const verifyDurationMs = Math.round(performance.now() - verifyStartMs);
+        const fallbackPlans = Array.isArray(verify.fallbackPlans)
+          ? verify.fallbackPlans
+          : [];
+        const isFallback =
+          opts.allowConsumerFallback &&
+          verify.nextAction === "fallback_to_consumers" &&
+          fallbackPlans.length > 0;
+
+        let currentCredits = patch.creditsUsed || creditsUsed;
+
+        // Bounded AI Verify Rescue: when lockfile is satisfied and git changes exist,
+        // but a build/test command failed, run a focused rescue hook (capped at
+        // rescueCreditBudget & remaining repo budget) and re-run deterministic verify.
+        const canRunVerifyRescue =
+          enableAiRescue &&
+          !verify.passed &&
+          !isFallback &&
+          !verifyRescueUsed &&
+          verify.nextAction === "retry_patch" &&
+          verify.hasGitChanges &&
+          verify.lockfilePassed &&
+          verify.commands.some((cmd) => !cmd.passed) &&
+          currentCredits < creditBudget;
+
+        if (canRunVerifyRescue) {
+          verifyRescueUsed = true;
+          runsStore?.recordEvent(runId, {
+            targetRepo: ws.plan.targetRepo,
+            stage: "verify",
+            status: "info",
+            attempt,
+            message: `[AI Rescue] Verification command failed; launching bounded verify rescue (limit ${Math.min(rescueCreditBudget, Math.max(0, creditBudget - currentCredits))} cr)`,
+          });
+          const rescue = await runAiRescueHook(
+            {
+              runId,
+              stage: "verify",
+              workspacePath: ws.workspacePath,
+              plan: ws.plan,
+              errorOutput: verify.failureSummary ?? "Verification command failed.",
+              changedFiles: verify.changedFiles,
+              allowUnrelated403Overrides,
+              rescueCreditBudget,
+              totalCreditBudget: creditBudget,
+              creditsUsed: currentCredits,
+              persist,
+            },
+            exec,
+          );
+          currentCredits = rescue.creditsUsed;
+          creditsUsed = rescue.creditsUsed;
+          runsStore?.updateRepo(runId, ws.plan.targetRepo, {
+            plan: ws.plan,
+            creditsUsed: currentCredits,
+            creditBudget,
+            currentStage: "verify",
+          });
+          runsStore?.recordEvent(runId, {
+            targetRepo: ws.plan.targetRepo,
+            stage: "verify",
+            status: rescue.outcome === "RECOVERED" ? "succeeded" : "failed",
+            attempt,
+            durationMs: rescue.durationMs,
+            message: `[AI Rescue] Verify rescue ${rescue.outcome} (${rescue.creditsSpent} cr, total ${currentCredits}/${creditBudget}): ${rescue.summary}`,
+          });
+
+          if (rescue.outcome === "RECOVERED") {
+            verify = await verifyRemediationWorkspace(
+              {
+                runId,
+                workspacePath: ws.workspacePath,
+                plan: ws.plan,
+                verifyDownstream: opts.verifyDownstream,
+                copilotOutput: patch.copilotOutput,
+                copilotStructuredOutput: patch.structuredOutput ?? undefined,
+                persist,
+              },
+              exec,
+            );
+          }
+        }
+
+        runsStore?.updateRepo(runId, ws.plan.targetRepo, {
+          plan: ws.plan,
+          status: isFallback ? "completed" : "verifying",
+          lastError:
+            verify.passed || isFallback
+              ? null
+              : (verify.failureSummary ?? "Verification failed"),
+          clearError: verify.passed || isFallback,
+          currentStage: "verify",
+          autoFinalize: false,
+        });
+        runsStore?.recordEvent(runId, {
+          targetRepo: ws.plan.targetRepo,
+          stage: "verify",
+          status: verify.passed ? "succeeded" : isFallback ? "info" : "failed",
+          durationMs: verifyDurationMs,
+          message: verify.passed
+            ? `Verification passed (${verify.changedFiles.length} file(s) changed, ${verify.commands.length} command(s))`
+            : isFallback
+              ? `Fallback to consumer(s) (${fallbackPlans.map((p) => p.targetRepo).join(", ")})`
+              : `Verification failed: ${verify.failureSummary ?? "checks did not pass"}`,
+        });
+
+        if (verify.passed) {
+          const prStartMs = performance.now();
+          runsStore?.updateRepo(runId, ws.plan.targetRepo, {
+            plan: ws.plan,
+            status: "creating_pr",
+            remediationBranch: ws.remediationBranch,
+            dryRun,
+            currentStage: "pr",
+          });
+          const pr = await createRemediationDraftPr(
+            {
+              runId,
+              workspacePath: ws.workspacePath,
+              plan: ws.plan,
+              remediationBranch: ws.remediationBranch,
+              baseBranch: ws.baseBranch,
+              verification: verify,
+              copilotSummary: patch.copilotOutput,
+              upstreamContext: opts.upstreamContext ?? null,
+              draft: true,
+              dryRun,
+              persist,
+            },
+            exec,
+          );
+          runsStore?.updateRepo(runId, ws.plan.targetRepo, {
+            plan: ws.plan,
+            status: "completed",
+            remediationBranch: pr.remediationBranch,
+            dryRun: pr.dryRun,
+            prUrl: pr.prUrl,
+            reportPath: pr.artifacts?.prReportPath ?? null,
+            clearError: true,
+            currentStage: "pr",
+            autoFinalize: false,
+            event: {
+              targetRepo: ws.plan.targetRepo,
+              stage: "pr",
+              status: "succeeded",
+              durationMs: Math.round(performance.now() - prStartMs),
+              message: pr.prUrl
+                ? `Draft PR ready: ${pr.prUrl}`
+                : `Dry-run report generated (${pr.remediationBranch})`,
+            },
+          });
+          return [pr as unknown as Record<string, unknown>];
+        }
+
+        if (isFallback) {
+          const fallbackBatch = await prepareRemediationWorkspacesBatch(
+            {
+              runId,
+              plans: fallbackPlans,
+              reuseExisting: true,
+              installDeps: false,
+              workspacesRoot,
+            },
+            exec,
+          );
+          const upstreamNote = `Upstream owned-library (${ws.targetRepo}) fallback (${verify.copilotStatus || "fallback_to_consumers"}): ${verify.fallbackReason || "Refresh consumer lockfile or apply consumer-scoped fix."}`;
+          const upstreamContext: UpstreamTriageContext = {
+            repository: ws.targetRepo,
+            status: verify.copilotStatus || "fallback_to_consumers",
+            reason: verify.fallbackReason || null,
+            copilotSummary: patch.copilotOutput || null,
+          };
+
+          const consumerResults: Record<string, unknown>[] = [];
+          for (const consumerWs of fallbackBatch.workspaces) {
+            const sub = await executeSingleWorkspace(consumerWs, {
+              allowConsumerFallback: false,
+              verifyDownstream: false,
+              extraInstructions: upstreamNote,
+              upstreamContext,
+            });
+            consumerResults.push(...sub);
+          }
+          return consumerResults;
+        }
+
+        const currentAttempt = patch.attempt || attempt;
+        const shouldEscalate403 =
+          verify.copilotStatus === "REGISTRY_BLOCKED_UNRELATED" &&
+          policy403 === "escalate_on_retry" &&
+          !allowUnrelated403Overrides &&
+          currentAttempt < maxRetries &&
+          currentCredits < creditBudget;
+        const isBlocked = verify.nextAction === "stop_blocked";
+        const canRetry =
+          shouldEscalate403 ||
+          (!isBlocked &&
+            currentAttempt < maxRetries &&
+            currentCredits < creditBudget);
+
+        if (canRetry) {
+          if (shouldEscalate403) {
+            allowUnrelated403Overrides = true;
+          }
+          attempt = currentAttempt + 1;
+          creditsUsed = currentCredits;
+          previousError =
+            verify.failureSummary || patch.error || "Verification failed.";
+          continue;
+        }
+
+        const reason =
+          verify.failureSummary ||
+          patch.error ||
+          (isBlocked
+            ? `Remediation blocked (${verify.copilotStatus || "stop_blocked"})`
+            : "Verification failed; retry or credit limit reached");
+        runsStore?.markRepoFailed(runId, ws.targetRepo, {
+          reason,
+          attempt: currentAttempt,
+          creditsUsed: currentCredits,
+          creditBudget,
+          autoFinalize: false,
+        });
+        return [
+          {
+            ok: false,
+            status: "failed",
+            runId,
+            targetRepo: ws.targetRepo,
+            remediationBranch: ws.remediationBranch,
+            attempts: currentAttempt,
+            creditsUsed: currentCredits,
+            creditBudget,
+            reason,
+          },
+        ];
+      }
+    };
+
+    const releaseActivity = runsStore?.trackRunActivity(runId);
+    try {
+      const results = await executeSingleWorkspace(workspace, {
+        allowConsumerFallback: true,
+        verifyDownstream,
+      });
+      const failed = results.filter(
+        (r) => r.ok === false || r.status === "failed",
+      );
+      const ok = failed.length === 0;
+      return c.json(
+        {
+          ok,
+          runId,
+          targetRepo: workspace.targetRepo,
+          status: ok ? "completed" : "failed",
+          dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
+          results,
+        },
+        ok ? 200 : 422,
+      );
+    } finally {
+      releaseActivity?.();
+    }
+  });
+
+  /**
+   * POST /api/remediation/rescue
+   * Standalone bounded AI rescue hook (`prepare` | `verify`) with a dedicated credit
+   * cap (default 10 credits) bounded by the repository's remaining credit budget.
+   */
+  route.post("/rescue", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    const plan = assertPlan(body.plan);
+    const stage = body.stage === "prepare" || body.stage === "verify" ? body.stage : null;
+    if (!stage) {
+      return c.json(
+        { ok: false, error: "Field `stage` must be 'prepare' or 'verify'." },
+        400,
+      );
+    }
+    const workspacePath =
+      typeof body.workspacePath === "string" ? body.workspacePath.trim() : "";
+    const dryRun = Boolean(body.dryRun);
+    if (!workspacePath && !dryRun) {
+      return c.json(
+        { ok: false, error: "Field `workspacePath` is required." },
+        400,
+      );
+    }
+    const errorOutput =
+      typeof body.errorOutput === "string" ? body.errorOutput : "";
+    const runId =
+      typeof body.runId === "string" && body.runId.trim()
+        ? body.runId.trim()
+        : createRunId("rem");
+
+    const input: RunAiRescueInput = {
+      runId,
+      stage,
+      workspacePath,
+      plan,
+      errorOutput,
+      rescueCreditBudget:
+        typeof body.rescueCreditBudget === "number"
+          ? body.rescueCreditBudget
+          : undefined,
+      totalCreditBudget:
+        typeof body.creditBudget === "number"
+          ? body.creditBudget
+          : typeof body.totalCreditBudget === "number"
+            ? body.totalCreditBudget
+            : undefined,
+      creditsUsed:
+        typeof body.creditsUsed === "number" ? body.creditsUsed : undefined,
+      changedFiles: Array.isArray(body.changedFiles)
+        ? body.changedFiles.filter((f): f is string => typeof f === "string")
+        : undefined,
+      allowUnrelated403Overrides:
+        typeof body.allowUnrelated403Overrides === "boolean"
+          ? body.allowUnrelated403Overrides
+          : undefined,
+      model: typeof body.model === "string" ? body.model : undefined,
+      timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
+      dryRun,
+      persist: typeof body.persist === "boolean" ? body.persist : true,
+    };
+
+    const result = await runAiRescueHook(input, exec);
+    if (runsStore && result.creditsSpent > 0) {
+      runsStore.updateRepo(runId, plan.targetRepo, {
+        plan,
+        creditsUsed: result.creditsUsed,
+        creditBudget: result.totalCreditBudget,
+        currentStage: stage,
+      });
+      runsStore.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage,
+        status: result.outcome === "RECOVERED" ? "succeeded" : "info",
+        durationMs: result.durationMs,
+        message: `[AI Rescue] ${stage} rescue ${result.outcome} (${result.creditsSpent} cr): ${result.summary}`,
+      });
+    }
+
+    return c.json(result, result.budgetExceeded ? 429 : 200);
   });
 
   /**

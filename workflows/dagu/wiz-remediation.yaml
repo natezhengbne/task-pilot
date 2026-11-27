@@ -1,0 +1,247 @@
+name: wiz-remediation
+description: >-
+  TaskPilot vulnerability remediation (Phase 1 / 2 / 3). Passes only `runId` and
+  `targetRepo` between steps; artifacts live in `.runs/<runId>/` on the TaskPilot host.
+
+params:
+  - name: report_path
+    type: string
+    description: Local path to the vulnerability export JSON file on the TaskPilot host (e.g. F:/path/to/wiz.json)
+  - name: source
+    type: string
+    default: wiz-graphql
+    enum:
+      - wiz-graphql
+    description: Vulnerability report source adapter
+  - name: min_severity
+    type: string
+    default: HIGH
+    enum:
+      - CRITICAL
+      - HIGH
+      - MEDIUM
+      - LOW
+    description: Minimum vulnerability severity to include
+  - name: owned_scopes
+    type: string
+    default: ""
+    description: Comma-separated owned npm scopes (optional; defaults to config/ownership.json)
+  - name: phase
+    type: string
+    default: Phase 3 - Full Remediation + Draft PR
+    enum:
+      - Phase 3 - Full Remediation + Draft PR
+      - Phase 2 - Copilot Remediation (Verify Only)
+      - Phase 1 - Analysis Only
+    description: Execution phase
+  - name: max_retries
+    type: integer
+    default: 2
+    description: Maximum Copilot remediation attempts per repository (up to 5; bounded by credit_budget and stop_blocked early exit)
+  - name: credit_budget
+    type: integer
+    default: 30
+    description: Copilot credit budget per repository
+  - name: unrelated_403_policy
+    type: string
+    default: allowed
+    enum:
+      - allowed
+      - escalate_on_retry
+      - forbidden
+    description: Policy when npm install hits HTTP 403 on unrelated registry-blocked packages
+  - name: enable_ai_rescue
+    type: boolean
+    default: true
+    description: Enable bounded AI rescue hooks when prepare or verify steps fail unexpectedly
+  - name: rescue_credit_budget
+    type: integer
+    default: 10
+    description: Dedicated credit cap per AI rescue invocation (also bounded by credit_budget)
+  - name: verify_downstream
+    type: boolean
+    default: false
+    description: Whether to verify downstream consumer repositories after patching
+
+env:
+  - API_URL: "${TASKPILOT_API_URL:-http://127.0.0.1:3456}"
+  - RUN_ID: "dagu-${DAG_RUN_ID}"
+
+steps:
+  - id: ingest_vulnerabilities
+    action: http.request
+    with:
+      method: POST
+      url: "${API_URL}/api/vulnerabilities/ingest"
+      timeout: 30
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
+      body: |
+        {
+          "runId": "${RUN_ID}",
+          "source": "${params.source}",
+          "phase": "${params.phase}",
+          "reportPath": "${params.report_path}",
+          "policy": {
+            "minSeverity": "${params.min_severity}",
+            "ownedScopes": "${params.owned_scopes}"
+          }
+        }
+    output: INGEST_RES
+
+  - id: plan_remediation
+    depends: ingest_vulnerabilities
+    action: http.request
+    with:
+      method: POST
+      url: "${API_URL}/api/vulnerabilities/plan"
+      timeout: 120
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
+      body: |
+        {
+          "runId": "${RUN_ID}",
+          "useGitHub": true,
+          "ownedScopes": "${params.owned_scopes}"
+        }
+    output: PLAN_RES
+
+  - id: preflight_check
+    depends: plan_remediation
+    preconditions:
+      - condition: "${params.phase}"
+        expected: "re:^Phase [23]"
+      - condition: "${PLAN_RES.summary.planCount}"
+        expected: "re:^[1-9][0-9]*$"
+    action: http.request
+    with:
+      method: POST
+      url: "${API_URL}/api/preflight"
+      timeout: 15
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
+      body: |
+        {
+          "checks": ["gh", "copilot", "git", "node", "npm", "npm-auth"]
+        }
+
+  - id: prepare_workspaces
+    depends: preflight_check
+    action: http.request
+    with:
+      method: POST
+      url: "${API_URL}/api/remediation/workspaces/prepare"
+      timeout: 900
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
+      body: |
+        {
+          "runId": "${RUN_ID}",
+          "reuseExisting": true,
+          "installDeps": false,
+          "enableAiRescue": ${params.enable_ai_rescue},
+          "rescueCreditBudget": ${params.rescue_credit_budget},
+          "creditBudget": ${params.credit_budget}
+        }
+    output: PREPARE_RES
+
+  - id: remediate_repos
+    depends: prepare_workspaces
+    action: dag.run
+    with:
+      dag: remediate-single-repo
+      params:
+        run_id: "${RUN_ID}"
+        target_repo: "${ITEM}"
+        phase: "${params.phase}"
+        max_retries: "${params.max_retries}"
+        credit_budget: "${params.credit_budget}"
+        unrelated_403_policy: "${params.unrelated_403_policy}"
+        enable_ai_rescue: "${params.enable_ai_rescue}"
+        rescue_credit_budget: "${params.rescue_credit_budget}"
+        verify_downstream: "${params.verify_downstream}"
+    parallel:
+      items: "${PREPARE_RES.targetRepos}"
+      max_concurrent: 1
+    continue_on:
+      failure: true
+
+  - id: finalize_run
+    depends: [plan_remediation, remediate_repos]
+    continue_on:
+      skipped: true
+    action: http.request
+    with:
+      method: POST
+      url: "${API_URL}/api/remediation/finalize"
+      timeout: 15
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
+      body: |
+        {
+          "runId": "${RUN_ID}",
+          "cancelIncomplete": true,
+          "message": "Dagu workflow finished"
+        }
+    output: FINALIZE_RES
+
+---
+name: remediate-single-repo
+description: Execute Phase 2 & 3 (patch -> verify -> retry/fallback -> Draft PR) for one target repo.
+params:
+  - name: run_id
+    type: string
+  - name: target_repo
+    type: string
+  - name: phase
+    type: string
+    default: Phase 3 - Full Remediation + Draft PR
+  - name: max_retries
+    type: integer
+    default: 2
+  - name: credit_budget
+    type: integer
+    default: 30
+  - name: unrelated_403_policy
+    type: string
+    default: allowed
+  - name: enable_ai_rescue
+    type: boolean
+    default: true
+  - name: rescue_credit_budget
+    type: integer
+    default: 10
+  - name: verify_downstream
+    type: boolean
+    default: false
+
+env:
+  - API_URL: "${TASKPILOT_API_URL:-http://127.0.0.1:3456}"
+
+steps:
+  - id: run_repo
+    action: http.request
+    with:
+      method: POST
+      url: "${API_URL}/api/remediation/run-repo"
+      timeout: 1800
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
+      body: |
+        {
+          "runId": "${params.run_id}",
+          "targetRepo": "${params.target_repo}",
+          "phase": "${params.phase}",
+          "maxRetries": ${params.max_retries},
+          "creditBudget": ${params.credit_budget},
+          "unrelated403Policy": "${params.unrelated_403_policy}",
+          "enableAiRescue": ${params.enable_ai_rescue},
+          "rescueCreditBudget": ${params.rescue_credit_budget},
+          "verifyDownstream": ${params.verify_downstream}
+        }

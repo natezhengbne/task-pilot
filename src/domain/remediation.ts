@@ -94,13 +94,15 @@ export interface StructuredRemediationOutput {
   };
   downstreamUpdateRequired: boolean;
   prReady: boolean;
+  blockedPackages?: string[];
   reason?: string;
 }
 
 export type RemediationNextAction =
   | "create_pr"
   | "retry_patch"
-  | "fallback_to_consumers";
+  | "fallback_to_consumers"
+  | "stop_blocked";
 
 export interface RemediationVerificationResult {
   passed: boolean;
@@ -284,7 +286,7 @@ export function buildCopilotRemediationPrompt(
   );
   lines.push(
     allowUnrelated403
-      ? "- **Unrelated 403 Scope Expansion**: `allowed` (same-major scoped `overrides` permitted only for HTTP 403 registry-blocked unrelated transitive packages; must be listed separately for PR audit)."
+      ? "- **Unrelated 403 Scope Expansion**: `allowed` (resolve HTTP 403 registry-blocked unrelated packages to their minimal compliant version — prefer same-major scoped `overrides`/parent upgrades; controlled cross-major upgrade permitted only when no same-major compliant version exists, usage impact is minimal, and all verification checks pass; list every upgraded package under `### Additional Registry-Blocked Dependencies Upgraded`)."
       : "- **Unrelated 403 Scope Expansion**: `forbidden` (default — if `npm install` fails with HTTP 403 on an unrelated package, stop and report `STATUS: REGISTRY_BLOCKED_UNRELATED` instead of expanding PR scope).",
   );
   if (options.detectedScripts && options.detectedScripts.length > 0) {
@@ -477,6 +479,12 @@ export function parseStructuredRemediationOutput(
       ? obj.advisories.filter((a): a is string => typeof a === "string" && a.trim().length > 0)
       : undefined;
 
+    const blockedPackages = Array.isArray(obj.blockedPackages)
+      ? obj.blockedPackages.filter(
+          (p): p is string => typeof p === "string" && p.trim().length > 0,
+        )
+      : undefined;
+
     return {
       status: obj.status as RemediationOutcomeStatus,
       impactScope: normalizeImpactScope(obj.impactScope),
@@ -490,6 +498,9 @@ export function parseStructuredRemediationOutput(
       validation,
       downstreamUpdateRequired: Boolean(obj.downstreamUpdateRequired),
       prReady: Boolean(obj.prReady) && !hasBlockingValidation,
+      ...(blockedPackages && blockedPackages.length > 0
+        ? { blockedPackages }
+        : {}),
       ...(typeof obj.reason === "string" && obj.reason.trim()
         ? { reason: obj.reason.trim() }
         : {}),

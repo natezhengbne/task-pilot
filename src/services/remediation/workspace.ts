@@ -8,6 +8,11 @@ import {
   loadDefaultOwnershipRules,
   resolveConfiguredRepoBaseBranch,
 } from "../../shared/ownership-config.ts";
+import {
+  DEFAULT_RESCUE_CREDIT_BUDGET,
+  runAiRescueHook,
+  type AiRescueOutcome,
+} from "./rescue.ts";
 
 export type CommandRunner = (
   cmd: string[],
@@ -35,6 +40,16 @@ export interface PrepareWorkspaceInput {
   workspacesRoot?: string;
   timeoutMs?: number;
   installTimeoutMs?: number;
+  /** Enable bounded AI rescue hook if `npm install` fails during prepare (default: false). */
+  enableAiRescue?: boolean;
+  /** Dedicated credit budget for the prepare rescue hook (default: 10). */
+  rescueCreditBudget?: number;
+  /** Total per-repo credit budget used to cap the rescue hook (default: 30). */
+  totalCreditBudget?: number;
+  /** Credits already used on this repo prior to prepare (default: 0). */
+  creditsUsed?: number;
+  /** Persist rescue prompt/output artifacts under `.runs/<runId>/` (default: true). */
+  persist?: boolean;
 }
 
 export interface PrepareWorkspaceResult {
@@ -49,6 +64,9 @@ export interface PrepareWorkspaceResult {
   packageName: string | null;
   detectedScripts: string[];
   recommendedVerifyCommands: string[];
+  rescueOutcome?: AiRescueOutcome;
+  rescueCreditsSpent?: number;
+  rescueHints?: string;
 }
 
 export interface PrepareWorkspacesBatchInput {
@@ -60,6 +78,10 @@ export interface PrepareWorkspacesBatchInput {
   workspacesRoot?: string;
   timeoutMs?: number;
   installTimeoutMs?: number;
+  enableAiRescue?: boolean;
+  rescueCreditBudget?: number;
+  totalCreditBudget?: number;
+  persist?: boolean;
 }
 
 export interface PreparedWorkspaceItem extends PrepareWorkspaceResult {
@@ -337,6 +359,9 @@ export async function prepareRemediationWorkspace(
 
   let depsInstalled = false;
   let installDurationMs = 0;
+  let rescueOutcome: AiRescueOutcome | undefined;
+  let rescueCreditsSpent: number | undefined;
+  let rescueHints: string | undefined;
   const hasPackageJson = existsSync(join(workspacePath, "package.json"));
 
   if (installDeps && hasPackageJson) {
@@ -353,15 +378,60 @@ export async function prepareRemediationWorkspace(
     );
     installDurationMs = Math.round(performance.now() - installStart);
     if (installRes.exitCode !== 0 || installRes.timedOut) {
-      const detail = (installRes.stderr || installRes.stdout).trim().slice(-1500);
-      throw new Error(
-        `Failed to run npm install in ${targetRepo} (exit ${installRes.exitCode}${installRes.timedOut ? ", timed out" : ""}): ${detail || "unknown error"}`,
+      const detail = (installRes.stderr || installRes.stdout).trim().slice(-2000);
+      const baseError = `Failed to run npm install in ${targetRepo} (exit ${installRes.exitCode}${installRes.timedOut ? ", timed out" : ""}): ${detail || "unknown error"}`;
+
+      if (input.enableAiRescue) {
+        process.stderr.write(
+          `[workspace] npm install failed in ${targetRepo}; invoking AI prepare rescue (budget=${input.rescueCreditBudget ?? DEFAULT_RESCUE_CREDIT_BUDGET} cr)...\n`,
+        );
+        const rescue = await runAiRescueHook(
+          {
+            runId: input.runId,
+            stage: "prepare",
+            workspacePath,
+            plan: input.plan,
+            errorOutput: baseError,
+            rescueCreditBudget: input.rescueCreditBudget ?? DEFAULT_RESCUE_CREDIT_BUDGET,
+            totalCreditBudget: input.totalCreditBudget ?? 30,
+            creditsUsed: input.creditsUsed ?? 0,
+            persist: input.persist,
+          },
+          exec,
+        );
+        rescueOutcome = rescue.outcome;
+        rescueCreditsSpent = rescue.creditsSpent;
+
+        if (rescue.outcome === "RECOVERED") {
+          depsInstalled = true;
+          rescueHints = rescue.nextHints;
+          process.stderr.write(
+            `[workspace] AI prepare rescue recovered ${targetRepo} (spent=${rescue.creditsSpent} cr): ${rescue.summary}\n`,
+          );
+        } else if (rescue.outcome === "DEFER_TO_PATCH") {
+          depsInstalled = false;
+          const blockedNote =
+            rescue.blockedPackages && rescue.blockedPackages.length > 0
+              ? ` Blocked packages: ${rescue.blockedPackages.join(", ")}.`
+              : "";
+          rescueHints = `${rescue.nextHints || rescue.summary}${blockedNote}`.trim();
+          process.stderr.write(
+            `[workspace] AI prepare rescue deferred install to patch stage for ${targetRepo} (spent=${rescue.creditsSpent} cr): ${rescue.summary}\n`,
+          );
+        } else {
+          throw new Error(
+            `${baseError}\n[AI Prepare Rescue: ${rescue.outcome}] ${rescue.summary}`,
+          );
+        }
+      } else {
+        throw new Error(baseError);
+      }
+    } else {
+      depsInstalled = true;
+      process.stderr.write(
+        `[workspace] dependencies ready in ${targetRepo} (${installDurationMs}ms)\n`,
       );
     }
-    depsInstalled = true;
-    process.stderr.write(
-      `[workspace] dependencies ready in ${targetRepo} (${installDurationMs}ms)\n`,
-    );
   }
 
   const pkgInfo = await inspectPackageScripts(workspacePath);
@@ -376,6 +446,9 @@ export async function prepareRemediationWorkspace(
     depsInstalled,
     installDurationMs,
     ...pkgInfo,
+    ...(rescueOutcome ? { rescueOutcome } : {}),
+    ...(rescueCreditsSpent !== undefined ? { rescueCreditsSpent } : {}),
+    ...(rescueHints ? { rescueHints } : {}),
   };
 }
 
@@ -424,6 +497,10 @@ export async function prepareRemediationWorkspacesBatch(
           workspacesRoot: input.workspacesRoot,
           timeoutMs: input.timeoutMs,
           installTimeoutMs: input.installTimeoutMs,
+          enableAiRescue: input.enableAiRescue,
+          rescueCreditBudget: input.rescueCreditBudget,
+          totalCreditBudget: input.totalCreditBudget,
+          persist: input.persist,
         },
         exec,
       );
