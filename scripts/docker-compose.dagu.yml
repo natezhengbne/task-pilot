@@ -5,11 +5,11 @@ services:
     network_mode: host
     restart: unless-stopped
     volumes:
+      - taskpilot_dagu_home:/var/lib/dagu
       - ../workflows/dagu:/var/lib/dagu/dags
-      - taskpilot_dagu_data:/var/lib/dagu/data
     environment:
       - DAGU_HOST=${DAGU_HOST:-0.0.0.0}
-      - DAGU_PORT=${DAGU_PORT:-8080}
+      - DAGU_PORT=${DAGU_PORT:-5678}
       - DAGU_DAGS_DIR=/var/lib/dagu/dags
       - DAGU_DATA_DIR=/var/lib/dagu/data
       - DAGU_TZ=${DAGU_TZ:-UTC}
@@ -18,5 +18,5 @@ services:
     command: ["dagu", "start-all"]
 
 volumes:
-  taskpilot_dagu_data:
-    name: taskpilot_dagu_data
+  taskpilot_dagu_home:
+    name: taskpilot_dagu_home

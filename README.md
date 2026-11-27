@@ -10,7 +10,6 @@ A TypeScript (Bun + Hono) **capability API server** designed to be orchestrated 
 ```text
 src/
 ├── server.ts                          # Bun.serve entrypoint (default http://127.0.0.1:3456)
-├── cli.ts                             # Optional local CLI runner calling the same domain logic
 ├── domain/
 │   ├── vulnerability.ts               # Vendor-neutral Finding & ingest policy
 │   ├── remediation-plan.ts            # Lockfile-backed target attribution & repo plan grouping
@@ -28,7 +27,7 @@ src/
 │       ├── vulnerabilities.ts         # Phase 1: POST /ingest, POST /plan, GET /sources
 │       ├── preflight.ts               # Generic runtime preflight: GET/POST /api/preflight
 │       └── remediation.ts             # Phase 2 & 3: /workspace/prepare, /patch, /verify, /pr
-└── shared/                            # Subprocess runner, CLI I/O, .runs/ artifact store
+└── shared/                            # Subprocess runner, .runs/ artifact store
 ```
 
 ## Quick Start
@@ -72,7 +71,7 @@ bun run dev:wsl
 # or: docker compose -f scripts/docker-compose.dagu.yml up -d
 ```
 
-* **Dagu**: Open `http://localhost:8080` and run `wiz-remediation` (`workflows/dagu/wiz-remediation.yaml`, mounted directly — no sync/import needed). Steps pass only `runId` and `targetRepo`; TaskPilot persists artifacts under `.runs/<runId>/` and handles the inner per-repo patch/verify retry & fallback loop via `POST /api/remediation/run-repo`.
+* **Dagu**: Open `http://localhost:5678` and run `wiz-remediation` (`workflows/dagu/wiz-remediation.yaml`, mounted directly — no sync/import needed). Steps pass only `runId` and `targetRepo`; TaskPilot persists artifacts under `.runs/<runId>/` and handles the inner per-repo patch/verify retry & fallback loop via `POST /api/remediation/run-repo`.
 * **n8n**: Import `workflows/n8n/wiz-remediation.workflow.json` into n8n (`http://localhost:5678`). It is a single-file, vertically layered 3-phase workflow (Row 1: Phase 1 upload/ingest/plan, Row 2: Phase 2 per-repo workspace + Copilot patch/verify retry loop, Row 3: Phase 3 Draft PR / report & final summary).
 * **Windmill**: Open `http://localhost:8000` (default login: `admin@windmill.dev` / `changeme`), then run `./workflows/windmill/sync.sh` (or `bun run windmill:sync`) to one-click sync `workflows/windmill/f/taskpilot/wiz_remediation.flow/flow.yaml` via Windmill REST API — or import the YAML in the Flow editor / run `cd workflows/windmill && wmill sync push`.
 

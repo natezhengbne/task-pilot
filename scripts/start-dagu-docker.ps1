@@ -8,7 +8,7 @@ $composeFile = Join-Path $PSScriptRoot "docker-compose.dagu.yml"
 
 docker compose -f $composeFile up -d @ComposeArgs
 
-$port = if ($env:DAGU_PORT) { $env:DAGU_PORT } else { "8080" }
+$port = if ($env:DAGU_PORT) { $env:DAGU_PORT } else { "5678" }
 $apiUrl = if ($env:TASKPILOT_API_URL) { $env:TASKPILOT_API_URL } else { "http://127.0.0.1:3456" }
 
 Write-Host ""

@@ -8,6 +8,7 @@ import {
   extractCopilotSummaryForPr,
   extractDirectParentInsight,
   loadRemediationSkill,
+  loadVersioningSkill,
   parseStructuredRemediationOutput,
 } from "../../src/domain/remediation.ts";
 import { parseCreditsFromOutput } from "../../src/services/remediation/copilot.ts";
@@ -79,6 +80,24 @@ describe("domain/remediation", () => {
     expect(skill).toContain("ENVIRONMENT_BLOCKED");
     expect(skill).toContain("MANUAL_REVIEW_REQUIRED");
     expect(skill).toContain("VALIDATION_FAILED");
+  });
+
+  test("loads skills/release-versioning/SKILL.md and embeds it into remediation prompt", () => {
+    const versioningSkill = loadVersioningSkill();
+    expect(versioningSkill.startsWith("# Release Versioning & Changelog Skill")).toBe(true);
+    expect(versioningSkill).not.toContain("name: release-versioning");
+    expect(versioningSkill).toContain("2026.11.1.1");
+    expect(versioningSkill).toContain("2026.11.2.1");
+    expect(versioningSkill).toContain("CHANGELOG.md");
+    expect(versioningSkill).toContain("semantic-release");
+
+    const prompt = buildCopilotRemediationPrompt(samplePlan);
+    expect(prompt).toContain("# Release Versioning & Changelog Skill");
+
+    const withoutVersioning = buildCopilotRemediationPrompt(samplePlan, {
+      versioningSkillPath: null,
+    });
+    expect(withoutVersioning).not.toContain("# Release Versioning & Changelog Skill");
   });
 
   test("builds Copilot prompt with CVEs, dependency paths, shared SKILL.md, and retry error context", () => {

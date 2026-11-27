@@ -7,10 +7,15 @@ export const DEFAULT_REMEDIATION_SKILL_PATH = resolve(
   "../../skills/npm-remediation/SKILL.md",
 );
 
+export const DEFAULT_VERSIONING_SKILL_PATH = resolve(
+  import.meta.dir,
+  "../../skills/release-versioning/SKILL.md",
+);
+
 const skillCache = new Map<string, string>();
 
 /**
- * Loads the Markdown remediation skill playbook (stripping YAML frontmatter)
+ * Loads a Markdown skill playbook (stripping YAML frontmatter)
  * so prompt rules live in a single human-reviewable `SKILL.md` file.
  */
 export function loadRemediationSkill(
@@ -24,6 +29,12 @@ export function loadRemediationSkill(
   const stripped = raw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   skillCache.set(skillPath, stripped);
   return stripped;
+}
+
+export function loadVersioningSkill(
+  skillPath = DEFAULT_VERSIONING_SKILL_PATH,
+): string {
+  return loadRemediationSkill(skillPath);
 }
 
 export interface RemediationCommandResult {
@@ -132,6 +143,8 @@ export interface CopilotPromptOptions {
   allowUnrelated403Overrides?: boolean;
   extraInstructions?: string;
   skillPath?: string;
+  /** Optional override for `skills/release-versioning/SKILL.md`; pass `null` to omit. */
+  versioningSkillPath?: string | null;
 }
 
 /**
@@ -333,6 +346,13 @@ export function buildCopilotRemediationPrompt(
   lines.push("---");
   lines.push("");
   lines.push(loadRemediationSkill(options.skillPath));
+
+  if (options.versioningSkillPath !== null) {
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+    lines.push(loadVersioningSkill(options.versioningSkillPath));
+  }
 
   if (options.extraInstructions?.trim()) {
     lines.push("");
