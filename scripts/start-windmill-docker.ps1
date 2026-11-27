@@ -9,7 +9,7 @@ $composeFile = Join-Path $PSScriptRoot "docker-compose.windmill.yml"
 docker compose -f $composeFile up -d @ComposeArgs
 
 $port = if ($env:WINDMILL_PORT) { $env:WINDMILL_PORT } else { "8000" }
-$apiUrl = if ($env:TASKPILOT_API_URL) { $env:TASKPILOT_API_URL } else { "http://host.docker.internal:3456" }
+$apiUrl = if ($env:TASKPILOT_API_URL) { $env:TASKPILOT_API_URL } else { "http://localhost:3456" }
 
 Write-Host ""
 Write-Host "Windmill is running in background:"

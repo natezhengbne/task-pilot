@@ -53,7 +53,7 @@ value:
             const apiUrl = (
               taskpilot_api_url ||
               process.env.TASKPILOT_API_URL ||
-              "http://host.docker.internal:3456"
+              "http://localhost:3456"
             ).replace(/\/+$/, "");
 
             const jobId =
