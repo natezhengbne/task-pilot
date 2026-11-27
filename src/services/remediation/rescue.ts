@@ -2,7 +2,6 @@ import { resolve } from "node:path";
 import type { RemediationPlan } from "../../domain/remediation-plan.ts";
 import { runCommand } from "../../shared/exec.ts";
 import {
-  DEFAULT_GENERIC_RESCUE_CREDIT_BUDGET,
   parseGenericRescueOutput,
   runGenericAiRescue,
 } from "../ai/rescue.ts";
@@ -24,7 +23,7 @@ export const AI_RESCUE_OUTCOMES = [
 
 export type AiRescueOutcome = (typeof AI_RESCUE_OUTCOMES)[number];
 
-export const DEFAULT_RESCUE_CREDIT_BUDGET = DEFAULT_GENERIC_RESCUE_CREDIT_BUDGET;
+export const DEFAULT_RESCUE_CREDIT_BUDGET = 10;
 
 export interface StructuredRescueOutput {
   outcome: AiRescueOutcome;
