@@ -326,6 +326,128 @@ describe("http/remediation", () => {
     }
   });
 
+  test("POST /api/remediation/verify signals fallback_to_consumers when owned-library has no changes or only overrides target", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-verify-fallback-"));
+    try {
+      const basePkg = JSON.stringify({
+        name: "@acme-org/shared-utils",
+        dependencies: { "webpack-dev-server": "^5.2.5" },
+        scripts: { test: "echo ok" },
+      });
+      await Bun.write(join(tempDir, "package.json"), basePkg);
+      await Bun.write(
+        join(tempDir, "package-lock.json"),
+        JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { name: "@acme-org/shared-utils" },
+            "node_modules/shell-quote": { version: "1.8.4" },
+          },
+        }),
+      );
+
+      // Case 1: Copilot made no edits because upstream parent cannot fix the CVE
+      const noChangesApp = createApp({
+        exec: async (cmd) => {
+          if (cmd[0] === "git" && cmd[1] === "status") {
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          }
+          return { exitCode: 0, stdout: "ok\n", stderr: "", timedOut: false };
+        },
+        enableLogging: false,
+      });
+
+      const res1 = await noChangesApp.request("/api/remediation/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-fallback-nochange",
+          workspacePath: tempDir,
+          plan: samplePlan,
+          persist: false,
+        }),
+      });
+      expect(res1.status).toBe(200);
+      const body1 = (await res1.json()) as {
+        passed: boolean;
+        hasGitChanges: boolean;
+        fallbackToConsumers: boolean;
+        fallbackReason: string | null;
+        nextAction: string;
+      };
+      expect(body1.passed).toBe(false);
+      expect(body1.hasGitChanges).toBe(false);
+      expect(body1.fallbackToConsumers).toBe(true);
+      expect(body1.nextAction).toBe("fallback_to_consumers");
+      expect(body1.fallbackReason).toContain("No upstream dependency changes");
+
+      // Case 2: Copilot added overrides-only patch for target package without changing dependencies
+      await Bun.write(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "@acme-org/shared-utils",
+          dependencies: { "webpack-dev-server": "^5.2.5" },
+          overrides: { "shell-quote": "^1.11.0" },
+          scripts: { test: "echo ok" },
+        }),
+      );
+      await Bun.write(
+        join(tempDir, "package-lock.json"),
+        JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { name: "@acme-org/shared-utils" },
+            "node_modules/shell-quote": { version: "1.12.0" },
+          },
+        }),
+      );
+
+      const overridesOnlyApp = createApp({
+        exec: async (cmd) => {
+          if (cmd[0] === "git" && cmd[1] === "status") {
+            return {
+              exitCode: 0,
+              stdout: " M package.json\n M package-lock.json\n",
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (cmd[0] === "git" && cmd[1] === "show" && cmd[2] === "HEAD:package.json") {
+            return { exitCode: 0, stdout: basePkg, stderr: "", timedOut: false };
+          }
+          return { exitCode: 0, stdout: "ok\n", stderr: "", timedOut: false };
+        },
+        enableLogging: false,
+      });
+
+      const res2 = await overridesOnlyApp.request("/api/remediation/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-fallback-override",
+          workspacePath: tempDir,
+          plan: samplePlan,
+          persist: false,
+        }),
+      });
+      expect(res2.status).toBe(200);
+      const body2 = (await res2.json()) as {
+        passed: boolean;
+        downstreamEffective: boolean;
+        fallbackToConsumers: boolean;
+        fallbackReason: string | null;
+        nextAction: string;
+      };
+      expect(body2.passed).toBe(false);
+      expect(body2.downstreamEffective).toBe(false);
+      expect(body2.fallbackToConsumers).toBe(true);
+      expect(body2.nextAction).toBe("fallback_to_consumers");
+      expect(body2.fallbackReason).toContain("overrides");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("POST /api/remediation/verify returns 500 when git status fails instead of silently succeeding", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-verify-giterr-"));
     try {
@@ -477,6 +599,73 @@ describe("http/remediation", () => {
       expect(commands.some((c) => c[0] === "npm" && c[1] === "install")).toBe(true);
     } finally {
       await rm(cacheRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("POST /api/remediation/patch defaults Copilot --model to fusion and respects env/request overrides", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-copilot-model-"));
+    const prevEnvModel = process.env.TASKPILOT_COPILOT_MODEL;
+    try {
+      const copilotCalls: string[][] = [];
+      const mockExec: CommandRunner = async (cmd) => {
+        if (cmd[0] === "copilot") {
+          copilotCalls.push(cmd);
+        }
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      };
+      const app = createApp({ exec: mockExec, enableLogging: false });
+
+      // 1. Default: no env var, no request model -> --model fusion
+      delete process.env.TASKPILOT_COPILOT_MODEL;
+      const resDefault = await app.request("/api/remediation/patch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-model-default",
+          workspacePath: tempDir,
+          plan: samplePlan,
+          persist: false,
+        }),
+      });
+      expect(resDefault.status).toBe(200);
+      expect(copilotCalls[0]?.slice(-2)).toEqual(["--model", "fusion"]);
+
+      // 2. Env var override -> --model claude-sonnet-4.5
+      process.env.TASKPILOT_COPILOT_MODEL = "claude-sonnet-4.5";
+      const resEnv = await app.request("/api/remediation/patch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-model-env",
+          workspacePath: tempDir,
+          plan: samplePlan,
+          persist: false,
+        }),
+      });
+      expect(resEnv.status).toBe(200);
+      expect(copilotCalls[1]?.slice(-2)).toEqual(["--model", "claude-sonnet-4.5"]);
+
+      // 3. Explicit request model overrides env var -> --model gpt-5
+      const resInput = await app.request("/api/remediation/patch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-model-input",
+          workspacePath: tempDir,
+          plan: samplePlan,
+          model: "gpt-5",
+          persist: false,
+        }),
+      });
+      expect(resInput.status).toBe(200);
+      expect(copilotCalls[2]?.slice(-2)).toEqual(["--model", "gpt-5"]);
+    } finally {
+      if (prevEnvModel === undefined) {
+        delete process.env.TASKPILOT_COPILOT_MODEL;
+      } else {
+        process.env.TASKPILOT_COPILOT_MODEL = prevEnvModel;
+      }
+      await rm(tempDir, { recursive: true, force: true });
     }
   });
 });

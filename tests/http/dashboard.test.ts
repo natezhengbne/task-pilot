@@ -60,7 +60,25 @@ describe("http/dashboard", () => {
       expect(listHtml).toContain("n8n-101");
       expect(listHtml).toContain("Wiz Remediation");
       expect(listHtml).toContain("/runs/stream");
+      expect(listHtml).toContain("run-card");
+      expect(listHtml).toContain("acme-org/shared-utils");
+      expect(listHtml).toContain("from acme-org/web-app");
       expect(listHtml).toContain("shell-quote");
+      expect(listHtml).toContain("1.8.4");
+      expect(listHtml).toContain("1.11.0");
+      expect(listHtml).toContain("CVE-2026-102422");
+
+      // Also verify generic run type renders its own card body cleanly
+      runsStore.recordIngest("generic-1", {
+        runType: "generic",
+        source: "manual-webhook",
+        totalFindings: 3,
+      });
+      const listRes2 = await app.request("/runs");
+      const listHtml2 = await listRes2.text();
+      expect(listHtml2).toContain("generic-1");
+      expect(listHtml2).toContain("manual-webhook");
+      expect(listHtml2).toContain("run-generic-grid");
 
       const detailRes = await app.request("/runs/n8n-101");
       expect(detailRes.status).toBe(200);
@@ -197,6 +215,44 @@ describe("http/dashboard", () => {
       expect(snap.run.completedRepos).toBe(1);
       expect(snap.repos[0]?.status).toBe("completed");
       expect(snap.repos[0]?.dryRun).toBe(true);
+    } finally {
+      runsStore.close();
+    }
+  });
+
+  test("POST /runs/:runId/cancel marks a stuck running run as cancelled without Bearer token", async () => {
+    const runsStore = new RunsStore(":memory:");
+    try {
+      runsStore.recordIngest("n8n-stuck", {
+        source: "wiz-graphql",
+        totalFindings: 1,
+      });
+      runsStore.recordPlans("n8n-stuck", [samplePlan]);
+      runsStore.updateRepo("n8n-stuck", "acme-org/shared-utils", {
+        status: "patching",
+        currentStage: "patch",
+      });
+
+      const app = createApp({
+        apiToken: "secret-token",
+        runsStore,
+        enableLogging: false,
+      });
+
+      const res = await app.request("/runs/n8n-stuck/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "Stopped in n8n" }),
+      });
+      expect(res.status).toBe(200);
+      const data = (await res.json()) as { ok: boolean; cancelled: boolean; status: string };
+      expect(data.ok).toBe(true);
+      expect(data.cancelled).toBe(true);
+      expect(data.status).toBe("cancelled");
+
+      const snap = runsStore.getRunSnapshot("n8n-stuck")!;
+      expect(snap.run.status).toBe("cancelled");
+      expect(snap.repos[0]?.status).toBe("cancelled");
     } finally {
       runsStore.close();
     }

@@ -221,9 +221,90 @@ describe("db/runs-store", () => {
         "shell-quote",
         "adm-zip",
       ]);
+      expect(summaries[0]?.repos).toHaveLength(1);
+      expect(summaries[0]?.repos[0]?.targetRepo).toBe("acme-org/ux-utilities");
+      expect(summaries[0]?.repos[0]?.packages).toHaveLength(2);
+      expect(summaries[0]?.repos[0]?.packages[0]?.fixVersion).toBe("1.11.0");
+      expect(summaries[0]?.repos[0]?.packages[0]?.cveDetails[0]).toEqual({
+        name: "CVE-2026-102422",
+        severity: "CRITICAL",
+      });
 
       expect(listEvents.length).toBeGreaterThanOrEqual(3);
       unsubscribeAll();
+    } finally {
+      store.close();
+    }
+  });
+
+  test("cancelRun stops a running run, marks non-terminal repos cancelled, and zeroes activeRepos", () => {
+    const store = new RunsStore(":memory:");
+    try {
+      store.recordIngest("n8n-14", { source: "wiz-graphql", totalFindings: 5 });
+      store.recordPlans("n8n-14", [
+        makePlan("acme-org/repo-a", "CRITICAL"),
+        makePlan("acme-org/repo-b", "HIGH"),
+        makePlan("acme-org/repo-c", "HIGH"),
+      ]);
+      store.updateRepo("n8n-14", "acme-org/repo-a", { status: "patching", currentStage: "patch" });
+      store.updateRepo("n8n-14", "acme-org/repo-b", { status: "prepared", currentStage: "prepare" });
+      store.markRepoFailed("n8n-14", "acme-org/repo-c", { reason: "Prepare failed", autoFinalize: false });
+
+      // Only repo-a (patching) should be active, not repo-b (prepared)
+      const before = store.listRunSummaries(10)[0]!;
+      expect(before.activeRepos).toBe(1);
+      expect(before.pendingRepos).toBe(1);
+      expect(before.failedRepos).toBe(1);
+
+      const ok = store.cancelRun("n8n-14", { reason: "Stopped in n8n" });
+      expect(ok).toBe(true);
+
+      const snap = store.getRunSnapshot("n8n-14")!;
+      expect(snap.run.status).toBe("cancelled");
+      expect(snap.run.finishedAt).not.toBeNull();
+      expect(snap.repos.find((r) => r.targetRepo === "acme-org/repo-a")?.status).toBe("cancelled");
+      expect(snap.repos.find((r) => r.targetRepo === "acme-org/repo-b")?.status).toBe("cancelled");
+      expect(snap.repos.find((r) => r.targetRepo === "acme-org/repo-c")?.status).toBe("failed");
+
+      const after = store.listRunSummaries(10)[0]!;
+      expect(after.activeRepos).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("reapStaleRuns finalizes inactive orphaned runs while sparing actively tracked runs", () => {
+    const store = new RunsStore(":memory:");
+    try {
+      store.recordIngest("n8n-stale", { source: "wiz-graphql", totalFindings: 2 });
+      store.recordPlans("n8n-stale", [
+        makePlan("acme-org/repo-1", "CRITICAL"),
+        makePlan("acme-org/repo-2", "HIGH"),
+      ]);
+      store.updateRepo("n8n-stale", "acme-org/repo-1", { status: "patching", currentStage: "patch" });
+      store.markRepoFailed("n8n-stale", "acme-org/repo-2", { reason: "Failed earlier", autoFinalize: false });
+
+      store.recordIngest("n8n-busy", { source: "wiz-graphql", totalFindings: 1 });
+      store.recordPlans("n8n-busy", [makePlan("acme-org/repo-busy", "HIGH")]);
+      store.updateRepo("n8n-busy", "acme-org/repo-busy", { status: "patching", currentStage: "patch" });
+
+      const releaseBusy = store.trackRunActivity("n8n-busy");
+      try {
+        // Simulate 10 minutes later with 5 minute stale timeout
+        const futureNow = Date.now() + 10 * 60_000;
+        const reaped = store.reapStaleRuns(5 * 60_000, undefined, futureNow);
+        expect(reaped).toEqual(["n8n-stale"]);
+
+        const staleSnap = store.getRunSnapshot("n8n-stale")!;
+        expect(staleSnap.run.status).toBe("failed");
+        expect(staleSnap.run.finishedAt).not.toBeNull();
+        expect(staleSnap.repos.find((r) => r.targetRepo === "acme-org/repo-1")?.status).toBe("cancelled");
+
+        const busySnap = store.getRunSnapshot("n8n-busy")!;
+        expect(busySnap.run.status).toBe("running");
+      } finally {
+        releaseBusy();
+      }
     } finally {
       store.close();
     }

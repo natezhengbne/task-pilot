@@ -202,32 +202,46 @@ export function createVulnerabilitiesRoute(
         : defaultRules;
 
     const startMs = performance.now();
+    const releaseActivity = runsStore?.trackRunActivity(runId);
     runsStore?.ensureRun(runId, { currentStage: "plan" });
-    const result = await planRemediations(body.findings, {
-      ownershipRules,
-      github: useGitHub ? createGitHubClient() : undefined,
-      strictGitHub,
-    });
-    const durationMs = Math.round(performance.now() - startMs);
-    runsStore?.recordPlans(runId, result.plans, { durationMs });
+    try {
+      const result = await planRemediations(body.findings, {
+        ownershipRules,
+        github: useGitHub ? createGitHubClient() : undefined,
+        strictGitHub,
+      });
+      const durationMs = Math.round(performance.now() - startMs);
+      runsStore?.recordPlans(runId, result.plans, { durationMs });
 
-    let artifacts: { plansOutputPath: string } | undefined;
-    if (persist) {
-      const plansOutputPath = await saveRunArtifact(
+      let artifacts: { plansOutputPath: string } | undefined;
+      if (persist) {
+        const plansOutputPath = await saveRunArtifact(
+          runId,
+          "plans.json",
+          `${JSON.stringify(result, null, 2)}\n`,
+        );
+        artifacts = { plansOutputPath };
+      }
+
+      return c.json({
+        ok: true,
         runId,
-        "plans.json",
-        `${JSON.stringify(result, null, 2)}\n`,
-      );
-      artifacts = { plansOutputPath };
+        dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
+        ...(artifacts ? { artifacts } : {}),
+        ...result,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      runsStore?.finalizeRun(runId, {
+        status: "failed",
+        error: msg,
+        message: `Planning failed: ${msg}`,
+        cancelIncomplete: true,
+      });
+      throw err;
+    } finally {
+      releaseActivity?.();
     }
-
-    return c.json({
-      ok: true,
-      runId,
-      dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
-      ...(artifacts ? { artifacts } : {}),
-      ...result,
-    });
   });
 
   return route;

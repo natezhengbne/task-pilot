@@ -19,6 +19,12 @@ export interface AppConfig {
   runsDbPath?: string;
   /** Enables request/response logging to stderr (defaults to true outside tests). */
   enableLogging?: boolean;
+  /**
+   * Automatically marks orphaned "running" runs (with no active in-flight HTTP request
+   * and no DB updates for longer than this threshold) as stopped/failed.
+   * Defaults to 5 minutes outside tests (0 disables).
+   */
+  staleRunTimeoutMs?: number;
 }
 
 function summarizeBody(raw: string): string {
@@ -74,6 +80,38 @@ export function createApp(config: AppConfig = {}): Hono {
       config.runsDbPath ??
         (process.env.NODE_ENV === "test" ? ":memory:" : undefined),
     );
+
+  const envStaleMs = Number(process.env.TASKPILOT_STALE_RUN_TIMEOUT_MS);
+  const staleRunTimeoutMs =
+    config.staleRunTimeoutMs ??
+    (Number.isFinite(envStaleMs) && envStaleMs >= 0
+      ? envStaleMs
+      : process.env.NODE_ENV === "test"
+        ? 0
+        : 5 * 60_000);
+
+  if (staleRunTimeoutMs > 0) {
+    const runReaper = () => {
+      try {
+        const reaped = runsStore.reapStaleRuns(staleRunTimeoutMs);
+        if (reaped.length > 0 && enableLogging) {
+          process.stderr.write(
+            `[runs] reaped ${reaped.length} stale run(s): ${reaped.join(", ")}\n`,
+          );
+        }
+      } catch {
+        // Ignore transient SQLite errors in background reaper
+      }
+    };
+    runReaper();
+    const reaperTimer = setInterval(
+      runReaper,
+      Math.max(10_000, Math.min(60_000, Math.floor(staleRunTimeoutMs / 2))),
+    );
+    if (typeof reaperTimer.unref === "function") {
+      reaperTimer.unref();
+    }
+  }
 
   if (enableLogging) {
     app.use("*", async (c, next) => {

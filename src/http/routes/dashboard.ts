@@ -2,8 +2,10 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import type {
   RunListItem,
+  RunRepoRecord,
   RunsStore,
   RunSnapshot,
+  StoredPackageDetail,
 } from "../../db/runs-store.ts";
 
 export interface DashboardRouteDeps {
@@ -40,6 +42,8 @@ function statusLabel(status: string): string {
       return "Partial Failed";
     case "failed":
       return "Failed";
+    case "cancelled":
+      return "Stopped";
     case "pending":
       return "Pending";
     case "preparing":
@@ -68,9 +72,42 @@ function runTypeLabel(runType: string): string {
   }
 }
 
-function shortRepoName(repo: string): string {
-  const idx = repo.indexOf("/");
-  return idx >= 0 ? repo.slice(idx + 1) : repo;
+function repoBadgeClass(status: string): string {
+  switch (status) {
+    case "completed":
+      return "badge-completed";
+    case "failed":
+      return "badge-failed";
+    case "cancelled":
+      return "badge-cancelled";
+    case "partial_failed":
+      return "badge-partial_failed";
+    case "pending":
+      return "badge-pending";
+    default:
+      return "badge-running";
+  }
+}
+
+function formatAttribution(repo: {
+  targetRepo: string;
+  consumers?: string[];
+  rootComponents?: string[];
+}): string {
+  const consumers = (repo.consumers ?? []).filter((c) => c !== repo.targetRepo);
+  const roots = repo.rootComponents ?? [];
+  const parts: string[] = [];
+  if (consumers.length > 0) {
+    parts.push(
+      `from ${consumers[0]}${consumers.length > 1 ? ` +${consumers.length - 1}` : ""}`,
+    );
+  }
+  if (roots.length > 0) {
+    parts.push(
+      `via ${roots.slice(0, 2).join(", ")}${roots.length > 2 ? ` +${roots.length - 2}` : ""}`,
+    );
+  }
+  return parts.join(" · ");
 }
 
 const SHARED_CSS = `
@@ -176,7 +213,29 @@ h1 {
 .badge-completed { color: var(--green); background: var(--green-soft); }
 .badge-partial_failed { color: var(--amber); background: var(--amber-soft); }
 .badge-failed { color: var(--red); background: var(--red-soft); }
+.badge-cancelled { color: var(--muted); background: var(--gray-soft); }
 .badge-pending { color: var(--muted); background: var(--gray-soft); }
+.stop-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--red);
+  background: var(--red-soft);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  cursor: pointer;
+  font-family: inherit;
+}
+.stop-btn:hover {
+  background: rgba(248, 113, 113, 0.24);
+}
+.stop-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.35; transform: scale(0.8); }
@@ -637,6 +696,166 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 .live-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .live-dot.reconnecting { background: var(--amber); }
 
+/* Per-Run Card List (/runs) */
+.runs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.run-card {
+  overflow: hidden;
+  transition: border-color 0.15s ease;
+}
+.run-card:hover {
+  border-color: var(--border-strong);
+}
+.run-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 18px 10px;
+}
+.run-card-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.run-id-link {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--blue);
+}
+.run-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+.run-detail-link {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--blue);
+  white-space: nowrap;
+}
+.run-card-progress {
+  padding: 0 18px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.run-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  margin-bottom: 7px;
+}
+.run-progress-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.run-card-body {
+  padding: 14px 18px 16px;
+  background: rgba(11, 14, 20, 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.run-repo-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.run-repo-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.run-repo-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.run-repo-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-word;
+}
+.run-repo-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+.run-repo-error {
+  border: 1px solid rgba(248, 113, 113, 0.32);
+  background: rgba(248, 113, 113, 0.08);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: #fecaca;
+  font-size: 12px;
+  margin-bottom: 10px;
+  word-break: break-word;
+}
+.expand-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  align-self: flex-start;
+}
+.expand-toggle-btn:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+.run-generic-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.run-generic-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.run-generic-val {
+  color: var(--text);
+  font-weight: 500;
+}
+.run-body-note {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
 @media (max-width: 920px) {
   .split-shell { grid-template-columns: 1fr; }
   .sidebar { position: static; max-height: none; }
@@ -650,30 +869,9 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 }
 `;
 
-function renderRunProgressActivity(r: RunListItem): string {
-  const first = r.activeTargets[0];
-  if (!first) {
-    return "";
-  }
-  const extraRepos = r.activeRepos > 1 ? ` +${r.activeRepos - 1} repo` : "";
-  const pkgsText =
-    first.packagesPreview.length > 0
-      ? first.packagesPreview.join(", ") +
-        (first.packageCount > first.packagesPreview.length
-          ? ` +${first.packageCount - first.packagesPreview.length}`
-          : "")
-      : first.packageCount > 0
-        ? `${first.packageCount} pkg`
-        : "";
-  const cveText = first.cveCount > 0 ? `${first.cveCount} CVE` : "";
-  const detailParts = [pkgsText, cveText].filter(Boolean).join(" · ");
-
-  return `<div class="activity-sub">
-    <span class="pill mono">${escapeHtml(statusLabel(first.status))}</span>
-    <span class="activity-repo mono" title="${escapeHtml(first.targetRepo)}">${escapeHtml(shortRepoName(first.targetRepo))}${escapeHtml(extraRepos)}</span>
-    ${detailParts ? `<span class="activity-pkgs mono">${escapeHtml(detailParts)}</span>` : ""}
-  </div>`;
-}
+const CARD_DEFAULT_REPOS_LIMIT = 3;
+const CARD_DEFAULT_PKGS_LIMIT = 4;
+const CARD_DEFAULT_CVES_LIMIT = 5;
 
 function renderRunSeverityChips(r: RunListItem): string {
   const order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
@@ -685,56 +883,226 @@ function renderRunSeverityChips(r: RunListItem): string {
       chips.push(`<span class="sev sev-${sev}">${count} ${short}</span>`);
     }
   }
-  return chips.length > 0 ? `<div class="sev-stack">${chips.join("")}</div>` : "";
+  return chips.length > 0 ? `<div class="sev-stack" style="margin-top:0">${chips.join("")}</div>` : "";
 }
 
-function renderRunsListRows(runs: RunListItem[]): string {
+function renderCardPackageRow(
+  runId: string,
+  targetRepo: string,
+  p: StoredPackageDetail,
+): string {
+  const pkgKey = `${runId}::${targetRepo}::${p.component}@${p.version}`;
+  const cveList =
+    p.cveDetails && p.cveDetails.length > 0
+      ? p.cveDetails
+      : (p.cves ?? []).map((name) => ({ name, severity: p.severity || "UNKNOWN" }));
+  const visibleCves = cveList.slice(0, CARD_DEFAULT_CVES_LIMIT);
+  const hiddenCount = cveList.length - visibleCves.length;
+
+  const cveChips = visibleCves
+    .map((c) => {
+      const sev = c.severity || "UNKNOWN";
+      return `<span class="cve-chip sev-${escapeHtml(sev)}">${escapeHtml(sev)} · ${escapeHtml(c.name)}</span>`;
+    })
+    .join("");
+
+  const moreBtn =
+    hiddenCount > 0
+      ? `<button type="button" class="cve-more-btn" data-toggle-cves="${escapeHtml(pkgKey)}">+${hiddenCount} more</button>`
+      : "";
+
+  const verHtml = p.fixVersion
+    ? `${escapeHtml(p.version)} → <span style="color:var(--text)">${escapeHtml(p.fixVersion)}</span>`
+    : escapeHtml(p.version || "-");
+
+  const kindCls = p.upgradeKind === "major" ? "pkg-kind pkg-kind-major" : "pkg-kind";
+  const kindHtml =
+    p.upgradeKind && p.upgradeKind !== "unknown"
+      ? `<span class="${kindCls}">${escapeHtml(p.upgradeKind)}</span>`
+      : "";
+
+  return `<div class="pkg-row">
+    <div class="pkg-left">
+      <span class="pkg-name mono">${escapeHtml(p.component)}</span>
+      <span class="pkg-ver mono">${verHtml}</span>
+      ${kindHtml}
+    </div>
+    <div class="pkg-cves">${cveChips}${moreBtn}</div>
+  </div>`;
+}
+
+function renderCardRepoBlock(runId: string, repo: RunRepoRecord): string {
+  const attr = formatAttribution(repo);
+  const metaParts: string[] = [
+    `<span class="mono">${repo.packageCount} ${repo.packageCount === 1 ? "package" : "packages"} · ${repo.cveCount} ${repo.cveCount === 1 ? "CVE" : "CVEs"}</span>`,
+  ];
+  if (attr) {
+    metaParts.push(`<span class="pill mono">${escapeHtml(attr)}</span>`);
+  }
+  if (repo.remediationBranch) {
+    metaParts.push(
+      `<span class="pill mono">${escapeHtml(repo.branch)} → ${escapeHtml(repo.remediationBranch)}</span>`,
+    );
+  }
+  if (repo.attempt > 0) {
+    metaParts.push(
+      `<span class="pill mono">Attempt ${repo.attempt}${repo.maxRetries ? `/${repo.maxRetries}` : ""}</span>`,
+    );
+  }
+  if (repo.creditsUsed > 0 || repo.creditBudget) {
+    metaParts.push(
+      `<span class="pill mono">${repo.creditsUsed}${repo.creditBudget ? ` / ${repo.creditBudget}` : ""} credits</span>`,
+    );
+  }
+
+  let actionHtml = "";
+  if (repo.prUrl) {
+    actionHtml = `<a class="pill" style="color:var(--blue);border-color:rgba(79,143,247,0.4)" href="${escapeHtml(repo.prUrl)}" target="_blank" rel="noopener noreferrer">Open Draft PR ↗</a>`;
+  } else if (repo.status === "completed" && repo.dryRun) {
+    actionHtml = `<span class="pill" style="color:var(--green)">Verified (Dry Run)</span>`;
+  }
+
+  const errorHtml = repo.lastError
+    ? `<div class="run-repo-error mono">${escapeHtml(repo.lastError)}</div>`
+    : "";
+
+  const pkgs = repo.packages ?? [];
+  let pkgsHtml = "";
+  if (pkgs.length > 0) {
+    const visiblePkgs = pkgs.slice(0, CARD_DEFAULT_PKGS_LIMIT);
+    const hiddenPkgs = pkgs.length - visiblePkgs.length;
+    const repoKey = `${runId}::${repo.targetRepo}`;
+    const pkgRows = visiblePkgs
+      .map((p) => renderCardPackageRow(runId, repo.targetRepo, p))
+      .join("");
+    pkgsHtml = `<div class="pkg-list">${pkgRows}</div>${
+      hiddenPkgs > 0
+        ? `<div style="margin-top:8px"><button type="button" class="expand-toggle-btn" data-toggle-pkgs="${escapeHtml(repoKey)}">+${hiddenPkgs} more ${hiddenPkgs === 1 ? "package" : "packages"}</button></div>`
+        : ""
+    }`;
+  }
+
+  return `<div class="run-repo-block">
+    <div class="run-repo-head">
+      <div class="run-repo-title">
+        <span class="run-repo-name mono">${escapeHtml(repo.targetRepo)}</span>
+        <span class="badge ${repoBadgeClass(repo.status)}">${escapeHtml(statusLabel(repo.status))}</span>
+      </div>
+      ${actionHtml}
+    </div>
+    <div class="run-repo-meta">${metaParts.join("")}</div>
+    ${errorHtml}
+    ${pkgsHtml}
+  </div>`;
+}
+
+function renderRunCardBody(r: RunListItem): string {
+  const isWiz = r.runType === "wiz-remediation" || r.repos.length > 0;
+  if (isWiz) {
+    if (r.repos.length === 0) {
+      const note =
+        r.error
+          ? `<div class="run-repo-error mono" style="margin-bottom:0">${escapeHtml(r.error)}</div>`
+          : r.status === "running"
+            ? `<div class="run-body-note">Waiting for remediation plans...</div>`
+            : `<div class="run-body-note">No target repositories planned.</div>`;
+      return `<div class="run-card-body">${note}</div>`;
+    }
+
+    const visibleRepos = r.repos.slice(0, CARD_DEFAULT_REPOS_LIMIT);
+    const hiddenRepos = r.repos.length - visibleRepos.length;
+    const repoBlocks = visibleRepos
+      .map((repo) => renderCardRepoBlock(r.runId, repo))
+      .join("");
+    const toggleBtn =
+      hiddenRepos > 0
+        ? `<button type="button" class="expand-toggle-btn" data-toggle-repos="${escapeHtml(r.runId)}">Show all ${r.repos.length} repositories (+${hiddenRepos} more)</button>`
+        : "";
+    return `<div class="run-card-body">${repoBlocks}${toggleBtn}</div>`;
+  }
+
+  // Generic / other run types
+  const items: string[] = [
+    `<span class="run-generic-item">Source: <span class="run-generic-val mono">${escapeHtml(r.source ?? "-")}</span></span>`,
+    `<span class="run-generic-item">Stage: <span class="run-generic-val mono">${escapeHtml(r.currentStage ?? "-")}</span></span>`,
+    `<span class="run-generic-item">Items: <span class="run-generic-val mono">${r.totalFindings}</span></span>`,
+  ];
+  if (r.phase) {
+    items.push(
+      `<span class="run-generic-item">Phase: <span class="run-generic-val mono">${escapeHtml(r.phase)}</span></span>`,
+    );
+  }
+  const errorHtml = r.error
+    ? `<div class="run-repo-error mono" style="margin-bottom:0">${escapeHtml(r.error)}</div>`
+    : "";
+  return `<div class="run-card-body"><div class="run-generic-grid">${items.join("")}</div>${errorHtml}</div>`;
+}
+
+function renderRunsListCards(runs: RunListItem[]): string {
   return runs
     .map((r) => {
       const doneCount = r.completedRepos;
       const failCount = r.failedRepos;
       const activeCount = r.activeRepos;
       const total = r.totalRepos;
-      const okPct = total > 0 ? Math.round((doneCount / total) * 100) : 0;
-      const runPct = total > 0 ? Math.round((activeCount / total) * 100) : 0;
-      const failPct = total > 0 ? Math.round((failCount / total) * 100) : 0;
+      const okPct = total > 0 ? Math.round((doneCount / total) * 100) : r.status === "completed" ? 100 : 0;
+      const runPct = total > 0 ? Math.round((activeCount / total) * 100) : r.status === "running" ? 15 : 0;
+      const failPct = total > 0 ? Math.round((failCount / total) * 100) : r.status === "failed" ? 100 : 0;
       const href = `/runs/${encodeURIComponent(r.runId)}`;
       const isGeneric = r.runType === "generic";
 
-      const progressParts = [`${doneCount}/${total} done`];
-      if (activeCount > 0) progressParts.push(`${activeCount} active`);
-      if (failCount > 0) progressParts.push(`${failCount} failed`);
+      const progressParts: string[] = [];
+      if (total > 0) {
+        progressParts.push(`${doneCount}/${total} repos done`);
+        if (activeCount > 0) progressParts.push(`${activeCount} active`);
+        if (failCount > 0) progressParts.push(`${failCount} failed`);
+      } else {
+        progressParts.push(`${r.totalFindings} findings`);
+      }
+
+      const summaryBits: string[] = [];
+      if (r.totalFindings > 0) summaryBits.push(`${r.totalFindings} findings`);
+      if (r.totalPackages > 0) summaryBits.push(`${r.totalPackages} pkg`);
+      if (r.totalCves > 0) summaryBits.push(`${r.totalCves} CVEs`);
 
       return `
-        <tr data-run-id="${escapeHtml(r.runId)}" data-started-at="${escapeHtml(r.startedAt)}" data-finished-at="${escapeHtml(r.finishedAt ?? "")}">
-          <td><a class="mono" href="${href}">${escapeHtml(r.runId)}</a></td>
-          <td><span class="type-pill ${isGeneric ? "type-pill-generic" : ""}">${escapeHtml(runTypeLabel(r.runType))}</span></td>
-          <td><span class="badge badge-${escapeHtml(r.status)}">${escapeHtml(statusLabel(r.status))}</span></td>
-          <td style="min-width:260px">
-            <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;gap:8px">
-              <span>${escapeHtml(progressParts.join(" · "))}</span>
-              <span class="muted mono">${escapeHtml(r.currentStage ?? "-")}</span>
+        <article class="card run-card" data-run-id="${escapeHtml(r.runId)}" data-started-at="${escapeHtml(r.startedAt)}" data-finished-at="${escapeHtml(r.finishedAt ?? "")}">
+          <div class="run-card-head">
+            <div class="run-card-title">
+              <a class="run-id-link mono" href="${href}">${escapeHtml(r.runId)}</a>
+              <span class="type-pill ${isGeneric ? "type-pill-generic" : ""}">${escapeHtml(runTypeLabel(r.runType))}</span>
+              <span class="badge badge-${escapeHtml(r.status)}">${escapeHtml(statusLabel(r.status))}</span>
+              ${r.status === "running" ? `<button type="button" class="stop-btn" data-stop-run="${escapeHtml(r.runId)}" title="Mark this run as stopped">Stop</button>` : ""}
+            </div>
+            <div class="run-card-meta">
+              ${renderRunSeverityChips(r)}
+              <span class="mono" data-role="duration">${escapeHtml(formatDuration(r.startedAt, r.finishedAt))}</span>
+              <span class="mono">${escapeHtml(r.startedAt.replace("T", " ").slice(0, 19))} UTC</span>
+              <a class="run-detail-link" href="${href}">Details →</a>
+            </div>
+          </div>
+          <div class="run-card-progress">
+            <div class="run-progress-row">
+              <div class="run-progress-left">
+                <span>${escapeHtml(progressParts.join(" · "))}</span>
+                ${total > 0 && summaryBits.length > 0 ? `<span class="muted mono">${escapeHtml(summaryBits.join(" · "))}</span>` : ""}
+              </div>
+              <span class="muted mono">stage: ${escapeHtml(r.currentStage ?? "-")}</span>
             </div>
             <div class="progress-track">
               <div class="progress-ok" style="width:${okPct}%"></div>
               <div class="progress-run" style="width:${runPct}%"></div>
               <div class="progress-fail" style="width:${failPct}%"></div>
             </div>
-            ${renderRunProgressActivity(r)}
-          </td>
-          <td>
-            <div class="mono">${r.totalFindings}${r.totalPackages > 0 ? ` <span class="muted" style="font-size:11px">(${r.totalPackages} pkg)</span>` : ""}</div>
-            ${renderRunSeverityChips(r)}
-          </td>
-          <td class="mono muted" data-role="duration">${escapeHtml(formatDuration(r.startedAt, r.finishedAt))}</td>
-          <td class="mono muted">${escapeHtml(r.startedAt.replace("T", " ").slice(0, 19))}</td>
-        </tr>`;
+          </div>
+          ${renderRunCardBody(r)}
+        </article>`;
     })
     .join("");
 }
 
 function renderRunsListPage(runs: RunListItem[]): string {
-  const rows = renderRunsListRows(runs);
+  const cards = renderRunsListCards(runs);
 
   return `<!doctype html>
 <html lang="en">
@@ -759,41 +1127,8 @@ function renderRunsListPage(runs: RunListItem[]): string {
         </div>
       </div>
     </div>
-    <div id="runs-card" class="card">
-      ${
-        runs.length === 0
-          ? `<div id="runs-empty" class="empty">No runs recorded yet. Trigger an n8n workflow or call <code>POST /api/vulnerabilities/ingest</code> to start one.</div>
-             <table id="runs-table" style="display:none">
-               <thead>
-                 <tr>
-                   <th>Run ID</th>
-                   <th>Type</th>
-                   <th>Status</th>
-                   <th>Progress</th>
-                   <th>Findings</th>
-                   <th>Duration</th>
-                   <th>Started (UTC)</th>
-                 </tr>
-               </thead>
-               <tbody id="runs-tbody"></tbody>
-             </table>`
-          : `<div id="runs-empty" class="empty" style="display:none">No runs recorded yet. Trigger an n8n workflow or call <code>POST /api/vulnerabilities/ingest</code> to start one.</div>
-             <table id="runs-table">
-               <thead>
-                 <tr>
-                   <th>Run ID</th>
-                   <th>Type</th>
-                   <th>Status</th>
-                   <th>Progress</th>
-                   <th>Findings</th>
-                   <th>Duration</th>
-                   <th>Started (UTC)</th>
-                 </tr>
-               </thead>
-               <tbody id="runs-tbody">${rows}</tbody>
-             </table>`
-      }
-    </div>
+    <div id="runs-empty" class="card empty" style="${runs.length === 0 ? "" : "display:none"}">No runs recorded yet. Trigger an n8n workflow or call <code>POST /api/vulnerabilities/ingest</code> to start one.</div>
+    <div id="runs-list" class="runs-list" style="${runs.length === 0 ? "display:none" : ""}">${cards}</div>
   </div>
 
   <script>
@@ -803,6 +1138,7 @@ function renderRunsListPage(runs: RunListItem[]): string {
       completed: "Completed",
       partial_failed: "Partial Failed",
       failed: "Failed",
+      cancelled: "Stopped",
       pending: "Pending",
       preparing: "Preparing",
       prepared: "Prepared",
@@ -811,7 +1147,15 @@ function renderRunsListPage(runs: RunListItem[]): string {
       creating_pr: "Creating PR",
     };
 
+    const REPOS_LIMIT = ${CARD_DEFAULT_REPOS_LIMIT};
+    const PKGS_LIMIT = ${CARD_DEFAULT_PKGS_LIMIT};
+    const CVES_LIMIT = ${CARD_DEFAULT_CVES_LIMIT};
+
     const $ = (id) => document.getElementById(id);
+    let latestRuns = [];
+    const expandedRuns = new Set();
+    const expandedRepoPkgs = new Set();
+    const expandedPkgCves = new Set();
 
     function esc(s) {
       return String(s ?? "")
@@ -831,33 +1175,32 @@ function renderRunsListPage(runs: RunListItem[]): string {
       return Math.floor(sec / 60) + "m " + (sec % 60) + "s";
     }
 
-    function shortRepo(repo) {
-      const idx = repo.indexOf("/");
-      return idx >= 0 ? repo.slice(idx + 1) : repo;
-    }
-
     function typeLabel(t) {
       if (t === "wiz-remediation") return "Wiz Remediation";
       if (t === "generic") return "Workflow";
       return t || "Workflow";
     }
 
-    function renderActivityHtml(r) {
-      const first = (r.activeTargets || [])[0];
-      if (!first) return "";
-      const extraRepos = r.activeRepos > 1 ? " +" + (r.activeRepos - 1) + " repo" : "";
-      const preview = first.packagesPreview || [];
-      const pkgsText = preview.length > 0
-        ? preview.join(", ") + (first.packageCount > preview.length ? " +" + (first.packageCount - preview.length) : "")
-        : (first.packageCount > 0 ? first.packageCount + " pkg" : "");
-      const cveText = first.cveCount > 0 ? first.cveCount + " CVE" : "";
-      const detailParts = [pkgsText, cveText].filter(Boolean).join(" · ");
+    function badgeClass(status) {
+      if (status === "completed") return "badge-completed";
+      if (status === "failed") return "badge-failed";
+      if (status === "cancelled") return "badge-cancelled";
+      if (status === "partial_failed") return "badge-partial_failed";
+      if (status === "pending") return "badge-pending";
+      return "badge-running";
+    }
 
-      return '<div class="activity-sub">' +
-        '<span class="pill mono">' + esc(STATUS_LABELS[first.status] || first.status) + '</span>' +
-        '<span class="activity-repo mono" title="' + esc(first.targetRepo) + '">' + esc(shortRepo(first.targetRepo) + extraRepos) + '</span>' +
-        (detailParts ? '<span class="activity-pkgs mono">' + esc(detailParts) + '</span>' : '') +
-      '</div>';
+    function attributionText(repo) {
+      const consumers = (repo.consumers || []).filter((c) => c !== repo.targetRepo);
+      const roots = repo.rootComponents || [];
+      const parts = [];
+      if (consumers.length > 0) {
+        parts.push("from " + consumers[0] + (consumers.length > 1 ? " +" + (consumers.length - 1) : ""));
+      }
+      if (roots.length > 0) {
+        parts.push("via " + roots.slice(0, 2).join(", ") + (roots.length > 2 ? " +" + (roots.length - 2) : ""));
+      }
+      return parts.join(" · ");
     }
 
     function renderSevHtml(r) {
@@ -871,68 +1214,275 @@ function renderRunsListPage(runs: RunListItem[]): string {
           chips.push('<span class="sev sev-' + sev + '">' + c + ' ' + short + '</span>');
         }
       }
-      return chips.length > 0 ? '<div class="sev-stack">' + chips.join("") + '</div>' : '';
+      return chips.length > 0 ? '<div class="sev-stack" style="margin-top:0">' + chips.join("") + '</div>' : '';
+    }
+
+    function renderPkgRowHtml(runId, targetRepo, p) {
+      const pkgKey = runId + "::" + targetRepo + "::" + p.component + "@" + p.version;
+      const cveList = (p.cveDetails && p.cveDetails.length > 0)
+        ? p.cveDetails
+        : (p.cves || []).map((name) => ({ name, severity: p.severity || "UNKNOWN" }));
+      const expanded = expandedPkgCves.has(pkgKey);
+      const visibleCves = expanded ? cveList : cveList.slice(0, CVES_LIMIT);
+      const hiddenCount = cveList.length - visibleCves.length;
+
+      const cveChips = visibleCves.map((c) => {
+        const sev = c.severity || "UNKNOWN";
+        return '<span class="cve-chip sev-' + esc(sev) + '">' + esc(sev) + ' · ' + esc(c.name) + '</span>';
+      }).join("");
+
+      const moreBtn = hiddenCount > 0
+        ? '<button type="button" class="cve-more-btn" data-toggle-cves="' + esc(pkgKey) + '">+' + hiddenCount + ' more</button>'
+        : (expanded && cveList.length > CVES_LIMIT
+          ? '<button type="button" class="cve-more-btn" data-toggle-cves="' + esc(pkgKey) + '">Show less</button>'
+          : '');
+
+      const verHtml = p.fixVersion
+        ? esc(p.version) + ' → <span style="color:var(--text)">' + esc(p.fixVersion) + '</span>'
+        : esc(p.version || "-");
+
+      const kindCls = p.upgradeKind === "major" ? "pkg-kind pkg-kind-major" : "pkg-kind";
+      const kindHtml = p.upgradeKind && p.upgradeKind !== "unknown"
+        ? '<span class="' + kindCls + '">' + esc(p.upgradeKind) + '</span>'
+        : '';
+
+      return '<div class="pkg-row">' +
+        '<div class="pkg-left">' +
+          '<span class="pkg-name mono">' + esc(p.component) + '</span>' +
+          '<span class="pkg-ver mono">' + verHtml + '</span>' +
+          kindHtml +
+        '</div>' +
+        '<div class="pkg-cves">' + cveChips + moreBtn + '</div>' +
+      '</div>';
+    }
+
+    function renderRepoBlockHtml(runId, repo) {
+      const attr = attributionText(repo);
+      const pkgWord = repo.packageCount === 1 ? "package" : "packages";
+      const cveWord = repo.cveCount === 1 ? "CVE" : "CVEs";
+      const metaParts = ['<span class="mono">' + repo.packageCount + ' ' + pkgWord + ' · ' + repo.cveCount + ' ' + cveWord + '</span>'];
+      if (attr) metaParts.push('<span class="pill mono">' + esc(attr) + '</span>');
+      if (repo.remediationBranch) {
+        metaParts.push('<span class="pill mono">' + esc(repo.branch) + ' → ' + esc(repo.remediationBranch) + '</span>');
+      }
+      if (repo.attempt > 0) {
+        metaParts.push('<span class="pill mono">Attempt ' + repo.attempt + (repo.maxRetries ? '/' + repo.maxRetries : '') + '</span>');
+      }
+      if (repo.creditsUsed > 0 || repo.creditBudget) {
+        metaParts.push('<span class="pill mono">' + repo.creditsUsed + (repo.creditBudget ? ' / ' + repo.creditBudget : '') + ' credits</span>');
+      }
+
+      let actionHtml = "";
+      if (repo.prUrl) {
+        actionHtml = '<a class="pill" style="color:var(--blue);border-color:rgba(79,143,247,0.4)" href="' + esc(repo.prUrl) + '" target="_blank" rel="noopener noreferrer">Open Draft PR ↗</a>';
+      } else if (repo.status === "completed" && repo.dryRun) {
+        actionHtml = '<span class="pill" style="color:var(--green)">Verified (Dry Run)</span>';
+      }
+
+      const errorHtml = repo.lastError
+        ? '<div class="run-repo-error mono">' + esc(repo.lastError) + '</div>'
+        : '';
+
+      const pkgs = repo.packages || [];
+      let pkgsHtml = "";
+      if (pkgs.length > 0) {
+        const repoKey = runId + "::" + repo.targetRepo;
+        const pkgsExpanded = expandedRepoPkgs.has(repoKey);
+        const visiblePkgs = pkgsExpanded ? pkgs : pkgs.slice(0, PKGS_LIMIT);
+        const hiddenPkgs = pkgs.length - visiblePkgs.length;
+        const pkgRows = visiblePkgs.map((p) => renderPkgRowHtml(runId, repo.targetRepo, p)).join("");
+        let togglePkgBtn = "";
+        if (hiddenPkgs > 0) {
+          togglePkgBtn = '<div style="margin-top:8px"><button type="button" class="expand-toggle-btn" data-toggle-pkgs="' + esc(repoKey) + '">+' + hiddenPkgs + ' more ' + (hiddenPkgs === 1 ? 'package' : 'packages') + '</button></div>';
+        } else if (pkgsExpanded && pkgs.length > PKGS_LIMIT) {
+          togglePkgBtn = '<div style="margin-top:8px"><button type="button" class="expand-toggle-btn" data-toggle-pkgs="' + esc(repoKey) + '">Show fewer packages</button></div>';
+        }
+        pkgsHtml = '<div class="pkg-list">' + pkgRows + '</div>' + togglePkgBtn;
+      }
+
+      return '<div class="run-repo-block">' +
+        '<div class="run-repo-head">' +
+          '<div class="run-repo-title">' +
+            '<span class="run-repo-name mono">' + esc(repo.targetRepo) + '</span>' +
+            '<span class="badge ' + badgeClass(repo.status) + '">' + esc(STATUS_LABELS[repo.status] || repo.status) + '</span>' +
+          '</div>' +
+          actionHtml +
+        '</div>' +
+        '<div class="run-repo-meta">' + metaParts.join("") + '</div>' +
+        errorHtml +
+        pkgsHtml +
+      '</div>';
+    }
+
+    function renderCardBodyHtml(r) {
+      const repos = r.repos || [];
+      const isWiz = r.runType === "wiz-remediation" || repos.length > 0;
+      if (isWiz) {
+        if (repos.length === 0) {
+          const note = r.error
+            ? '<div class="run-repo-error mono" style="margin-bottom:0">' + esc(r.error) + '</div>'
+            : (r.status === "running"
+              ? '<div class="run-body-note">Waiting for remediation plans...</div>'
+              : '<div class="run-body-note">No target repositories planned.</div>');
+          return '<div class="run-card-body">' + note + '</div>';
+        }
+
+        const reposExpanded = expandedRuns.has(r.runId);
+        const visibleRepos = reposExpanded ? repos : repos.slice(0, REPOS_LIMIT);
+        const hiddenRepos = repos.length - visibleRepos.length;
+        const repoBlocks = visibleRepos.map((repo) => renderRepoBlockHtml(r.runId, repo)).join("");
+        let toggleBtn = "";
+        if (hiddenRepos > 0) {
+          toggleBtn = '<button type="button" class="expand-toggle-btn" data-toggle-repos="' + esc(r.runId) + '">Show all ' + repos.length + ' repositories (+' + hiddenRepos + ' more)</button>';
+        } else if (reposExpanded && repos.length > REPOS_LIMIT) {
+          toggleBtn = '<button type="button" class="expand-toggle-btn" data-toggle-repos="' + esc(r.runId) + '">Show fewer repositories</button>';
+        }
+        return '<div class="run-card-body">' + repoBlocks + toggleBtn + '</div>';
+      }
+
+      const items = [
+        '<span class="run-generic-item">Source: <span class="run-generic-val mono">' + esc(r.source || "-") + '</span></span>',
+        '<span class="run-generic-item">Stage: <span class="run-generic-val mono">' + esc(r.currentStage || "-") + '</span></span>',
+        '<span class="run-generic-item">Items: <span class="run-generic-val mono">' + (r.totalFindings || 0) + '</span></span>',
+      ];
+      if (r.phase) {
+        items.push('<span class="run-generic-item">Phase: <span class="run-generic-val mono">' + esc(r.phase) + '</span></span>');
+      }
+      const errorHtml = r.error
+        ? '<div class="run-repo-error mono" style="margin-bottom:0">' + esc(r.error) + '</div>'
+        : '';
+      return '<div class="run-card-body"><div class="run-generic-grid">' + items.join("") + '</div>' + errorHtml + '</div>';
     }
 
     function renderRuns(runs) {
-      $("runs-count").textContent = runs.length + " recent run(s)";
-      if (runs.length === 0) {
+      latestRuns = runs || [];
+      $("runs-count").textContent = latestRuns.length + " recent run(s)";
+      if (latestRuns.length === 0) {
         $("runs-empty").style.display = "block";
-        $("runs-table").style.display = "none";
+        $("runs-list").style.display = "none";
         return;
       }
       $("runs-empty").style.display = "none";
-      $("runs-table").style.display = "table";
+      $("runs-list").style.display = "flex";
 
-      const html = runs.map((r) => {
+      const html = latestRuns.map((r) => {
         const total = r.totalRepos || 0;
         const done = r.completedRepos || 0;
         const active = r.activeRepos || 0;
         const fail = r.failedRepos || 0;
-        const okPct = total > 0 ? Math.round((done / total) * 100) : 0;
-        const runPct = total > 0 ? Math.round((active / total) * 100) : 0;
-        const failPct = total > 0 ? Math.round((fail / total) * 100) : 0;
+        const okPct = total > 0 ? Math.round((done / total) * 100) : (r.status === "completed" ? 100 : 0);
+        const runPct = total > 0 ? Math.round((active / total) * 100) : (r.status === "running" ? 15 : 0);
+        const failPct = total > 0 ? Math.round((fail / total) * 100) : (r.status === "failed" ? 100 : 0);
         const href = "/runs/" + encodeURIComponent(r.runId);
         const isGeneric = r.runType === "generic";
-        const parts = [done + "/" + total + " done"];
-        if (active > 0) parts.push(active + " active");
-        if (fail > 0) parts.push(fail + " failed");
 
-        return '<tr data-run-id="' + esc(r.runId) + '" data-started-at="' + esc(r.startedAt) + '" data-finished-at="' + esc(r.finishedAt || "") + '">' +
-          '<td><a class="mono" href="' + href + '">' + esc(r.runId) + '</a></td>' +
-          '<td><span class="type-pill ' + (isGeneric ? 'type-pill-generic' : '') + '">' + esc(typeLabel(r.runType)) + '</span></td>' +
-          '<td><span class="badge badge-' + esc(r.status) + '">' + esc(STATUS_LABELS[r.status] || r.status) + '</span></td>' +
-          '<td style="min-width:260px">' +
-            '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;gap:8px">' +
-              '<span>' + esc(parts.join(" · ")) + '</span>' +
-              '<span class="muted mono">' + esc(r.currentStage || "-") + '</span>' +
+        const progressParts = [];
+        if (total > 0) {
+          progressParts.push(done + "/" + total + " repos done");
+          if (active > 0) progressParts.push(active + " active");
+          if (fail > 0) progressParts.push(fail + " failed");
+        } else {
+          progressParts.push((r.totalFindings || 0) + " findings");
+        }
+
+        const summaryBits = [];
+        if (r.totalFindings > 0) summaryBits.push(r.totalFindings + " findings");
+        if (r.totalPackages > 0) summaryBits.push(r.totalPackages + " pkg");
+        if (r.totalCves > 0) summaryBits.push(r.totalCves + " CVEs");
+
+        return '<article class="card run-card" data-run-id="' + esc(r.runId) + '" data-started-at="' + esc(r.startedAt) + '" data-finished-at="' + esc(r.finishedAt || "") + '">' +
+          '<div class="run-card-head">' +
+            '<div class="run-card-title">' +
+              '<a class="run-id-link mono" href="' + href + '">' + esc(r.runId) + '</a>' +
+              '<span class="type-pill ' + (isGeneric ? 'type-pill-generic' : '') + '">' + esc(typeLabel(r.runType)) + '</span>' +
+              '<span class="badge badge-' + esc(r.status) + '">' + esc(STATUS_LABELS[r.status] || r.status) + '</span>' +
+              (r.status === "running" ? '<button type="button" class="stop-btn" data-stop-run="' + esc(r.runId) + '" title="Mark this run as stopped">Stop</button>' : '') +
+            '</div>' +
+            '<div class="run-card-meta">' +
+              renderSevHtml(r) +
+              '<span class="mono" data-role="duration">' + esc(fmtDuration(r.startedAt, r.finishedAt)) + '</span>' +
+              '<span class="mono">' + esc((r.startedAt || "").replace("T", " ").slice(0, 19)) + ' UTC</span>' +
+              '<a class="run-detail-link" href="' + href + '">Details →</a>' +
+            '</div>' +
+          '</div>' +
+          '<div class="run-card-progress">' +
+            '<div class="run-progress-row">' +
+              '<div class="run-progress-left">' +
+                '<span>' + esc(progressParts.join(" · ")) + '</span>' +
+                (total > 0 && summaryBits.length > 0 ? '<span class="muted mono">' + esc(summaryBits.join(" · ")) + '</span>' : '') +
+              '</div>' +
+              '<span class="muted mono">stage: ' + esc(r.currentStage || "-") + '</span>' +
             '</div>' +
             '<div class="progress-track">' +
               '<div class="progress-ok" style="width:' + okPct + '%"></div>' +
               '<div class="progress-run" style="width:' + runPct + '%"></div>' +
               '<div class="progress-fail" style="width:' + failPct + '%"></div>' +
             '</div>' +
-            renderActivityHtml(r) +
-          '</td>' +
-          '<td>' +
-            '<div class="mono">' + (r.totalFindings || 0) + (r.totalPackages > 0 ? ' <span class="muted" style="font-size:11px">(' + r.totalPackages + ' pkg)</span>' : '') + '</div>' +
-            renderSevHtml(r) +
-          '</td>' +
-          '<td class="mono muted" data-role="duration">' + esc(fmtDuration(r.startedAt, r.finishedAt)) + '</td>' +
-          '<td class="mono muted">' + esc((r.startedAt || "").replace("T", " ").slice(0, 19)) + '</td>' +
-        '</tr>';
+          '</div>' +
+          renderCardBodyHtml(r) +
+        '</article>';
       }).join("");
 
-      $("runs-tbody").innerHTML = html;
+      $("runs-list").innerHTML = html;
     }
 
-    // Live 1s elapsed timer for running rows
+    // Delegate clicks on "Stop" and expand/collapse buttons in run cards
+    document.addEventListener("click", async (ev) => {
+      const target = ev.target;
+      if (!target || !target.closest) return;
+
+      const repoToggle = target.closest("[data-toggle-repos]");
+      if (repoToggle) {
+        const key = repoToggle.getAttribute("data-toggle-repos");
+        if (expandedRuns.has(key)) expandedRuns.delete(key);
+        else expandedRuns.add(key);
+        if (latestRuns.length > 0) renderRuns(latestRuns);
+        return;
+      }
+
+      const pkgToggle = target.closest("[data-toggle-pkgs]");
+      if (pkgToggle) {
+        const key = pkgToggle.getAttribute("data-toggle-pkgs");
+        if (expandedRepoPkgs.has(key)) expandedRepoPkgs.delete(key);
+        else expandedRepoPkgs.add(key);
+        if (latestRuns.length > 0) renderRuns(latestRuns);
+        return;
+      }
+
+      const cveToggle = target.closest("[data-toggle-cves]");
+      if (cveToggle) {
+        const key = cveToggle.getAttribute("data-toggle-cves");
+        if (expandedPkgCves.has(key)) expandedPkgCves.delete(key);
+        else expandedPkgCves.add(key);
+        if (latestRuns.length > 0) renderRuns(latestRuns);
+        return;
+      }
+
+      const btn = target.closest("[data-stop-run]");
+      if (!btn) return;
+      const runId = btn.getAttribute("data-stop-run");
+      if (!runId) return;
+      btn.disabled = true;
+      btn.textContent = "Stopping...";
+      try {
+        await fetch("/runs/" + encodeURIComponent(runId) + "/cancel", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ reason: "Manually marked stopped from dashboard" }),
+        });
+      } catch {
+        btn.disabled = false;
+        btn.textContent = "Stop";
+      }
+    });
+
+    // Live 1s elapsed timer for running cards
     setInterval(() => {
-      const rows = document.querySelectorAll("#runs-tbody tr");
-      for (const tr of rows) {
-        if (!tr.dataset.finishedAt && tr.dataset.startedAt) {
-          const cell = tr.querySelector('[data-role="duration"]');
-          if (cell) cell.textContent = fmtDuration(tr.dataset.startedAt, null);
+      const cards = document.querySelectorAll("#runs-list .run-card");
+      for (const card of cards) {
+        if (!card.dataset.finishedAt && card.dataset.startedAt) {
+          const cell = card.querySelector('[data-role="duration"]');
+          if (cell) cell.textContent = fmtDuration(card.dataset.startedAt, null);
         }
       }
     }, 1000);
@@ -983,9 +1533,12 @@ function renderRunDetailPage(runId: string): string {
           <span id="run-elapsed" class="pill mono">-</span>
         </div>
       </div>
-      <div class="live-pill">
-        <span id="live-dot" class="live-dot"></span>
-        <span id="live-label">Connecting SSE</span>
+      <div style="display:flex;align-items:center;gap:10px">
+        <button id="stop-run-btn" type="button" class="stop-btn" style="display:none;padding:5px 12px;font-size:12px" title="Mark this run as stopped">Mark Stopped</button>
+        <div class="live-pill">
+          <span id="live-dot" class="live-dot"></span>
+          <span id="live-label">Connecting SSE</span>
+        </div>
       </div>
     </div>
 
@@ -1069,6 +1622,7 @@ function renderRunDetailPage(runId: string): string {
       completed: "Completed",
       partial_failed: "Partial Failed",
       failed: "Failed",
+      cancelled: "Stopped",
       pending: "Pending",
       preparing: "Preparing",
       prepared: "Prepared",
@@ -1117,9 +1671,15 @@ function renderRunDetailPage(runId: string): string {
     function badgeClass(status) {
       if (status === "completed") return "badge-completed";
       if (status === "failed") return "badge-failed";
+      if (status === "cancelled") return "badge-cancelled";
       if (status === "partial_failed") return "badge-partial_failed";
       if (status === "pending") return "badge-pending";
       return "badge-running";
+    }
+
+    const ACTIVE_STATUSES = new Set(["preparing", "patching", "verifying", "creating_pr"]);
+    function isRepoActive(status, runStatus) {
+      return runStatus === "running" && ACTIVE_STATUSES.has(status);
     }
 
     function setBadge(el, status) {
@@ -1321,12 +1881,12 @@ function renderRunDetailPage(runId: string): string {
       $("wiz-split").style.display = "grid";
       $("wiz-repo-count").textContent = String(repos.length);
 
-      const activeCount = repos.filter((r) => r.status !== "pending" && r.status !== "completed" && r.status !== "failed").length;
+      const activeCount = repos.filter((r) => isRepoActive(r.status, snap.run.status)).length;
       $("wiz-active-pill").textContent = activeCount > 0 ? activeCount + " active" : "";
 
       // Pick default repo if user hasn't manually clicked one
       if (!userPickedRepo || !repos.some((r) => r.targetRepo === selectedRepo)) {
-        const activeRepo = repos.find((r) => r.status !== "pending" && r.status !== "completed" && r.status !== "failed");
+        const activeRepo = repos.find((r) => isRepoActive(r.status, snap.run.status));
         const failedRepo = repos.find((r) => r.status === "failed");
         selectedRepo = (activeRepo || failedRepo || repos[0]).targetRepo;
       }
@@ -1406,8 +1966,18 @@ function renderRunDetailPage(runId: string): string {
       setBadge($("run-status"), run.status);
       $("run-elapsed").textContent = fmtDuration(run.startedAt, run.finishedAt);
 
-      const activeCount = repos.filter((r) => r.status !== "pending" && r.status !== "completed" && r.status !== "failed").length;
-      const pendingCount = repos.filter((r) => r.status === "pending").length;
+      const stopBtn = $("stop-run-btn");
+      if (stopBtn) {
+        stopBtn.style.display = run.status === "running" ? "inline-flex" : "none";
+        if (run.status === "running") {
+          stopBtn.disabled = false;
+          stopBtn.textContent = "Mark Stopped";
+        }
+      }
+
+      const activeCount = repos.filter((r) => isRepoActive(r.status, run.status)).length;
+      const pendingCount = repos.filter((r) => r.status === "pending" || r.status === "prepared").length;
+      const cancelledCount = repos.filter((r) => r.status === "cancelled").length;
       const total = repos.length;
 
       const okPct = total > 0 ? Math.round((run.completedRepos / total) * 100) : (run.status === "completed" ? 100 : 0);
@@ -1417,10 +1987,15 @@ function renderRunDetailPage(runId: string): string {
       $("bar-run").style.width = runPct + "%";
       $("bar-fail").style.width = failPct + "%";
 
+      const summaryParts = [run.completedRepos + " completed"];
+      if (activeCount > 0) summaryParts.push(activeCount + " active");
+      if (pendingCount > 0) summaryParts.push(pendingCount + " pending");
+      if (run.failedRepos > 0) summaryParts.push(run.failedRepos + " failed");
+      if (cancelledCount > 0) summaryParts.push(cancelledCount + " stopped");
       $("progress-summary").textContent =
         total > 0
-          ? run.completedRepos + " completed · " + activeCount + " active · " + pendingCount + " pending · " + run.failedRepos + " failed"
-          : (run.status === "running" ? "Waiting for remediation plans..." : "Run " + run.status);
+          ? summaryParts.join(" · ")
+          : (run.status === "running" ? "Waiting for remediation plans..." : "Run " + (STATUS_LABELS[run.status] || run.status));
       $("progress-findings").textContent = (run.totalFindings || 0) + " findings";
       $("progress-stage").textContent = "stage: " + (run.currentStage || "-");
 
@@ -1444,6 +2019,24 @@ function renderRunDetailPage(runId: string): string {
       $("tab-events-repo").classList.remove("active");
       if (latestSnap) renderWizView(latestSnap);
     });
+
+    const stopRunBtn = $("stop-run-btn");
+    if (stopRunBtn) {
+      stopRunBtn.addEventListener("click", async () => {
+        stopRunBtn.disabled = true;
+        stopRunBtn.textContent = "Stopping...";
+        try {
+          await fetch(${JSON.stringify(`/runs/${encodeURIComponent(runId)}/cancel`)}, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ reason: "Manually marked stopped from dashboard" }),
+          });
+        } catch {
+          stopRunBtn.disabled = false;
+          stopRunBtn.textContent = "Mark Stopped";
+        }
+      });
+    }
 
     // Live elapsed timer while running
     setInterval(() => {
@@ -1681,6 +2274,39 @@ export function createDashboardRoute(deps: DashboardRouteDeps): Hono {
       clearInterval(pollTimer);
       clearInterval(heartbeat);
       unsubscribe();
+    });
+  });
+
+  /**
+   * POST /runs/:runId/cancel
+   * Marks a running run as stopped/cancelled directly from the dashboard UI.
+   */
+  route.post("/:runId/cancel", async (c) => {
+    const runId = c.req.param("runId");
+    let reason = "Manually marked stopped from dashboard";
+    try {
+      const raw = await c.req.text();
+      if (raw.trim()) {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (typeof parsed.reason === "string" && parsed.reason.trim()) {
+          reason = parsed.reason.trim();
+        }
+      }
+    } catch {
+      // Ignore malformed optional body
+    }
+
+    const cancelled = runsStore.cancelRun(runId, { reason });
+    const snapshot = runsStore.getRunSnapshot(runId);
+    if (!snapshot) {
+      return c.json({ ok: false, error: `Run '${runId}' not found.` }, 404);
+    }
+
+    return c.json({
+      ok: true,
+      runId,
+      cancelled,
+      status: snapshot.run.status,
     });
   });
 

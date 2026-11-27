@@ -108,6 +108,7 @@ export function createRemediationRoute(
     };
 
     const startMs = performance.now();
+    const releaseActivity = runsStore?.trackRunActivity(runId);
     runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
       status: "preparing",
@@ -149,6 +150,7 @@ export function createRemediationRoute(
         status: "failed",
         lastError: msg,
         currentStage: "prepare",
+        autoFinalize: true,
       });
       runsStore?.recordEvent(runId, {
         targetRepo: plan.targetRepo,
@@ -158,6 +160,8 @@ export function createRemediationRoute(
         message: `Workspace preparation failed: ${msg}`,
       });
       throw err;
+    } finally {
+      releaseActivity?.();
     }
   });
 
@@ -199,73 +203,87 @@ export function createRemediationRoute(
           : undefined,
     };
 
-    if (runsStore && plans.length > 0) {
-      for (const plan of plans) {
-        runsStore.updateRepo(runId, plan.targetRepo, {
-          plan,
-          currentStage: "prepare",
+    const releaseActivity = runsStore?.trackRunActivity(runId);
+    try {
+      if (runsStore && plans.length > 0) {
+        for (const plan of plans) {
+          runsStore.updateRepo(runId, plan.targetRepo, {
+            plan,
+            currentStage: "prepare",
+          });
+        }
+      }
+
+      const repoStartTimes = new Map<string, number>();
+      const result = await prepareRemediationWorkspacesBatch(input, exec, {
+        onRepoStart: (plan, index, total) => {
+          repoStartTimes.set(plan.targetRepo, performance.now());
+          runsStore?.updateRepo(runId, plan.targetRepo, {
+            plan,
+            status: "preparing",
+            currentStage: "prepare",
+            clearError: true,
+          });
+          runsStore?.recordEvent(runId, {
+            targetRepo: plan.targetRepo,
+            stage: "prepare",
+            status: "started",
+            message: `[${index + 1}/${total}] Preparing workspace for ${plan.targetRepo}`,
+          });
+        },
+        onRepoDone: (prepared, index, total) => {
+          const started = repoStartTimes.get(prepared.targetRepo);
+          const durationMs = started ? Math.round(performance.now() - started) : null;
+          runsStore?.updateRepo(runId, prepared.targetRepo, {
+            plan: prepared.plan,
+            status: "prepared",
+            remediationBranch: prepared.remediationBranch,
+            cacheHit: prepared.cacheHit,
+            currentStage: "prepare",
+          });
+          runsStore?.recordEvent(runId, {
+            targetRepo: prepared.targetRepo,
+            stage: "prepare",
+            status: "succeeded",
+            durationMs,
+            message: `[${index + 1}/${total}] Workspace ready (${prepared.cacheHit ? "cache hit" : "fresh clone"}, branch ${prepared.remediationBranch})`,
+          });
+        },
+        onRepoError: (plan, err, index, total) => {
+          const started = repoStartTimes.get(plan.targetRepo);
+          const durationMs = started ? Math.round(performance.now() - started) : null;
+          const msg = err instanceof Error ? err.message : String(err);
+          runsStore?.updateRepo(runId, plan.targetRepo, {
+            plan,
+            status: "failed",
+            lastError: msg,
+            currentStage: "prepare",
+          });
+          runsStore?.recordEvent(runId, {
+            targetRepo: plan.targetRepo,
+            stage: "prepare",
+            status: "failed",
+            durationMs,
+            message: `[${index + 1}/${total}] Prepare failed: ${msg}`,
+          });
+        },
+      });
+
+      if (plans.length > 0 && result.workspaces.length === 0) {
+        runsStore?.finalizeRun(runId, {
+          status: "failed",
+          error: "All workspace preparations failed",
+          message: "All workspace preparations failed",
         });
       }
-    }
 
-    const repoStartTimes = new Map<string, number>();
-    const result = await prepareRemediationWorkspacesBatch(input, exec, {
-      onRepoStart: (plan, index, total) => {
-        repoStartTimes.set(plan.targetRepo, performance.now());
-        runsStore?.updateRepo(runId, plan.targetRepo, {
-          plan,
-          status: "preparing",
-          currentStage: "prepare",
-          clearError: true,
-        });
-        runsStore?.recordEvent(runId, {
-          targetRepo: plan.targetRepo,
-          stage: "prepare",
-          status: "started",
-          message: `[${index + 1}/${total}] Preparing workspace for ${plan.targetRepo}`,
-        });
-      },
-      onRepoDone: (prepared, index, total) => {
-        const started = repoStartTimes.get(prepared.targetRepo);
-        const durationMs = started ? Math.round(performance.now() - started) : null;
-        runsStore?.updateRepo(runId, prepared.targetRepo, {
-          plan: prepared.plan,
-          status: "prepared",
-          remediationBranch: prepared.remediationBranch,
-          cacheHit: prepared.cacheHit,
-          currentStage: "prepare",
-        });
-        runsStore?.recordEvent(runId, {
-          targetRepo: prepared.targetRepo,
-          stage: "prepare",
-          status: "succeeded",
-          durationMs,
-          message: `[${index + 1}/${total}] Workspace ready (${prepared.cacheHit ? "cache hit" : "fresh clone"}, branch ${prepared.remediationBranch})`,
-        });
-      },
-      onRepoError: (plan, err, index, total) => {
-        const started = repoStartTimes.get(plan.targetRepo);
-        const durationMs = started ? Math.round(performance.now() - started) : null;
-        const msg = err instanceof Error ? err.message : String(err);
-        runsStore?.updateRepo(runId, plan.targetRepo, {
-          plan,
-          status: "failed",
-          lastError: msg,
-          currentStage: "prepare",
-        });
-        runsStore?.recordEvent(runId, {
-          targetRepo: plan.targetRepo,
-          stage: "prepare",
-          status: "failed",
-          durationMs,
-          message: `[${index + 1}/${total}] Prepare failed: ${msg}`,
-        });
-      },
-    });
-    return c.json({
-      ok: true,
-      ...result,
-    });
+      return c.json({
+        ok: true,
+        ...result,
+      });
+    } finally {
+      releaseActivity?.();
+    }
   });
 
   /**
@@ -320,6 +338,7 @@ export function createRemediationRoute(
 
     const attempt = input.attempt ?? 1;
     const startMs = performance.now();
+    const releaseActivity = runsStore?.trackRunActivity(runId);
     runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
       status: "patching",
@@ -338,32 +357,57 @@ export function createRemediationRoute(
       message: `Copilot patch started (attempt ${attempt}${input.maxRetries ? `/${input.maxRetries}` : ""})`,
     });
 
-    const result = await runCopilotRemediationPatch(input, exec);
-    const durationMs = Math.round(performance.now() - startMs);
+    try {
+      const result = await runCopilotRemediationPatch(input, exec);
+      const durationMs = Math.round(performance.now() - startMs);
+      const httpStatus = getCopilotPatchHttpStatus(result);
+      const isTerminalFailure = !result.ok && httpStatus >= 400;
 
-    runsStore?.updateRepo(runId, plan.targetRepo, {
-      plan,
-      status: "patching",
-      attempt: result.attempt,
-      maxRetries: result.maxRetries,
-      creditsUsed: result.creditsUsed,
-      creditBudget: result.creditBudget,
-      lastError: result.ok ? null : (result.error ?? result.code ?? "Copilot patch failed"),
-      clearError: result.ok,
-      currentStage: "patch",
-    });
-    runsStore?.recordEvent(runId, {
-      targetRepo: plan.targetRepo,
-      stage: "patch",
-      status: result.ok ? "succeeded" : "failed",
-      attempt: result.attempt,
-      durationMs,
-      message: result.ok
-        ? `Copilot patch finished (${result.changedFiles.length} file(s) changed, credits ${result.creditsUsed}/${result.creditBudget})`
-        : `Copilot patch failed (${result.code ?? "ERROR"}): ${result.error ?? "unknown error"}`,
-    });
+      runsStore?.updateRepo(runId, plan.targetRepo, {
+        plan,
+        status: isTerminalFailure ? "failed" : "patching",
+        attempt: result.attempt,
+        maxRetries: result.maxRetries,
+        creditsUsed: result.creditsUsed,
+        creditBudget: result.creditBudget,
+        lastError: result.ok ? null : (result.error ?? result.code ?? "Copilot patch failed"),
+        clearError: result.ok,
+        currentStage: "patch",
+        autoFinalize: isTerminalFailure,
+      });
+      runsStore?.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage: "patch",
+        status: result.ok ? "succeeded" : "failed",
+        attempt: result.attempt,
+        durationMs,
+        message: result.ok
+          ? `Copilot patch finished (${result.changedFiles.length} file(s) changed, credits ${result.creditsUsed}/${result.creditBudget})`
+          : `Copilot patch failed (${result.code ?? "ERROR"}): ${result.error ?? "unknown error"}`,
+      });
 
-    return c.json(result, getCopilotPatchHttpStatus(result));
+      return c.json(result, httpStatus);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      runsStore?.updateRepo(runId, plan.targetRepo, {
+        plan,
+        status: "failed",
+        lastError: msg,
+        currentStage: "patch",
+        autoFinalize: true,
+      });
+      runsStore?.recordEvent(runId, {
+        targetRepo: plan.targetRepo,
+        stage: "patch",
+        status: "failed",
+        attempt,
+        durationMs: Math.round(performance.now() - startMs),
+        message: `Copilot patch errored: ${msg}`,
+      });
+      throw err;
+    } finally {
+      releaseActivity?.();
+    }
   });
 
   /**
@@ -414,6 +458,7 @@ export function createRemediationRoute(
     };
 
     const startMs = performance.now();
+    const releaseActivity = runsStore?.trackRunActivity(runId);
     runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
       status: "verifying",
@@ -455,9 +500,10 @@ export function createRemediationRoute(
       const msg = err instanceof Error ? err.message : String(err);
       runsStore?.updateRepo(runId, plan.targetRepo, {
         plan,
-        status: "verifying",
+        status: "failed",
         lastError: msg,
         currentStage: "verify",
+        autoFinalize: true,
       });
       runsStore?.recordEvent(runId, {
         targetRepo: plan.targetRepo,
@@ -467,6 +513,8 @@ export function createRemediationRoute(
         message: `Verification errored: ${msg}`,
       });
       throw err;
+    } finally {
+      releaseActivity?.();
     }
   });
 
@@ -526,6 +574,7 @@ export function createRemediationRoute(
     };
 
     const startMs = performance.now();
+    const releaseActivity = runsStore?.trackRunActivity(runId);
     runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
       status: "creating_pr",
@@ -583,6 +632,8 @@ export function createRemediationRoute(
         message: `PR creation failed: ${msg}`,
       });
       throw err;
+    } finally {
+      releaseActivity?.();
     }
   });
 
@@ -625,13 +676,18 @@ export function createRemediationRoute(
       const status =
         body.status === "completed" ||
         body.status === "partial_failed" ||
-        body.status === "failed"
+        body.status === "failed" ||
+        body.status === "cancelled"
           ? (body.status as RunStatus)
           : undefined;
       runsStore?.finalizeRun(runId, {
         status,
         error: typeof body.error === "string" ? body.error : null,
         message: typeof body.message === "string" ? body.message : undefined,
+        cancelIncomplete:
+          typeof body.cancelIncomplete === "boolean"
+            ? body.cancelIncomplete
+            : status === "cancelled",
       });
     }
 
@@ -641,6 +697,36 @@ export function createRemediationRoute(
       runId,
       dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
       status: snapshot?.run.status ?? "completed",
+    });
+  });
+
+  /**
+   * POST /api/remediation/cancel
+   * Marks a running run as stopped/cancelled and transitions any non-terminal repos to cancelled.
+   */
+  route.post("/cancel", async (c) => {
+    const body = await parseJsonObject(await c.req.text());
+    const runId = typeof body.runId === "string" ? body.runId.trim() : "";
+    if (!runId) {
+      return c.json({ ok: false, error: "Field `runId` is required." }, 400);
+    }
+
+    const reason =
+      typeof body.reason === "string" && body.reason.trim()
+        ? body.reason.trim()
+        : "Run manually stopped";
+    const cancelled = runsStore?.cancelRun(runId, { reason }) ?? false;
+    const snapshot = runsStore?.getRunSnapshot(runId) ?? null;
+    if (!snapshot) {
+      return c.json({ ok: false, error: `Run '${runId}' not found.` }, 404);
+    }
+
+    return c.json({
+      ok: true,
+      runId,
+      cancelled,
+      status: snapshot.run.status,
+      dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
     });
   });
 

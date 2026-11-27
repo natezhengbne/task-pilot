@@ -6,6 +6,7 @@ import type {
   DownstreamVerificationResult,
   LockfilePackageVerification,
   RemediationCommandResult,
+  RemediationNextAction,
   RemediationVerificationResult,
 } from "../../domain/remediation.ts";
 import { compareSemver, parseSemver } from "../npm/lockfile.ts";
@@ -278,6 +279,110 @@ async function runDownstreamVerification(
   return results;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stableStringMapEquals(a: unknown, b: unknown): boolean {
+  const mapA = isRecord(a) ? a : {};
+  const mapB = isRecord(b) ? b : {};
+  const keysA = Object.keys(mapA).sort();
+  const keysB = Object.keys(mapB).sort();
+  if (keysA.length !== keysB.length) return false;
+  for (let i = 0; i < keysA.length; i += 1) {
+    const k = keysA[i]!;
+    if (k !== keysB[i]) return false;
+    if (mapA[k] !== mapB[k]) return false;
+  }
+  return true;
+}
+
+function collectOverrideTargets(
+  overrides: unknown,
+  out = new Map<string, string>(),
+): Map<string, string> {
+  if (!isRecord(overrides)) return out;
+  for (const [rawKey, value] of Object.entries(overrides)) {
+    // Strip optional version specifier in npm override keys, e.g. "shell-quote@1.8.4" -> "shell-quote"
+    const key = rawKey.startsWith("@")
+      ? rawKey.replace(/^(@[^/]+\/[^@]+)@.+$/, "$1")
+      : rawKey.replace(/^([^@]+)@.+$/, "$1");
+    if (typeof value === "string") {
+      const prev = out.get(key);
+      out.set(key, prev ? `${prev}|${value}` : value);
+    } else if (isRecord(value)) {
+      collectOverrideTargets(value, out);
+    }
+  }
+  return out;
+}
+
+export interface OwnedLibraryChangeEvaluation {
+  downstreamEffective: boolean;
+  reason: string | null;
+}
+
+/**
+ * Evaluates whether `package.json` changes in an `owned-library` repo will
+ * propagate to downstream consumers. Returns `downstreamEffective: false` if
+ * runtime dependency maps (`dependencies`, `optionalDependencies`, `peerDependencies`)
+ * were untouched while target vulnerable package(s) were patched solely via npm `overrides`.
+ */
+export function evaluateOwnedLibraryPackageJsonChange(
+  basePkgText: string | null,
+  currentPkgText: string | null,
+  plan: RemediationPlan,
+): OwnedLibraryChangeEvaluation {
+  if (plan.ownership !== "owned-library") {
+    return { downstreamEffective: true, reason: null };
+  }
+  if (!basePkgText?.trim() || !currentPkgText?.trim()) {
+    return { downstreamEffective: true, reason: null };
+  }
+
+  let basePkg: Record<string, unknown>;
+  let currentPkg: Record<string, unknown>;
+  try {
+    const parsedBase = JSON.parse(basePkgText) as unknown;
+    const parsedCurrent = JSON.parse(currentPkgText) as unknown;
+    if (!isRecord(parsedBase) || !isRecord(parsedCurrent)) {
+      return { downstreamEffective: true, reason: null };
+    }
+    basePkg = parsedBase;
+    currentPkg = parsedCurrent;
+  } catch {
+    return { downstreamEffective: true, reason: null };
+  }
+
+  const runtimeDepsUnchanged =
+    stableStringMapEquals(basePkg.dependencies, currentPkg.dependencies) &&
+    stableStringMapEquals(basePkg.optionalDependencies, currentPkg.optionalDependencies) &&
+    stableStringMapEquals(basePkg.peerDependencies, currentPkg.peerDependencies);
+
+  if (!runtimeDepsUnchanged) {
+    return { downstreamEffective: true, reason: null };
+  }
+
+  const baseOverrides = collectOverrideTargets(basePkg.overrides);
+  const currentOverrides = collectOverrideTargets(currentPkg.overrides);
+  const targetOverridesChanged = plan.packages
+    .map((p) => p.component)
+    .filter((pkgName) => {
+      const cur = currentOverrides.get(pkgName);
+      return cur !== undefined && cur !== baseOverrides.get(pkgName);
+    });
+
+  if (targetOverridesChanged.length > 0) {
+    const list = targetOverridesChanged.map((p) => `\`${p}\``).join(", ");
+    return {
+      downstreamEffective: false,
+      reason: `Owned-library patch only added/updated npm \`overrides\` for ${list} without changing \`dependencies\`; npm \`overrides\` do not propagate to downstream consumers.`,
+    };
+  }
+
+  return { downstreamEffective: true, reason: null };
+}
+
 /**
  * Verifies a remediation workspace:
  * 1. Confirms git changes exist.
@@ -304,6 +409,32 @@ export async function verifyRemediationWorkspace(
 
   if (requireChanges && !gitChanges.hasChanges) {
     failures.push("No git file changes were detected in the workspace after patch.");
+  }
+
+  let downstreamEffective = true;
+  let ownedLibraryIneffectiveReason: string | null = null;
+  const packageJsonPath = join(input.workspacePath, "package.json");
+  if (
+    input.plan.ownership === "owned-library" &&
+    gitChanges.changedFiles.includes("package.json") &&
+    existsSync(packageJsonPath)
+  ) {
+    const basePkgRes = await exec(["git", "show", "HEAD:package.json"], {
+      cwd: input.workspacePath,
+      timeoutMs: 10_000,
+    });
+    const basePkgText = basePkgRes.exitCode === 0 ? basePkgRes.stdout : null;
+    const currentPkgText = await Bun.file(packageJsonPath).text();
+    const evalRes = evaluateOwnedLibraryPackageJsonChange(
+      basePkgText,
+      currentPkgText,
+      input.plan,
+    );
+    downstreamEffective = evalRes.downstreamEffective;
+    ownedLibraryIneffectiveReason = evalRes.reason;
+    if (!downstreamEffective && ownedLibraryIneffectiveReason) {
+      failures.push(ownedLibraryIneffectiveReason);
+    }
   }
 
   let lockfileChecks: LockfilePackageVerification[] = [];
@@ -360,6 +491,33 @@ export async function verifyRemediationWorkspace(
   }
 
   const passed = failures.length === 0;
+  const hasConsumers =
+    input.plan.ownership === "owned-library" && input.plan.consumers.length > 0;
+  const downstreamFailed = downstreamChecks.some((dc) => !dc.passed);
+
+  let fallbackToConsumers = false;
+  let fallbackReason: string | null = null;
+  if (!passed && hasConsumers) {
+    if (!gitChanges.hasChanges) {
+      fallbackToConsumers = true;
+      fallbackReason =
+        "No upstream dependency changes were made in owned-library (parent upgrade unavailable or reverted); fall back to consumer remediation.";
+    } else if (!downstreamEffective) {
+      fallbackToConsumers = true;
+      fallbackReason = ownedLibraryIneffectiveReason;
+    } else if (downstreamFailed) {
+      fallbackToConsumers = true;
+      fallbackReason =
+        "Downstream consumer validation failed after owned-library upgrade; fall back to consumer remediation.";
+    }
+  }
+
+  const nextAction: RemediationNextAction = passed
+    ? "create_pr"
+    : fallbackToConsumers
+      ? "fallback_to_consumers"
+      : "retry_patch";
+
   const result: RemediationVerificationResult = {
     passed,
     hasGitChanges: gitChanges.hasChanges,
@@ -368,6 +526,10 @@ export async function verifyRemediationWorkspace(
     lockfilePassed,
     commands: commandResults,
     downstreamChecks,
+    downstreamEffective,
+    fallbackToConsumers,
+    fallbackReason,
+    nextAction,
     failureSummary: passed ? null : failures.join("\n\n"),
   };
 

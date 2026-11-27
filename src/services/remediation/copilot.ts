@@ -160,8 +160,14 @@ export function getCopilotPatchHttpStatus(
   }
 }
 
+export const DEFAULT_COPILOT_MODEL = "fusion";
+
 export function getCopilotBinary(): string {
   return process.env.TASKPILOT_COPILOT_BIN?.trim() || "copilot";
+}
+
+export function getDefaultCopilotModel(): string {
+  return process.env.TASKPILOT_COPILOT_MODEL?.trim() || DEFAULT_COPILOT_MODEL;
 }
 
 export function getDefaultCopilotTimeoutMs(): number {
@@ -375,13 +381,13 @@ export async function runCopilotRemediationPatch(
 
   const binary = getCopilotBinary();
   const cmd = [binary, "-p", prompt, "--allow-all-tools"];
-  const model = input.model?.trim() || process.env.TASKPILOT_COPILOT_MODEL?.trim();
+  const model = input.model?.trim() || getDefaultCopilotModel();
   if (model) {
     cmd.push("--model", model);
   }
 
   process.stderr.write(
-    `[copilot] --> ${input.plan.targetRepo} attempt ${attempt}/${maxRetries} (credits ${priorCredits}/${creditBudget}, timeout ${Math.round(timeoutMs / 1000)}s)\n`,
+    `[copilot] --> ${input.plan.targetRepo} attempt ${attempt}/${maxRetries} (model=${model}, credits ${priorCredits}/${creditBudget}, timeout ${Math.round(timeoutMs / 1000)}s)\n`,
   );
 
   const streamLogs = process.env.NODE_ENV !== "test";

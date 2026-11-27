@@ -28,6 +28,11 @@ export interface DownstreamVerificationResult {
   error?: string;
 }
 
+export type RemediationNextAction =
+  | "create_pr"
+  | "retry_patch"
+  | "fallback_to_consumers";
+
 export interface RemediationVerificationResult {
   passed: boolean;
   hasGitChanges: boolean;
@@ -36,6 +41,10 @@ export interface RemediationVerificationResult {
   lockfilePassed: boolean;
   commands: RemediationCommandResult[];
   downstreamChecks: DownstreamVerificationResult[];
+  downstreamEffective?: boolean;
+  fallbackToConsumers?: boolean;
+  fallbackReason?: string | null;
+  nextAction?: RemediationNextAction;
   failureSummary: string | null;
 }
 
@@ -121,30 +130,47 @@ export function buildCopilotRemediationPrompt(
 
   lines.push("");
   lines.push("## Remediation Rules");
-  lines.push("1. Inspect `package.json` and `package-lock.json` first to understand how each vulnerable package is pulled in.");
   lines.push(
-    "2. Prefer upgrading direct dependencies cleanly when possible; if a package is strictly transitive and cannot be upgraded via a parent bump without a breaking rewrite, use npm `overrides` carefully and regenerate `package-lock.json`.",
+    "1. Inspect `package.json` and `package-lock.json` first to understand how each vulnerable package is pulled in.",
   );
-  if (options.depsInstalled) {
+  lines.push(
+    "2. **Check direct/parent upgrades with evidence before using `overrides`**: Before concluding a transitive vulnerability cannot be fixed via a parent upgrade, you MUST inspect the direct parent dependency (and key intermediate dependencies in the chain) using `npm view <parent> versions --json` and `npm view <parent>@<version> dependencies` to verify whether a same-major release already tightens the vulnerable package range to the fixed version or removes it. If a compatible same-major parent upgrade resolves the vulnerability cleanly, upgrade the direct dependency in `package.json` instead of jumping straight to `overrides`. Avoid cross-major bumps of direct dependencies unless unavoidable and verified non-breaking.",
+  );
+  if (plan.ownership === "owned-library") {
+    const consumerNote =
+      plan.consumers.length > 0
+        ? ` (${plan.consumers.join(", ")})`
+        : "";
     lines.push(
-      "3. `node_modules` is already pre-installed in this cached workspace; do NOT delete `node_modules`. Ensure `package-lock.json` is updated and consistent with `package.json` by running an incremental `npm install` or `npm update`.",
+      `3. **Owned-library optimal-fix rule**: This repository is published as a shared library consumed downstream${consumerNote}. Your goal is to find the optimal upstream fix so that all downstream repositories automatically get fixed when they upgrade this library. Remember that npm \`overrides\` and \`package-lock.json\` do NOT propagate to downstream consumers when they install this package. Therefore, you MUST fix the vulnerability via \`package.json\` \`dependencies\` (e.g. upgrading the direct parent dependency such as \`webpack-dev-server\`, or moving a dev-only tool out of \`dependencies\` if genuinely unused at runtime and safe to move). Do NOT add an \`overrides\` entry for the target vulnerable package(s) as a workaround. If you verify via \`npm view\` that no compatible upstream parent version eliminates the vulnerable range, OR if upgrading the parent dependency causes build/lint/test failures that cannot be safely resolved, revert any unsuccessful edits so the workspace stays clean and report the exact evidence and reason clearly.`,
     );
   } else {
     lines.push(
-      "3. Dependencies were intentionally NOT installed before patching (corporate registries such as JFrog Xray/Curation may block Critical vulnerable versions with HTTP 403). Do NOT run `npm install` before editing `package.json`. First update `package.json` to eliminate the vulnerable version(s), then refresh the lockfile with `npm install --package-lock-only --no-audit --no-fund` so no blocked vulnerable versions remain, and finally run `npm install --no-audit --no-fund` (preserve any existing cached `node_modules` unless corrupted).",
+      "3. **Transitive fallback**: If a vulnerable package is strictly transitive and you have verified via `npm view` that no compatible same-major parent upgrade tightens the range, add a minimal npm `overrides` entry in `package.json` and regenerate `package-lock.json`.",
+    );
+  }
+  if (options.depsInstalled) {
+    lines.push(
+      "4. `node_modules` is already pre-installed in this cached workspace; do NOT delete `node_modules`. Ensure `package-lock.json` is updated and consistent with `package.json` by running an incremental `npm install` or `npm update`.",
+    );
+  } else {
+    lines.push(
+      "4. Dependencies were intentionally NOT installed before patching (corporate registries such as JFrog Xray/Curation may block Critical vulnerable versions with HTTP 403). Do NOT run `npm install` before editing `package.json`. First update `package.json` to eliminate the vulnerable version(s), then refresh the lockfile with `npm install --package-lock-only --no-audit --no-fund` so no blocked vulnerable versions remain, and finally run `npm install --no-audit --no-fund` (preserve any existing cached `node_modules` unless corrupted).",
     );
   }
   lines.push(
-    "4. **Handling unrelated HTTP 403 registry blocks**: If `npm install` fails with HTTP 403 (e.g. JFrog Curation blocking an older transitive dependency not listed above), you MAY add a minimal npm `overrides` entry to bump that blocked transitive package to the smallest unblocked safe version **within the same major version** (e.g. `7.29.0` -> `7.30.1`), regenerate `package-lock.json`, and re-run `npm install`. Do NOT perform cross-major upgrades on unrelated packages and do NOT bump direct dependencies across majors. If no same-major unblocked version exists, stop and report the exact blocked package(s) and version(s) clearly.",
+    "5. **Handling unrelated HTTP 403 registry blocks**: If `npm install` fails with HTTP 403 (e.g. JFrog Curation blocking an older transitive dependency not listed above), you MAY add a minimal npm `overrides` entry to bump that blocked transitive package to the smallest unblocked safe version **within the same major version** (e.g. `7.29.0` -> `7.30.1`), regenerate `package-lock.json`, and re-run `npm install`. Do NOT perform cross-major upgrades on unrelated packages and do NOT bump direct dependencies across majors. If no same-major unblocked version exists, stop and report the exact blocked package(s) and version(s) clearly.",
   );
-  lines.push("5. Keep changes minimal and strictly scoped to resolving these CVEs (plus any same-major 403 unblock above). Do NOT disable, skip, or delete existing tests or linters.");
+  lines.push(
+    "6. Keep changes minimal and strictly scoped to resolving these CVEs (plus any same-major 403 unblock above). Do NOT disable, skip, or delete existing tests or linters.",
+  );
 
   if (options.detectedScripts && options.detectedScripts.length > 0) {
     lines.push(
-      `6. Before finishing, verify the repository using available scripts: ${options.detectedScripts.map((s) => `\`npm run ${s}\``).join(", ")}.`,
+      `7. Before finishing, verify the repository using available scripts: ${options.detectedScripts.map((s) => `\`npm run ${s}\``).join(", ")}.`,
     );
   } else {
-    lines.push("6. Before finishing, run the repository's build/test scripts if present.");
+    lines.push("7. Before finishing, run the repository's build/test scripts if present.");
   }
 
   if (options.extraInstructions?.trim()) {
@@ -164,7 +190,7 @@ export function buildCopilotRemediationPrompt(
 
   lines.push("");
   lines.push(
-    "When finished, summarize the exact dependency changes made, why each change was chosen, and the verification commands you ran. If you had to add any same-major `overrides` to unblock an unrelated HTTP 403 registry error, list them under a separate `### Additional Registry-Blocked Dependencies Upgraded` section with old -> new version and reason so the Draft PR reviewer can audit them easily.",
+    "When finished, summarize: (a) the exact dependency changes made, (b) the parent-upgrade check evidence (which direct/intermediate parent versions were checked via `npm view` and why a parent upgrade was or was not used), and (c) the verification commands you ran. If you had to add any same-major `overrides` to unblock an unrelated HTTP 403 registry error, list them under a separate `### Additional Registry-Blocked Dependencies Upgraded` section with old -> new version and reason so the Draft PR reviewer can audit them easily.",
   );
 
   return lines.join("\n");
@@ -195,6 +221,44 @@ export interface DraftPrBodyInput {
   remediationBranch: string;
   verification?: RemediationVerificationResult | null;
   copilotSummary?: string | null;
+}
+
+/**
+ * Extracts the human-readable final summary from raw Copilot CLI output so
+ * verbose `$ Shell ...` command traces do not crowd out or truncate the rationale
+ * in Draft PR descriptions.
+ */
+export function extractCopilotSummaryForPr(raw: string, maxLen = 4000): string {
+  const normalized = raw.replace(/\r\n/g, "\n").trim();
+  if (!normalized) return "";
+
+  const lines = normalized.split("\n");
+  // Drop trailing Copilot CLI telemetry footer lines (Changes / AI Credits / Tokens / Resume)
+  while (
+    lines.length > 0 &&
+    /^(?:Changes|AI Credits|Tokens|Resume)\s+/i.test(lines[lines.length - 1]!.trim())
+  ) {
+    lines.pop();
+  }
+
+  let body = lines.join("\n").trim();
+
+  // If raw output contains `$ Shell ...` tool-call trace blocks, keep only the final summary after the last block
+  const lastShellIdx = lines.findLastIndex((line) => /^\s*\$\s+Shell\b/.test(line));
+  if (lastShellIdx >= 0) {
+    let summaryStart = lastShellIdx + 1;
+    // Skip indented command lines belonging to the last `$ Shell` block
+    while (summaryStart < lines.length && /^\s+\S/.test(lines[summaryStart]!)) {
+      summaryStart += 1;
+    }
+    const afterShell = lines.slice(summaryStart).join("\n").trim();
+    if (afterShell.length > 0) {
+      body = afterShell;
+    }
+  }
+
+  if (body.length <= maxLen) return body;
+  return `${body.slice(0, maxLen).trimEnd()}\n\n...(truncated)`;
 }
 
 /**
@@ -245,10 +309,13 @@ export function buildDraftPrBody(input: DraftPrBodyInput): string {
   }
 
   if (copilotSummary?.trim()) {
-    lines.push("");
-    lines.push("## Upgrade Rationale & Copilot Summary");
-    lines.push("");
-    lines.push(copilotSummary.trim().slice(0, 3000));
+    const formattedSummary = extractCopilotSummaryForPr(copilotSummary);
+    if (formattedSummary) {
+      lines.push("");
+      lines.push("## Upgrade Rationale & Copilot Summary");
+      lines.push("");
+      lines.push(formattedSummary);
+    }
   }
 
   if (verification) {

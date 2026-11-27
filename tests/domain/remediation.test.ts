@@ -5,9 +5,13 @@ import {
   buildDraftPrBody,
   buildDraftPrTitle,
   buildRemediationBranchName,
+  extractCopilotSummaryForPr,
 } from "../../src/domain/remediation.ts";
 import { parseCreditsFromOutput } from "../../src/services/remediation/copilot.ts";
-import { verifyLockfileContent } from "../../src/services/remediation/verify.ts";
+import {
+  evaluateOwnedLibraryPackageJsonChange,
+  verifyLockfileContent,
+} from "../../src/services/remediation/verify.ts";
 
 const samplePlan: RemediationPlan = {
   dedupKey: "remediate:acme-org/shared-utils:shell-quote@1.8.4",
@@ -76,6 +80,53 @@ describe("domain/remediation", () => {
     expect(prompt).toContain("npm install --package-lock-only --no-audit --no-fund");
     expect(prompt).toContain("within the same major version");
     expect(prompt).toContain("Additional Registry-Blocked Dependencies Upgraded");
+    expect(prompt).toContain("npm view <parent> versions --json");
+    expect(prompt).toContain("Owned-library optimal-fix rule");
+    expect(prompt).toContain("do NOT propagate to downstream consumers");
+    expect(prompt).toContain("Do NOT add an `overrides` entry for the target vulnerable package(s)");
+    expect(prompt).toContain("revert any unsuccessful edits so the workspace stays clean");
+    expect(prompt).toContain("parent-upgrade check evidence");
+  });
+
+  test("builds consumer-repo prompt without owned-library constraint", () => {
+    const consumerPlan: RemediationPlan = {
+      ...samplePlan,
+      ownership: "consumer-repo",
+      consumers: [],
+    };
+    const prompt = buildCopilotRemediationPrompt(consumerPlan);
+
+    expect(prompt).toContain("npm view <parent> versions --json");
+    expect(prompt).toContain("Transitive fallback");
+    expect(prompt).not.toContain("Owned-library optimal-fix rule");
+  });
+
+  test("extracts final Copilot summary by stripping shell traces and CLI telemetry footer", () => {
+    const raw = [
+      "$ Shell Inspect package files 10 lines...",
+      "   cat package.json",
+      "",
+      " $ Shell Verify build and lint 5 lines...",
+      "   npm run build",
+      "   npm run lint",
+      "",
+      "`shell-quote` is now 1.12.0. Checked webpack-dev-server@5.2.7.",
+      "",
+      "### Additional Registry-Blocked Dependencies Upgraded",
+      "- `undici`: 7.29.0 -> 7.30.1",
+      "",
+      "Changes    +0 -0",
+      "AI Credits 12.42 (2m 58s)",
+      "Tokens     ↑ 252.3k • ↓ 1.8k",
+      "Resume     copilot --resume=abc",
+    ].join("\n");
+
+    const extracted = extractCopilotSummaryForPr(raw);
+    expect(extracted).toContain("`shell-quote` is now 1.12.0.");
+    expect(extracted).toContain("- `undici`: 7.29.0 -> 7.30.1");
+    expect(extracted).not.toContain("$ Shell");
+    expect(extracted).not.toContain("AI Credits");
+    expect(extracted).not.toContain("copilot --resume");
   });
 
   test("builds Copilot prompt with pre-installed guidance when depsInstalled is true", () => {
@@ -175,5 +226,31 @@ describe("domain/remediation", () => {
     expect(parseCreditsFromOutput("Done. Credits: 5", 1)).toBe(5);
     expect(parseCreditsFromOutput("AI Credits 12.66 (5m 13s)", 1)).toBe(13);
     expect(parseCreditsFromOutput("Done without credit footer", 2)).toBe(2);
+  });
+
+  test("flags owned-library overrides-only patch as downstream-ineffective", () => {
+    const basePkg = JSON.stringify({
+      name: "@acme-org/shared-utils",
+      dependencies: { "webpack-dev-server": "^5.2.5" },
+      overrides: { koa: "^3.0.1" },
+    });
+    const overridesOnlyPkg = JSON.stringify({
+      name: "@acme-org/shared-utils",
+      dependencies: { "webpack-dev-server": "^5.2.5" },
+      overrides: { koa: "^3.0.1", "shell-quote": "^1.11.0" },
+    });
+    const depUpgradedPkg = JSON.stringify({
+      name: "@acme-org/shared-utils",
+      dependencies: { "webpack-dev-server": "^5.2.7" },
+      overrides: { koa: "^3.0.1" },
+    });
+
+    const bad = evaluateOwnedLibraryPackageJsonChange(basePkg, overridesOnlyPkg, samplePlan);
+    expect(bad.downstreamEffective).toBe(false);
+    expect(bad.reason).toContain("shell-quote");
+
+    const good = evaluateOwnedLibraryPackageJsonChange(basePkg, depUpgradedPkg, samplePlan);
+    expect(good.downstreamEffective).toBe(true);
+    expect(good.reason).toBeNull();
   });
 });

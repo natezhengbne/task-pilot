@@ -3,7 +3,12 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { RemediationPlan } from "../domain/remediation-plan.ts";
 
-export type RunStatus = "running" | "completed" | "partial_failed" | "failed";
+export type RunStatus =
+  | "running"
+  | "completed"
+  | "partial_failed"
+  | "failed"
+  | "cancelled";
 
 export type RunType = "wiz-remediation" | "generic" | (string & {});
 
@@ -15,7 +20,29 @@ export type RepoRunStatus =
   | "verifying"
   | "creating_pr"
   | "completed"
-  | "failed";
+  | "failed"
+  | "cancelled";
+
+const ACTIVE_REPO_STATUSES = new Set<RepoRunStatus>([
+  "preparing",
+  "patching",
+  "verifying",
+  "creating_pr",
+]);
+
+const TERMINAL_REPO_STATUSES = new Set<RepoRunStatus>([
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
+export function isActiveRepoStatus(status: RepoRunStatus): boolean {
+  return ACTIVE_REPO_STATUSES.has(status);
+}
+
+export function isTerminalRepoStatus(status: RepoRunStatus): boolean {
+  return TERMINAL_REPO_STATUSES.has(status);
+}
 
 export type RunStage =
   | "ingest"
@@ -72,6 +99,7 @@ export interface RunListItem extends RunRecord {
   totalCves: number;
   severityCounts: Record<string, number>;
   activeTargets: RunActiveRepoSummary[];
+  repos: RunRepoRecord[];
 }
 
 export interface RunRepoRecord {
@@ -332,6 +360,7 @@ export class RunsStore {
   private readonly db: Database;
   private readonly listeners = new Map<string, Set<RunSnapshotListener>>();
   private readonly allListeners = new Set<RunsListListener>();
+  private readonly activeRunCounts = new Map<string, number>();
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     if (dbPath !== ":memory:") {
@@ -430,7 +459,33 @@ export class RunsStore {
   close(): void {
     this.listeners.clear();
     this.allListeners.clear();
+    this.activeRunCounts.clear();
     this.db.close();
+  }
+
+  /**
+   * Marks a run as having an active in-flight HTTP request on this server
+   * so the stale-run reaper will never prematurely finalize it while a long
+   * operation (e.g. Copilot patch, npm install, verify) is executing.
+   */
+  trackRunActivity(runId: string): () => void {
+    const prev = this.activeRunCounts.get(runId) ?? 0;
+    this.activeRunCounts.set(runId, prev + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const cur = this.activeRunCounts.get(runId) ?? 0;
+      if (cur <= 1) {
+        this.activeRunCounts.delete(runId);
+      } else {
+        this.activeRunCounts.set(runId, cur - 1);
+      }
+    };
+  }
+
+  isRunActivelyTracked(runId: string): boolean {
+    return (this.activeRunCounts.get(runId) ?? 0) > 0;
   }
 
   subscribe(runId: string, listener: RunSnapshotListener): () => void {
@@ -635,7 +690,7 @@ export class RunsStore {
 
       const nextStatus: RepoRunStatus =
         patch.status ?? (existing?.status as RepoRunStatus | undefined) ?? "pending";
-      const isTerminal = nextStatus === "completed" || nextStatus === "failed";
+      const isTerminal = isTerminalRepoStatus(nextStatus);
       const startedAt =
         existing?.started_at ?? (nextStatus !== "pending" ? ts : null);
       const finishedAt = isTerminal ? ts : existing?.finished_at ?? null;
@@ -829,11 +884,31 @@ export class RunsStore {
       status?: RunStatus;
       error?: string | null;
       message?: string;
+      cancelIncomplete?: boolean;
     } = {},
   ): void {
     const ts = nowIso();
     const tx = this.db.transaction(() => {
       this.ensureRun(runId, { currentStage: "finalize" });
+
+      if (opts.cancelIncomplete || opts.status === "cancelled") {
+        const reason =
+          opts.error?.trim() ||
+          opts.message?.trim() ||
+          "Run stopped before repository finished";
+        this.db
+          .query(
+            `UPDATE run_repos
+             SET status = 'cancelled',
+                 last_error = COALESCE(last_error, ?),
+                 updated_at = ?,
+                 finished_at = COALESCE(finished_at, ?)
+             WHERE run_id = ?
+               AND status NOT IN ('completed', 'failed', 'cancelled')`,
+          )
+          .run(reason, ts, ts, runId);
+      }
+
       const counts = this.getRepoCounts(runId);
 
       let finalStatus: RunStatus;
@@ -841,12 +916,14 @@ export class RunsStore {
         finalStatus = opts.status;
       } else if (counts.total === 0) {
         finalStatus = opts.error ? "failed" : "completed";
-      } else if (counts.failed === 0) {
+      } else if (counts.failed === 0 && counts.cancelled === 0) {
         finalStatus = "completed";
       } else if (counts.completed > 0) {
         finalStatus = "partial_failed";
-      } else {
+      } else if (counts.failed > 0) {
         finalStatus = "failed";
+      } else {
+        finalStatus = "cancelled";
       }
 
       this.db
@@ -880,7 +957,7 @@ export class RunsStore {
           status: finalStatus === "completed" ? "succeeded" : "failed",
           message:
             opts.message ??
-            `Run finished with status "${finalStatus}" (${counts.completed}/${counts.total} completed, ${counts.failed} failed)`,
+            `Run finished with status "${finalStatus}" (${counts.completed}/${counts.total} completed, ${counts.failed} failed${counts.cancelled > 0 ? `, ${counts.cancelled} stopped` : ""})`,
         },
         ts,
       );
@@ -888,6 +965,71 @@ export class RunsStore {
 
     tx();
     this.emit(runId);
+  }
+
+  cancelRun(
+    runId: string,
+    opts: {
+      reason?: string | null;
+      status?: "cancelled" | "failed" | "partial_failed";
+    } = {},
+  ): boolean {
+    const existing = this.db
+      .query("SELECT status FROM runs WHERE run_id = ?")
+      .get(runId) as { status: string } | null;
+    if (!existing) return false;
+    if (existing.status !== "running") return false;
+
+    const reason = opts.reason?.trim() || "Run manually stopped";
+    this.finalizeRun(runId, {
+      status: opts.status ?? "cancelled",
+      error: reason,
+      message: reason,
+      cancelIncomplete: true,
+    });
+    return true;
+  }
+
+  reapStaleRuns(
+    staleAfterMs: number,
+    activeRunIds?: ReadonlySet<string>,
+    nowMs: number = Date.now(),
+  ): string[] {
+    if (staleAfterMs <= 0) return [];
+    const cutoffIso = new Date(nowMs - staleAfterMs).toISOString();
+    const rows = this.db
+      .query(
+        `SELECT run_id, updated_at
+         FROM runs
+         WHERE status = 'running' AND updated_at < ?`,
+      )
+      .all(cutoffIso) as Array<{ run_id: string; updated_at: string }>;
+
+    const reaped: string[] = [];
+    const minutes = Math.max(1, Math.round(staleAfterMs / 60_000));
+
+    for (const row of rows) {
+      if (activeRunIds?.has(row.run_id) || this.isRunActivelyTracked(row.run_id)) {
+        continue;
+      }
+      const counts = this.getRepoCounts(row.run_id);
+      const status: RunStatus =
+        counts.completed > 0
+          ? "partial_failed"
+          : counts.failed > 0
+            ? "failed"
+            : "cancelled";
+      const reason = `Marked stopped after ${minutes}m of inactivity (orchestrator stopped or disconnected)`;
+      this.finalizeRun(row.run_id, {
+        status,
+        error: reason,
+        message: reason,
+        cancelIncomplete: true,
+      });
+      reaped.push(row.run_id);
+    }
+
+    return reaped;
   }
 
   listRuns(limit = 50): RunRecord[] {
@@ -946,11 +1088,11 @@ export class RunsStore {
 
       for (const repo of repos) {
         const isActive =
-          repo.status !== "pending" &&
-          repo.status !== "completed" &&
-          repo.status !== "failed";
+          run.status === "running" && isActiveRepoStatus(repo.status);
         if (isActive) activeRepos++;
-        if (repo.status === "pending") pendingRepos++;
+        if (repo.status === "pending" || repo.status === "prepared") {
+          pendingRepos++;
+        }
         totalPackages += repo.packageCount;
         totalCves += repo.cveCount;
 
@@ -1005,6 +1147,7 @@ export class RunsStore {
         totalCves,
         severityCounts,
         activeTargets,
+        repos,
       };
     });
   }
@@ -1064,13 +1207,15 @@ export class RunsStore {
     total: number;
     completed: number;
     failed: number;
+    cancelled: number;
   } {
     const row = this.db
       .query(
         `SELECT
            COUNT(*) AS total,
            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+           SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled
          FROM run_repos
          WHERE run_id = ?`,
       )
@@ -1078,11 +1223,13 @@ export class RunsStore {
       total: number;
       completed: number | null;
       failed: number | null;
+      cancelled: number | null;
     };
     return {
       total: row?.total ?? 0,
       completed: row?.completed ?? 0,
       failed: row?.failed ?? 0,
+      cancelled: row?.cancelled ?? 0,
     };
   }
 
@@ -1094,15 +1241,18 @@ export class RunsStore {
   ): void {
     const counts = this.getRepoCounts(runId);
     const allTerminal =
-      counts.total > 0 && counts.completed + counts.failed === counts.total;
+      counts.total > 0 &&
+      counts.completed + counts.failed + counts.cancelled === counts.total;
 
     if (autoFinalize && allTerminal) {
       const finalStatus: RunStatus =
-        counts.failed === 0
+        counts.failed === 0 && counts.cancelled === 0
           ? "completed"
           : counts.completed > 0
             ? "partial_failed"
-            : "failed";
+            : counts.failed > 0
+              ? "failed"
+              : "cancelled";
       this.db
         .query(
           `UPDATE runs

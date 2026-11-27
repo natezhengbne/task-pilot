@@ -422,13 +422,30 @@
     },
     {
       "parameters": {
-        "jsCode": "const items = $input.all().map((i) => i.json);\nconst lines = items.map((d) => {\n  if (d.prUrl) return `- [DRAFT PR] ${d.targetRepo}: ${d.prUrl}`;\n  if (d.dryRun) return `- [VERIFIED / DRY RUN] ${d.targetRepo} (${d.remediationBranch})`;\n  return `- [FAILED] ${d.targetRepo}: ${d.reason || d.error || 'see execution logs'}`;\n});\nconst summary = `Processed ${items.length} repository remediation(s):\\n\\n${lines.join('\\n')}`;\n\nreturn [{\n  json: {\n    processedCount: items.length,\n    summary,\n    results: items,\n  },\n}];"
+        "jsCode": "const items = $input.all().map((i) => i.json);\nconst runId = $('🔍 4. Plan Remediation Targets').first().json.runId || ('n8n-' + $execution.id);\nconst lines = items.map((d) => {\n  if (d.prUrl) return `- [DRAFT PR] ${d.targetRepo}: ${d.prUrl}`;\n  if (d.dryRun) return `- [VERIFIED / DRY RUN] ${d.targetRepo} (${d.remediationBranch})`;\n  return `- [FAILED] ${d.targetRepo}: ${d.reason || d.error || 'see execution logs'}`;\n});\nconst summary = `Processed ${items.length} repository remediation(s):\\n\\n${lines.join('\\n')}`;\n\nreturn [{\n  json: {\n    runId,\n    processedCount: items.length,\n    summary,\n    results: items,\n  },\n}];"
       },
       "id": "form-end-remediation",
       "name": "15. Remediation Summary",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [420, 1130]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TASKPILOT_API_URL || 'http://127.0.0.1:3456') + '/api/remediation/finalize' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ runId: $json.runId, cancelIncomplete: true, message: 'Remediation workflow finished' }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "http-finalize-remediation",
+      "name": "16. Finalize Run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 1130]
     }
   ],
   "connections": {
@@ -529,6 +546,11 @@
     "14b. Report Repo Failure": {
       "main": [
         [{ "node": "8. Loop Over Repos", "type": "main", "index": 0 }]
+      ]
+    },
+    "15. Remediation Summary": {
+      "main": [
+        [{ "node": "16. Finalize Run", "type": "main", "index": 0 }]
       ]
     }
   },
