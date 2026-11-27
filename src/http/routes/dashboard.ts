@@ -1517,7 +1517,7 @@ function renderRunDetailPage(runId: string): string {
       el.textContent = labelOverride || STATUS_LABELS[status] || status;
     }
 
-    function computeStepStates(repo) {
+    function computeStepStates(repo, events) {
       const s = repo.status;
       if (s === "completed") {
         if (!isSafeHttpUrl(repo.prUrl) && !repo.dryRun) {
@@ -1531,6 +1531,19 @@ function renderRunDetailPage(runId: string): string {
       if (s === "prepared") return ["done", "idle", "idle", "idle"];
       if (s === "preparing") return ["active", "idle", "idle", "idle"];
       if (s === "failed") {
+        const repoEvents = (events || []).filter((e) => e.targetRepo === repo.targetRepo);
+        let failStage = null;
+        for (let i = repoEvents.length - 1; i >= 0; i--) {
+          const ev = repoEvents[i];
+          if (ev.status === "failed" && (ev.stage === "prepare" || ev.stage === "patch" || ev.stage === "verify" || ev.stage === "pr")) {
+            failStage = ev.stage;
+            break;
+          }
+        }
+        if (failStage === "pr") return ["done", "done", "done", "failed"];
+        if (failStage === "verify") return ["done", "done", "failed", "idle"];
+        if (failStage === "patch") return ["done", "failed", "idle", "idle"];
+        if (failStage === "prepare") return ["failed", "idle", "idle", "idle"];
         if (repo.attempt > 0) return ["done", "done", "failed", "idle"];
         return ["failed", "idle", "idle", "idle"];
       }
@@ -1567,14 +1580,14 @@ function renderRunDetailPage(runId: string): string {
       }).join("");
     }
 
-    function renderSelectedRepoDetail(repo) {
+    function renderSelectedRepoDetail(repo, events) {
       const el = $("wiz-detail-card");
       if (!repo) {
         el.innerHTML = '<div class="empty">Select a repository from the left to inspect its packages and CVEs.</div>';
         return;
       }
 
-      const states = computeStepStates(repo);
+      const states = computeStepStates(repo, events);
       const icons = { done: "✓", active: "●", failed: "✕", skipped: "–", idle: "" };
       const step4Label =
         repo.status === "completed" && !isSafeHttpUrl(repo.prUrl) && !repo.dryRun
@@ -1709,7 +1722,7 @@ function renderRunDetailPage(runId: string): string {
           const key = btn.getAttribute("data-expand-pkg");
           if (expandedPkgCves.has(key)) expandedPkgCves.delete(key);
           else expandedPkgCves.add(key);
-          renderSelectedRepoDetail(repo);
+          renderSelectedRepoDetail(repo, events);
         });
       });
     }
@@ -1796,7 +1809,7 @@ function renderRunDetailPage(runId: string): string {
       });
 
       const currentRepoObj = repos.find((r) => r.targetRepo === selectedRepo) || repos[0];
-      renderSelectedRepoDetail(currentRepoObj);
+      renderSelectedRepoDetail(currentRepoObj, events);
 
       const filteredEvents = eventScope === "repo" && currentRepoObj
         ? events.filter((ev) => ev.targetRepo === currentRepoObj.targetRepo || !ev.targetRepo)

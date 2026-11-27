@@ -8,6 +8,7 @@
     "dev:wsl": "bun --watch src/server.ts --host 0.0.0.0",
     "start": "bun run src/server.ts",
     "cli": "bun run src/cli.ts",
+    "windmill:sync": "bun run workflows/windmill/sync.ts",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit"
   },

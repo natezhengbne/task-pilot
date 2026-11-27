@@ -68,6 +68,7 @@ Only if the direct parent is genuinely unused by published runtime:
 ## Install & Corporate Registry (JFrog 403) Protocol
 
 - **Deferred install mode (default)**: Do NOT run `npm install` before editing `package.json` (corporate registries may block Critical vulnerable versions with `HTTP 403`). Edit `package.json` (or refresh lockfile for `LOCKFILE_REFRESHED`), run `npm install --package-lock-only --no-audit --no-fund`, then `npm install --no-audit --no-fund` (preserve cached `node_modules` unless corrupted).
+- **Never hand-edit `package-lock.json`**: Do NOT manually edit version/resolved/integrity fields in `package-lock.json` or `git restore` it after `npm install` without re-syncing `node_modules`. Always let the package manager update `package-lock.json` (`npm update <pkg> --package-lock-only` or `npm install --package-lock-only`) and follow with `npm install --no-audit --no-fund` (or `npm ci`) so `node_modules` and `package-lock.json` remain strictly in sync before running verification scripts.
 - **Pre-installed mode**: Do NOT delete `node_modules`; use incremental `npm install` or `npm update`.
 - **Unrelated HTTP 403 blocks**:
   - **Default (`forbidden`)**: Do NOT add `overrides` for unrelated blocked packages. Stop, record the blocked package/version/parent/recommended fix, revert only your own incomplete edits, and report `REGISTRY_BLOCKED_UNRELATED`.
@@ -78,7 +79,7 @@ Only if the direct parent is genuinely unused by published runtime:
 
 1. Inspect `git status --short`, `git diff --check`, and the full diff (`package.json`, lockfile, and any code adaptations) to confirm changes are minimal, cleanly formatted, and strictly scoped.
 2. Run `npm ls <target-package> --all`. Remember a non-zero `npm ls` exit code may reflect peer dependency warnings/conflicts rather than the vulnerability—separately confirm tree validity and that no affected version remains in any resolved path.
-3. Run every configured script from `verificationScripts`.
+3. Run every configured script from `verificationScripts` and inspect the actual output (do not rely on exit code `0` alone—some webpack/build wrappers log `compiled with N errors` while still exiting `0`; never report `"build": "passed"` if compilation errors were logged).
 4. For `PUBLISHED_RUNTIME` fixes in an `owned-library`, local validation alone does **NOT** close the downstream vulnerability: set `"downstreamUpdateRequired": true` (publish -> update consumer & lockfile -> verify vulnerable version absent in consumer).
 
 ## Required Final Output

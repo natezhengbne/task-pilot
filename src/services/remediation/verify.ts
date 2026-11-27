@@ -159,6 +159,26 @@ export function verifyLockfileContent(
   });
 }
 
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/**
+ * Detects silent bundler/compiler failures where a build wrapper (e.g. a custom
+ * webpack JS API script) prints compilation errors but still exits with code 0.
+ */
+export function detectSilentCommandFailure(
+  stdout: string,
+  stderr: string,
+): string | null {
+  const combined = stripAnsi(`${stdout}\n${stderr}`);
+  const webpackErrMatch = combined.match(/compiled with ([1-9]\d*) errors?\b/i);
+  if (webpackErrMatch) {
+    return `Bundler reported ${webpackErrMatch[1]} compilation error(s) despite exit code 0.`;
+  }
+  return null;
+}
+
 async function execShellStep(
   command: string,
   cwd: string,
@@ -168,15 +188,26 @@ async function execShellStep(
   const start = performance.now();
   const res = await exec(shellCommand(command), { cwd, timeoutMs });
   const durationMs = Math.round(performance.now() - start);
+  const silentFailure =
+    !res.timedOut && res.exitCode === 0
+      ? detectSilentCommandFailure(res.stdout, res.stderr)
+      : null;
+  const passed = !res.timedOut && res.exitCode === 0 && !silentFailure;
+  const rawStderrTail = tail(res.stderr);
+  const stderrTail = silentFailure
+    ? rawStderrTail
+      ? `[silent-failure] ${silentFailure}\n${rawStderrTail}`
+      : `[silent-failure] ${silentFailure}`
+    : rawStderrTail;
   return {
     command,
     cwd,
     exitCode: res.exitCode,
-    passed: !res.timedOut && res.exitCode === 0,
+    passed,
     timedOut: res.timedOut,
     durationMs,
     stdoutTail: tail(res.stdout),
-    stderrTail: tail(res.stderr),
+    stderrTail,
   };
 }
 
@@ -527,8 +558,12 @@ export async function verifyRemediationWorkspace(
       `[verify] <-- ${input.plan.targetRepo}: ${trimmed} exit=${step.exitCode} (${step.durationMs}ms)\n`,
     );
     if (!step.passed) {
+      const detail =
+        step.exitCode === 0 && !step.timedOut
+          ? "exit 0, silent build/compilation error"
+          : `exit ${step.exitCode}${step.timedOut ? ", timed out" : ""}`;
       failures.push(
-        `Command '${trimmed}' failed (exit ${step.exitCode}${step.timedOut ? ", timed out" : ""}):\n${step.stderrTail || step.stdoutTail}`,
+        `Command '${trimmed}' failed (${detail}):\n${step.stderrTail || step.stdoutTail}`,
       );
       break;
     }

@@ -672,7 +672,9 @@ export function createRemediationRoute(
         status: "succeeded",
         durationMs,
         message: result.prUrl
-          ? `Draft PR opened: ${result.prUrl}`
+          ? result.prUpdated
+            ? `Draft PR updated: ${result.prUrl}`
+            : `Draft PR opened: ${result.prUrl}`
           : `Dry-run report generated (${result.remediationBranch})`,
       });
       return c.json(result);

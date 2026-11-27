@@ -769,4 +769,196 @@ describe("http/remediation", () => {
       await rm(tempDir, { recursive: true, force: true });
     }
   });
+
+  test("POST /api/remediation/verify fails on silent webpack compilation errors even with exitCode 0", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-silent-build-"));
+    try {
+      await Bun.write(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "ux-embedded-operation-bar",
+          scripts: { build: "webpack", test: "jest" },
+        }),
+      );
+      await Bun.write(
+        join(tempDir, "package-lock.json"),
+        JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { name: "ux-embedded-operation-bar" },
+            "node_modules/shell-quote": { version: "1.12.0" },
+          },
+        }),
+      );
+
+      const consumerPlan: RemediationPlan = {
+        ...samplePlan,
+        targetRepo: "acme-org/web-app",
+        ownership: "consumer-repo",
+      };
+
+      const mockExec: CommandRunner = async (cmd) => {
+        if (cmd[0] === "git" && cmd[1] === "status") {
+          return {
+            exitCode: 0,
+            stdout: " M package-lock.json\n",
+            stderr: "",
+            timedOut: false,
+          };
+        }
+        if (cmd.join(" ").includes("npm run build")) {
+          return {
+            exitCode: 0,
+            stdout:
+              "\u001b[1muxEmbeddedOperationbar\u001b[39m (webpack 5.105.4) compiled with \u001b[1m\u001b[31m61 errors\u001b[39m\u001b[22m in 17741 ms\n",
+            stderr: "",
+            timedOut: false,
+          };
+        }
+        return { exitCode: 0, stdout: "ok\n", stderr: "", timedOut: false };
+      };
+
+      const app = createApp({ exec: mockExec, enableLogging: false });
+      const res = await app.request("/api/remediation/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId: "test-silent-build",
+          workspacePath: tempDir,
+          plan: consumerPlan,
+          persist: false,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        passed: boolean;
+        commands: Array<{ command: string; exitCode: number; passed: boolean; stderrTail: string }>;
+        failureSummary: string | null;
+      };
+      expect(body.passed).toBe(false);
+      expect(body.commands[0]?.command).toBe("npm run build");
+      expect(body.commands[0]?.exitCode).toBe(0);
+      expect(body.commands[0]?.passed).toBe(false);
+      expect(body.commands[0]?.stderrTail).toContain("61 compilation error(s)");
+      expect(body.failureSummary).toContain("silent build/compilation error");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("POST /api/remediation/pr force-pushes, updates existing open PR in-place, and persists pr-result artifact", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-pr-update-"));
+    const runId = `test-pr-update-${Date.now()}`;
+    try {
+      const commands: string[][] = [];
+      const mockExec: CommandRunner = async (cmd) => {
+        commands.push(cmd);
+        if (cmd[0] === "git" && cmd[1] === "status") {
+          return { exitCode: 0, stdout: " M package-lock.json\n", stderr: "", timedOut: false };
+        }
+        if (cmd[0] === "git" && cmd[1] === "rev-parse") {
+          return { exitCode: 0, stdout: "deadbeef1234\n", stderr: "", timedOut: false };
+        }
+        if (cmd[0] === "gh" && cmd[1] === "pr" && cmd[2] === "list") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify([{ url: "https://github.com/acme-org/shared-utils/pull/42", number: 42 }]),
+            stderr: "",
+            timedOut: false,
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      };
+
+      const app = createApp({ exec: mockExec, enableLogging: false });
+      const res = await app.request("/api/remediation/pr", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId,
+          workspacePath: tempDir,
+          plan: samplePlan,
+          remediationBranch: "fix/vuln-shell-quote-1-11-0-2ed78cc0",
+          persist: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        ok: boolean;
+        prUrl: string | null;
+        prUpdated: boolean;
+        artifacts?: { prReportPath: string; prResultPath?: string };
+      };
+      expect(body.ok).toBe(true);
+      expect(body.prUpdated).toBe(true);
+      expect(body.prUrl).toBe("https://github.com/acme-org/shared-utils/pull/42");
+      expect(commands.some((c) => c[0] === "git" && c[1] === "push" && c.includes("--force"))).toBe(true);
+      expect(commands.some((c) => c[0] === "gh" && c[1] === "pr" && c[2] === "edit")).toBe(true);
+      expect(commands.some((c) => c[0] === "gh" && c[1] === "pr" && c[2] === "create")).toBe(false);
+      expect(body.artifacts?.prResultPath).toBeTruthy();
+
+      const savedResult = JSON.parse(await Bun.file(body.artifacts!.prResultPath!).text()) as {
+        ok: boolean;
+        prUpdated: boolean;
+        prUrl: string;
+      };
+      expect(savedResult.ok).toBe(true);
+      expect(savedResult.prUpdated).toBe(true);
+      expect(savedResult.prUrl).toBe("https://github.com/acme-org/shared-utils/pull/42");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+      await rm(join(process.cwd(), ".runs", runId), { recursive: true, force: true });
+    }
+  });
+
+  test("POST /api/remediation/pr persists error into pr-result artifact when git push fails", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "task-pilot-pr-fail-"));
+    const runId = `test-pr-fail-${Date.now()}`;
+    try {
+      const mockExec: CommandRunner = async (cmd) => {
+        if (cmd[0] === "git" && cmd[1] === "status") {
+          return { exitCode: 0, stdout: " M package-lock.json\n", stderr: "", timedOut: false };
+        }
+        if (cmd[0] === "git" && cmd[1] === "push") {
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr: "! [rejected] fix/vuln -> fix/vuln (non-fast-forward)\n",
+            timedOut: false,
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      };
+
+      const app = createApp({ exec: mockExec, enableLogging: false });
+      const res = await app.request("/api/remediation/pr", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runId,
+          workspacePath: tempDir,
+          plan: samplePlan,
+          remediationBranch: "fix/vuln-shell-quote-1-11-0-2ed78cc0",
+          persist: true,
+        }),
+      });
+      expect(res.status).toBe(500);
+
+      const prResultPath = join(
+        process.cwd(),
+        ".runs",
+        runId,
+        "pr-result-acme-org_shared-utils.json",
+      );
+      const savedError = JSON.parse(await Bun.file(prResultPath).text()) as {
+        ok: boolean;
+        error: string;
+      };
+      expect(savedError.ok).toBe(false);
+      expect(savedError.error).toContain("non-fast-forward");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+      await rm(join(process.cwd(), ".runs", runId), { recursive: true, force: true });
+    }
+  });
 });

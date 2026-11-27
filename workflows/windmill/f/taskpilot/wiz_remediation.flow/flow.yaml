@@ -1,0 +1,829 @@
+summary: "TaskPilot - Vulnerability Remediation (Phase 1 / 2 / 3)"
+description: >-
+  Upload a vulnerability export (e.g. Wiz GraphQL JSON). Runs Phase 1 ingest &
+  remediation planning, optional Phase 2 Copilot patch/verify retry loop with
+  consumer fallback, and Phase 3 Draft PR creation via the TaskPilot HTTP API.
+value:
+  modules:
+    - id: ingest_vulnerabilities
+      summary: "1. Ingest Vulnerabilities"
+      value:
+        type: rawscript
+        language: bun
+        content: |
+          type IngestPolicy = {
+            minSeverity: string;
+            ownedScopes?: string[];
+          };
+
+          function decodeReportPayload(raw: string): unknown {
+            const trimmed = (raw ?? "").trim();
+            if (!trimmed) {
+              throw new Error("report_file is empty.");
+            }
+            if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+              return JSON.parse(trimmed);
+            }
+            const base64 = trimmed.startsWith("data:")
+              ? trimmed.slice(trimmed.indexOf(",") + 1)
+              : trimmed;
+            const decoded = Buffer.from(base64, "base64").toString("utf8");
+            return JSON.parse(decoded);
+          }
+
+          function buildHeaders(): Record<string, string> {
+            const headers: Record<string, string> = {
+              "content-type": "application/json",
+            };
+            const token = (process.env.TASKPILOT_API_TOKEN ?? "").trim();
+            if (token) {
+              headers["authorization"] = `Bearer ${token}`;
+            }
+            return headers;
+          }
+
+          export async function main(
+            report_file: string,
+            source: string = "wiz-graphql",
+            min_severity: string = "HIGH",
+            owned_scopes: string = "",
+            phase: string = "Phase 3 - Full Remediation + Draft PR",
+            taskpilot_api_url: string = "",
+          ) {
+            const apiUrl = (
+              taskpilot_api_url ||
+              process.env.TASKPILOT_API_URL ||
+              "http://host.docker.internal:3456"
+            ).replace(/\/+$/, "");
+
+            const jobId =
+              process.env.WM_ROOT_FLOW_JOB_ID ||
+              process.env.WM_JOB_ID ||
+              String(Date.now());
+            const runId = `wmill-${jobId}`;
+
+            const parsedScopes = owned_scopes
+              ? owned_scopes
+                  .split(",")
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              : [];
+
+            const policy: IngestPolicy = {
+              minSeverity: min_severity || "HIGH",
+              ...(parsedScopes.length > 0 ? { ownedScopes: parsedScopes } : {}),
+            };
+
+            const payload = decodeReportPayload(report_file);
+
+            const res = await fetch(`${apiUrl}/api/vulnerabilities/ingest`, {
+              method: "POST",
+              headers: buildHeaders(),
+              body: JSON.stringify({
+                source: source || "wiz-graphql",
+                runId,
+                phase: phase || "Phase 3 - Full Remediation + Draft PR",
+                policy,
+                payload,
+              }),
+              signal: AbortSignal.timeout(30_000),
+            });
+
+            const data = await res.json();
+            if (!res.ok || !data?.ok) {
+              throw new Error(
+                `Ingest failed (${res.status}): ${data?.error ?? JSON.stringify(data)}`,
+              );
+            }
+
+            return {
+              ...data,
+              apiUrl,
+            };
+          }
+        input_transforms:
+          report_file:
+            type: javascript
+            expr: flow_input.report_file
+          source:
+            type: javascript
+            expr: flow_input.source || 'wiz-graphql'
+          min_severity:
+            type: javascript
+            expr: flow_input.min_severity || 'HIGH'
+          owned_scopes:
+            type: javascript
+            expr: flow_input.owned_scopes || ''
+          phase:
+            type: javascript
+            expr: flow_input.phase || 'Phase 3 - Full Remediation + Draft PR'
+          taskpilot_api_url:
+            type: javascript
+            expr: flow_input.taskpilot_api_url || ''
+
+    - id: plan_remediation_targets
+      summary: "2. Plan Remediation Targets"
+      value:
+        type: rawscript
+        language: bun
+        content: |
+          function buildHeaders(): Record<string, string> {
+            const headers: Record<string, string> = {
+              "content-type": "application/json",
+            };
+            const token = (process.env.TASKPILOT_API_TOKEN ?? "").trim();
+            if (token) {
+              headers["authorization"] = `Bearer ${token}`;
+            }
+            return headers;
+          }
+
+          export async function main(
+            apiUrl: string,
+            runId: string,
+            ownedScopes: string[] | undefined,
+            findings: unknown[],
+          ) {
+            const res = await fetch(`${apiUrl}/api/vulnerabilities/plan`, {
+              method: "POST",
+              headers: buildHeaders(),
+              body: JSON.stringify({
+                runId,
+                useGitHub: true,
+                ...(ownedScopes && ownedScopes.length > 0 ? { ownedScopes } : {}),
+                findings,
+              }),
+              signal: AbortSignal.timeout(120_000),
+            });
+
+            const data = await res.json();
+            if (!res.ok || !data?.ok) {
+              throw new Error(
+                `Plan failed (${res.status}): ${data?.error ?? JSON.stringify(data)}`,
+              );
+            }
+
+            return data;
+          }
+        input_transforms:
+          apiUrl:
+            type: javascript
+            expr: results.ingest_vulnerabilities.apiUrl
+          runId:
+            type: javascript
+            expr: results.ingest_vulnerabilities.runId
+          ownedScopes:
+            type: javascript
+            expr: results.ingest_vulnerabilities.policy?.ownedScopes
+          findings:
+            type: javascript
+            expr: results.ingest_vulnerabilities.findings || []
+
+    - id: execute_or_summarize
+      summary: "3. Execute Remediation or Finalize Phase 1"
+      value:
+        type: branchone
+        branches:
+          - summary: "Execute Remediation (Phase 2 / 3)"
+            expr: >-
+              (flow_input.phase || 'Phase 3 - Full Remediation + Draft PR') !== 'Phase 1 - Analysis Only'
+              && (results.plan_remediation_targets.plans || []).length > 0
+            modules:
+              - id: preflight_check
+                summary: "3a. Preflight Check"
+                value:
+                  type: rawscript
+                  language: bun
+                  content: |
+                    function buildHeaders(): Record<string, string> {
+                      const headers: Record<string, string> = {
+                        "content-type": "application/json",
+                      };
+                      const token = (process.env.TASKPILOT_API_TOKEN ?? "").trim();
+                      if (token) {
+                        headers["authorization"] = `Bearer ${token}`;
+                      }
+                      return headers;
+                    }
+
+                    export async function main(apiUrl: string) {
+                      const res = await fetch(`${apiUrl}/api/preflight`, {
+                        method: "POST",
+                        headers: buildHeaders(),
+                        body: JSON.stringify({
+                          checks: ["gh", "copilot", "git", "node", "npm", "npm-auth"],
+                        }),
+                        signal: AbortSignal.timeout(15_000),
+                      });
+
+                      const data = await res.json();
+                      if (!res.ok || !data?.ok) {
+                        throw new Error(
+                          `Preflight failed (${res.status}): ${JSON.stringify(data)}`,
+                        );
+                      }
+                      return data;
+                    }
+                  input_transforms:
+                    apiUrl:
+                      type: javascript
+                      expr: results.ingest_vulnerabilities.apiUrl
+
+              - id: prepare_workspaces
+                summary: "3b. Prepare Remediation Workspaces"
+                value:
+                  type: rawscript
+                  language: bun
+                  content: |
+                    function buildHeaders(): Record<string, string> {
+                      const headers: Record<string, string> = {
+                        "content-type": "application/json",
+                      };
+                      const token = (process.env.TASKPILOT_API_TOKEN ?? "").trim();
+                      if (token) {
+                        headers["authorization"] = `Bearer ${token}`;
+                      }
+                      return headers;
+                    }
+
+                    export async function main(
+                      apiUrl: string,
+                      runId: string,
+                      plans: unknown[],
+                    ) {
+                      const res = await fetch(
+                        `${apiUrl}/api/remediation/workspaces/prepare`,
+                        {
+                          method: "POST",
+                          headers: buildHeaders(),
+                          body: JSON.stringify({
+                            runId,
+                            plans,
+                            reuseExisting: true,
+                            installDeps: false,
+                          }),
+                          signal: AbortSignal.timeout(900_000),
+                        },
+                      );
+
+                      const data = await res.json();
+                      if (!res.ok || !data?.ok) {
+                        throw new Error(
+                          `Workspace prepare failed (${res.status}): ${data?.error ?? JSON.stringify(data)}`,
+                        );
+                      }
+                      return data;
+                    }
+                  input_transforms:
+                    apiUrl:
+                      type: javascript
+                      expr: results.ingest_vulnerabilities.apiUrl
+                    runId:
+                      type: javascript
+                      expr: results.plan_remediation_targets.runId
+                    plans:
+                      type: javascript
+                      expr: results.plan_remediation_targets.plans || []
+
+              - id: remediate_repos
+                summary: "3c. Remediate Each Repository"
+                value:
+                  type: forloopflow
+                  iterator:
+                    type: javascript
+                    expr: results.prepare_workspaces.workspaces || []
+                  parallel: false
+                  skip_failures: true
+                  modules:
+                    - id: remediate_single_repo
+                      summary: "Patch, Verify, Retry / Fallback & Draft PR"
+                      value:
+                        type: rawscript
+                        language: bun
+                        content: |
+                          type PreparedWorkspace = {
+                            runId?: string;
+                            plan: Record<string, unknown>;
+                            targetRepo: string;
+                            baseBranch: string;
+                            remediationBranch: string;
+                            workspacePath: string;
+                            cacheHit?: boolean;
+                            depsInstalled?: boolean;
+                          };
+
+                          function buildHeaders(): Record<string, string> {
+                            const headers: Record<string, string> = {
+                              "content-type": "application/json",
+                            };
+                            const token = (process.env.TASKPILOT_API_TOKEN ?? "").trim();
+                            if (token) {
+                              headers["authorization"] = `Bearer ${token}`;
+                            }
+                            return headers;
+                          }
+
+                          async function postJson(
+                            apiUrl: string,
+                            path: string,
+                            body: Record<string, unknown>,
+                            timeoutMs: number,
+                            allowNon2xx: boolean = false,
+                          ): Promise<Record<string, any>> {
+                            const res = await fetch(`${apiUrl}${path}`, {
+                              method: "POST",
+                              headers: buildHeaders(),
+                              body: JSON.stringify(body),
+                              signal: AbortSignal.timeout(timeoutMs),
+                            });
+                            const data = (await res.json()) as Record<string, any>;
+                            if (!allowNon2xx && !res.ok) {
+                              throw new Error(
+                                `POST ${path} failed (${res.status}): ${data?.error ?? JSON.stringify(data)}`,
+                              );
+                            }
+                            return data;
+                          }
+
+                          export async function main(
+                            apiUrl: string,
+                            defaultRunId: string,
+                            workspace: PreparedWorkspace,
+                            phase: string = "Phase 3 - Full Remediation + Draft PR",
+                            max_retries: number = 1,
+                            credit_budget: number = 30,
+                            verify_downstream: boolean = false,
+                          ) {
+                            const runId = workspace.runId || defaultRunId;
+                            const maxRetries =
+                              Number(max_retries) > 0
+                                ? Math.min(Number(max_retries), 2)
+                                : 1;
+                            const creditBudget =
+                              Number(credit_budget) > 0 ? Number(credit_budget) : 30;
+                            const dryRun =
+                              phase !== "Phase 3 - Full Remediation + Draft PR";
+
+                            let attempt = 1;
+                            let creditsUsed = 0;
+                            let previousError: string | null = null;
+
+                            while (true) {
+                              const patch = await postJson(
+                                apiUrl,
+                                "/api/remediation/patch",
+                                {
+                                  runId,
+                                  workspacePath: workspace.workspacePath,
+                                  plan: workspace.plan,
+                                  attempt,
+                                  maxRetries,
+                                  creditBudget,
+                                  creditsUsed,
+                                  previousError,
+                                  depsInstalled: Boolean(workspace.depsInstalled),
+                                },
+                                660_000,
+                                true,
+                              );
+
+                              const verify = await postJson(
+                                apiUrl,
+                                "/api/remediation/verify",
+                                {
+                                  runId,
+                                  workspacePath: workspace.workspacePath,
+                                  plan: workspace.plan,
+                                  verifyDownstream: Boolean(verify_downstream),
+                                  copilotOutput: patch.copilotOutput,
+                                  copilotStructuredOutput: patch.structuredOutput,
+                                },
+                                240_000,
+                              );
+
+                              if (verify.passed) {
+                                const pr = await postJson(
+                                  apiUrl,
+                                  "/api/remediation/pr",
+                                  {
+                                    runId,
+                                    workspacePath: workspace.workspacePath,
+                                    plan: workspace.plan,
+                                    remediationBranch: workspace.remediationBranch,
+                                    baseBranch: workspace.baseBranch,
+                                    verification: verify,
+                                    copilotSummary: patch.copilotOutput,
+                                    draft: true,
+                                    dryRun,
+                                  },
+                                  120_000,
+                                );
+                                return [pr];
+                              }
+
+                              if (
+                                verify.nextAction === "fallback_to_consumers" &&
+                                Array.isArray(verify.fallbackPlans) &&
+                                verify.fallbackPlans.length > 0
+                              ) {
+                                const fallbackBatch = await postJson(
+                                  apiUrl,
+                                  "/api/remediation/workspaces/prepare",
+                                  {
+                                    runId,
+                                    plans: verify.fallbackPlans,
+                                    reuseExisting: true,
+                                    installDeps: false,
+                                  },
+                                  900_000,
+                                );
+
+                                const upstreamNote = `Upstream owned-library (${workspace.targetRepo}) fallback (${verify.copilotStatus || "fallback_to_consumers"}): ${verify.fallbackReason || "Refresh consumer lockfile or apply consumer-scoped fix."}`;
+                                const upstreamContext = {
+                                  repository: workspace.targetRepo,
+                                  status:
+                                    verify.copilotStatus || "fallback_to_consumers",
+                                  reason: verify.fallbackReason || null,
+                                  copilotSummary: patch.copilotOutput || null,
+                                };
+
+                                const consumerResults: Record<string, any>[] = [];
+                                for (const consumerWs of (fallbackBatch.workspaces ??
+                                  []) as PreparedWorkspace[]) {
+                                  const consumerPatch = await postJson(
+                                    apiUrl,
+                                    "/api/remediation/patch",
+                                    {
+                                      runId: consumerWs.runId || runId,
+                                      workspacePath: consumerWs.workspacePath,
+                                      plan: consumerWs.plan,
+                                      attempt: 1,
+                                      maxRetries,
+                                      creditBudget,
+                                      creditsUsed: patch.creditsUsed || 0,
+                                      previousError: null,
+                                      depsInstalled: Boolean(
+                                        consumerWs.depsInstalled,
+                                      ),
+                                      extraInstructions: upstreamNote,
+                                    },
+                                    660_000,
+                                    true,
+                                  );
+
+                                  const consumerVerify = await postJson(
+                                    apiUrl,
+                                    "/api/remediation/verify",
+                                    {
+                                      runId: consumerWs.runId || runId,
+                                      workspacePath: consumerWs.workspacePath,
+                                      plan: consumerWs.plan,
+                                      verifyDownstream: false,
+                                      copilotOutput: consumerPatch.copilotOutput,
+                                      copilotStructuredOutput:
+                                        consumerPatch.structuredOutput,
+                                    },
+                                    240_000,
+                                  );
+
+                                  if (consumerVerify.passed) {
+                                    const consumerPr = await postJson(
+                                      apiUrl,
+                                      "/api/remediation/pr",
+                                      {
+                                        runId: consumerWs.runId || runId,
+                                        workspacePath: consumerWs.workspacePath,
+                                        plan: consumerWs.plan,
+                                        remediationBranch:
+                                          consumerWs.remediationBranch,
+                                        baseBranch: consumerWs.baseBranch,
+                                        verification: consumerVerify,
+                                        copilotSummary: consumerPatch.copilotOutput,
+                                        upstreamContext,
+                                        draft: true,
+                                        dryRun,
+                                      },
+                                      120_000,
+                                    );
+                                    consumerResults.push(consumerPr);
+                                  } else {
+                                    const failure = {
+                                      ok: false,
+                                      status: "failed",
+                                      runId: consumerWs.runId || runId,
+                                      targetRepo: consumerWs.targetRepo,
+                                      remediationBranch:
+                                        consumerWs.remediationBranch,
+                                      attempts: consumerPatch.attempt,
+                                      creditsUsed: consumerPatch.creditsUsed,
+                                      creditBudget: consumerPatch.creditBudget,
+                                      reason:
+                                        "Consumer fallback verification failed",
+                                      failureSummary:
+                                        consumerVerify.failureSummary ||
+                                        consumerPatch.error ||
+                                        null,
+                                    };
+                                    await postJson(
+                                      apiUrl,
+                                      "/api/remediation/finalize",
+                                      {
+                                        runId: failure.runId,
+                                        targetRepo: failure.targetRepo,
+                                        reason:
+                                          failure.failureSummary || failure.reason,
+                                        attempt: failure.attempts,
+                                        creditsUsed: failure.creditsUsed,
+                                        creditBudget: failure.creditBudget,
+                                      },
+                                      10_000,
+                                    );
+                                    consumerResults.push(failure);
+                                  }
+                                }
+                                return consumerResults;
+                              }
+
+                              const currentAttempt = Number(patch.attempt || attempt);
+                              const currentCredits = Number(
+                                patch.creditsUsed || creditsUsed,
+                              );
+                              const canRetry =
+                                currentAttempt < maxRetries &&
+                                currentCredits < creditBudget;
+
+                              if (canRetry) {
+                                attempt = currentAttempt + 1;
+                                creditsUsed = currentCredits;
+                                previousError =
+                                  verify.failureSummary ||
+                                  patch.error ||
+                                  "Verification failed.";
+                                continue;
+                              }
+
+                              const failure = {
+                                ok: false,
+                                status: "failed",
+                                runId,
+                                targetRepo: workspace.targetRepo,
+                                remediationBranch: workspace.remediationBranch,
+                                attempts: currentAttempt,
+                                creditsUsed: currentCredits,
+                                creditBudget,
+                                reason:
+                                  "Verification failed; retry or credit limit reached",
+                                failureSummary:
+                                  verify.failureSummary || patch.error || null,
+                              };
+
+                              await postJson(
+                                apiUrl,
+                                "/api/remediation/finalize",
+                                {
+                                  runId,
+                                  targetRepo: failure.targetRepo,
+                                  reason: failure.failureSummary || failure.reason,
+                                  attempt: failure.attempts,
+                                  creditsUsed: failure.creditsUsed,
+                                  creditBudget: failure.creditBudget,
+                                },
+                                10_000,
+                              );
+                              return [failure];
+                            }
+                          }
+                        input_transforms:
+                          apiUrl:
+                            type: javascript
+                            expr: results.ingest_vulnerabilities.apiUrl
+                          defaultRunId:
+                            type: javascript
+                            expr: results.plan_remediation_targets.runId
+                          workspace:
+                            type: javascript
+                            expr: flow_input.iter.value
+                          phase:
+                            type: javascript
+                            expr: flow_input.phase || 'Phase 3 - Full Remediation + Draft PR'
+                          max_retries:
+                            type: javascript
+                            expr: flow_input.max_retries ?? 1
+                          credit_budget:
+                            type: javascript
+                            expr: flow_input.credit_budget ?? 30
+                          verify_downstream:
+                            type: javascript
+                            expr: Boolean(flow_input.verify_downstream)
+
+              - id: summarize_and_finalize_remediation
+                summary: "3d. Remediation Summary & Finalize Run"
+                value:
+                  type: rawscript
+                  language: bun
+                  content: |
+                    function buildHeaders(): Record<string, string> {
+                      const headers: Record<string, string> = {
+                        "content-type": "application/json",
+                      };
+                      const token = (process.env.TASKPILOT_API_TOKEN ?? "").trim();
+                      if (token) {
+                        headers["authorization"] = `Bearer ${token}`;
+                      }
+                      return headers;
+                    }
+
+                    export async function main(
+                      apiUrl: string,
+                      runId: string,
+                      dashboardUrl: string,
+                      loopResults: unknown[],
+                    ) {
+                      const items = (loopResults ?? []).flatMap((entry) =>
+                        Array.isArray(entry) ? entry : [entry],
+                      ) as Record<string, any>[];
+
+                      const lines = items.map((d) => {
+                        if (d?.prUrl) {
+                          return `- [DRAFT PR] ${d.targetRepo}: ${d.prUrl}`;
+                        }
+                        if (d?.dryRun) {
+                          return `- [VERIFIED / DRY RUN] ${d.targetRepo} (${d.remediationBranch})`;
+                        }
+                        return `- [FAILED] ${d?.targetRepo ?? "unknown"}: ${d?.reason || d?.error || "see execution logs"}`;
+                      });
+
+                      const summary = `Processed ${items.length} repository remediation(s):\n\n${lines.join("\n")}`;
+
+                      const res = await fetch(`${apiUrl}/api/remediation/finalize`, {
+                        method: "POST",
+                        headers: buildHeaders(),
+                        body: JSON.stringify({
+                          runId,
+                          cancelIncomplete: true,
+                          message: "Remediation workflow finished",
+                        }),
+                        signal: AbortSignal.timeout(10_000),
+                      });
+                      const finalize = await res.json();
+
+                      return {
+                        runId,
+                        dashboardUrl: finalize?.dashboardUrl || dashboardUrl,
+                        status: finalize?.status || "completed",
+                        processedCount: items.length,
+                        summary,
+                        results: items,
+                      };
+                    }
+                  input_transforms:
+                    apiUrl:
+                      type: javascript
+                      expr: results.ingest_vulnerabilities.apiUrl
+                    runId:
+                      type: javascript
+                      expr: results.plan_remediation_targets.runId
+                    dashboardUrl:
+                      type: javascript
+                      expr: results.plan_remediation_targets.dashboardUrl || ''
+                    loopResults:
+                      type: javascript
+                      expr: results.remediate_repos || []
+
+        default:
+          - id: summarize_and_finalize_phase1
+            summary: "3b. Analysis Summary & Finalize Phase 1"
+            value:
+              type: rawscript
+              language: bun
+              content: |
+                function buildHeaders(): Record<string, string> {
+                  const headers: Record<string, string> = {
+                    "content-type": "application/json",
+                  };
+                  const token = (process.env.TASKPILOT_API_TOKEN ?? "").trim();
+                  if (token) {
+                    headers["authorization"] = `Bearer ${token}`;
+                  }
+                  return headers;
+                }
+
+                export async function main(
+                  apiUrl: string,
+                  planResult: Record<string, any>,
+                ) {
+                  const runId = planResult.runId;
+                  const plans = (planResult.plans ?? []) as Record<string, any>[];
+                  const inputFindings = planResult.summary?.inputFindings ?? 0;
+                  const planCount = planResult.summary?.planCount ?? plans.length;
+
+                  const summary = [
+                    "Phase 1 Analysis Complete",
+                    `Run ID: ${runId}`,
+                    `Total Findings: ${inputFindings}`,
+                    `Target Repos: ${planCount}`,
+                    "",
+                    ...plans.map(
+                      (p) =>
+                        `- ${p.targetRepo} (${p.ownership}, ${p.packageCount} pkgs, ${p.cveCount} CVEs, max ${p.maxSeverity})`,
+                    ),
+                  ].join("\n");
+
+                  const res = await fetch(`${apiUrl}/api/remediation/finalize`, {
+                    method: "POST",
+                    headers: buildHeaders(),
+                    body: JSON.stringify({
+                      runId,
+                      message: "Phase 1 analysis complete",
+                    }),
+                    signal: AbortSignal.timeout(10_000),
+                  });
+                  const finalize = await res.json();
+
+                  return {
+                    runId,
+                    dashboardUrl:
+                      finalize?.dashboardUrl || planResult.dashboardUrl || "",
+                    status: finalize?.status || "completed",
+                    inputFindings,
+                    planCount,
+                    summary,
+                    plans,
+                  };
+                }
+              input_transforms:
+                apiUrl:
+                  type: javascript
+                  expr: results.ingest_vulnerabilities.apiUrl
+                planResult:
+                  type: javascript
+                  expr: results.plan_remediation_targets
+
+schema:
+  $schema: "https://json-schema.org/draft/2020-12/schema"
+  type: object
+  order:
+    - report_file
+    - source
+    - min_severity
+    - owned_scopes
+    - phase
+    - max_retries
+    - credit_budget
+    - verify_downstream
+    - taskpilot_api_url
+  properties:
+    report_file:
+      type: string
+      format: base64
+      description: "Upload a vulnerability export JSON file (e.g. Wiz GraphQL JSON)"
+    source:
+      type: string
+      default: "wiz-graphql"
+      enum:
+        - "wiz-graphql"
+      description: "Vulnerability report source adapter"
+    min_severity:
+      type: string
+      default: "HIGH"
+      enum:
+        - "HIGH"
+        - "CRITICAL"
+        - "MEDIUM"
+        - "LOW"
+      description: "Minimum vulnerability severity to include"
+    owned_scopes:
+      type: string
+      default: ""
+      description: "Comma-separated owned npm scopes (e.g. @your-org/); optional, defaults to config/ownership.json"
+    phase:
+      type: string
+      default: "Phase 3 - Full Remediation + Draft PR"
+      enum:
+        - "Phase 3 - Full Remediation + Draft PR"
+        - "Phase 2 - Copilot Remediation (Verify Only)"
+        - "Phase 1 - Analysis Only"
+      description: "Execution phase"
+    max_retries:
+      type: integer
+      default: 1
+      minimum: 1
+      maximum: 2
+      description: "Maximum Copilot remediation attempts per repository (capped at 2)"
+    credit_budget:
+      type: integer
+      default: 30
+      minimum: 1
+      description: "Copilot credit budget per repository"
+    verify_downstream:
+      type: boolean
+      default: false
+      description: "Whether to verify downstream consumer repositories after patching"
+    taskpilot_api_url:
+      type: string
+      default: ""
+      description: "Optional TaskPilot API base URL override (defaults to TASKPILOT_API_URL env var)"
+  required:
+    - report_file
+    - source
+    - min_severity

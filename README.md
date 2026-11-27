@@ -1,8 +1,8 @@
 # TaskPilot
 
-A TypeScript (Bun + Hono) **capability API server** designed to be orchestrated by **n8n** (compatible with both local n8n v2 and Docker n8n v3).
+A TypeScript (Bun + Hono) **capability API server** designed to be orchestrated by **n8n** (compatible with both local n8n v2 and Docker n8n v3) or **Windmill** (OpenFlow YAML + Bun workers).
 
-* **n8n** owns the **Workflow** (form upload, branching, approvals, notifications).
+* **n8n / Windmill** owns the **Workflow** (form upload, branching, retries, approvals, notifications).
 * **TaskPilot** runs natively on Windows (direct access to local `gh`, Copilot CLI, Git, and npm) and exposes **source-agnostic domain HTTP APIs**.
 
 ## Architecture
@@ -53,10 +53,19 @@ bun run dev
 bun run dev
 
 # Terminal 2 (in WSL): Start n8n in Docker via Docker Compose (defaults to http://localhost:3456)
-./scripts/start-n8n-docker.sh   # or: docker compose -f scripts/docker-compose.yml up -d
+./scripts/start-n8n-docker.sh   # or: docker compose -f scripts/docker-compose.n8n.yml up -d
+
+# Option C: Windows Bun + Docker Windmill
+# Terminal 1: Start TaskPilot HTTP API bound to all interfaces (reachable via host.docker.internal:3456)
+bun run dev:wsl
+
+# Terminal 2: Start Windmill (Postgres + Server + Worker) via Docker Compose
+.\scripts\start-windmill-docker.ps1   # or in WSL: ./scripts/start-windmill-docker.sh
+# or: docker compose -f scripts/docker-compose.windmill.yml up -d
 ```
 
-Import `n8n/wiz-remediation.workflow.json` into n8n (`http://localhost:5678`). It is a single-file, vertically layered 3-phase workflow (Row 1: Phase 1 upload/ingest/plan, Row 2: Phase 2 per-repo workspace + Copilot patch/verify retry loop, Row 3: Phase 3 Draft PR / report & final summary).
+* **n8n**: Import `workflows/n8n/wiz-remediation.workflow.json` into n8n (`http://localhost:5678`). It is a single-file, vertically layered 3-phase workflow (Row 1: Phase 1 upload/ingest/plan, Row 2: Phase 2 per-repo workspace + Copilot patch/verify retry loop, Row 3: Phase 3 Draft PR / report & final summary).
+* **Windmill**: Open `http://localhost:8000` (default login: `admin@windmill.dev` / `changeme`), then run `./workflows/windmill/sync.sh` (or `bun run windmill:sync`) to one-click sync `workflows/windmill/f/taskpilot/wiz_remediation.flow/flow.yaml` via Windmill REST API — or import the YAML in the Flow editor / run `cd workflows/windmill && wmill sync push`.
 
 ### Optional Security (Recommended when calling from Docker n8n v3)
 

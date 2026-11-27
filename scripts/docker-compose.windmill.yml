@@ -1,0 +1,62 @@
+services:
+  db:
+    image: ${WINDMILL_DB_IMAGE:-postgres:16-alpine}
+    container_name: ${WINDMILL_DB_CONTAINER_NAME:-taskpilot-windmill-db}
+    restart: unless-stopped
+    shm_size: 1g
+    volumes:
+      - taskpilot_windmill_db_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${WINDMILL_DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${WINDMILL_DB_PASSWORD:-changeme}
+      - POSTGRES_DB=${WINDMILL_DB_NAME:-windmill}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WINDMILL_DB_USER:-postgres} -d ${WINDMILL_DB_NAME:-windmill}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  windmill_server:
+    image: ${WINDMILL_IMAGE:-ghcr.io/windmill-labs/windmill:latest}
+    container_name: ${WINDMILL_SERVER_CONTAINER_NAME:-taskpilot-windmill-server}
+    restart: unless-stopped
+    ports:
+      - "${WINDMILL_PORT:-8000}:8000"
+    environment:
+      - DATABASE_URL=postgres://${WINDMILL_DB_USER:-postgres}:${WINDMILL_DB_PASSWORD:-changeme}@db:5432/${WINDMILL_DB_NAME:-windmill}?sslmode=disable
+      - MODE=server
+      - BASE_URL=${WINDMILL_BASE_URL:-http://localhost:8000}
+      - TASKPILOT_API_URL=${TASKPILOT_API_URL:-http://host.docker.internal:3456}
+      - TASKPILOT_API_TOKEN=${TASKPILOT_API_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - taskpilot_windmill_worker_logs:/tmp/windmill/logs
+
+  windmill_worker:
+    image: ${WINDMILL_IMAGE:-ghcr.io/windmill-labs/windmill:latest}
+    container_name: ${WINDMILL_WORKER_CONTAINER_NAME:-taskpilot-windmill-worker}
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgres://${WINDMILL_DB_USER:-postgres}:${WINDMILL_DB_PASSWORD:-changeme}@db:5432/${WINDMILL_DB_NAME:-windmill}?sslmode=disable
+      - MODE=worker
+      - WORKER_GROUP=default
+      - TASKPILOT_API_URL=${TASKPILOT_API_URL:-http://host.docker.internal:3456}
+      - TASKPILOT_API_TOKEN=${TASKPILOT_API_TOKEN:-}
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - taskpilot_windmill_worker_logs:/tmp/windmill/logs
+
+volumes:
+  taskpilot_windmill_db_data:
+    name: taskpilot_windmill_db_data
+  taskpilot_windmill_worker_logs:
+    name: taskpilot_windmill_worker_logs
