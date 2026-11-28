@@ -276,7 +276,6 @@ export function buildCopilotRemediationPrompt(
   }));
 
   const impactScope = options.impactScope ?? inferImpactScope(plan);
-  const allowUnrelated403 = Boolean(options.allowUnrelated403Overrides);
 
   lines.push("# Task Brief");
   lines.push("");
@@ -297,11 +296,15 @@ export function buildCopilotRemediationPrompt(
       ? "- **Install Mode**: `pre-installed` (`node_modules` is already present in this cached workspace; do NOT delete `node_modules`)."
       : "- **Install Mode**: `deferred` (dependencies were intentionally NOT installed before patching; do NOT run `npm install` before editing `package.json`).",
   );
-  lines.push(
-    allowUnrelated403
-      ? "- **Unrelated 403 Scope Expansion**: `allowed` (resolve HTTP 403 registry-blocked unrelated packages to their minimal compliant version in order: first try lockfile refresh `npm update <pkg> --package-lock-only` without editing `package.json`, then same-major parent upgrade, and only as last resort a major-version-scoped `overrides` entry like `\"parent@^X\": { \"pkg\": \"^Y.Z.W\" }`; controlled cross-major upgrade permitted only when no same-major compliant version exists, usage impact is minimal, and all verification checks pass; list every upgraded package under `### Additional Registry-Blocked Dependencies Upgraded`)."
-      : "- **Unrelated 403 Scope Expansion**: `forbidden` (default — if `npm install` fails with HTTP 403 on an unrelated package, stop and report `STATUS: REGISTRY_BLOCKED_UNRELATED` instead of expanding PR scope).",
-  );
+  if (options.allowUnrelated403Overrides === false) {
+    lines.push(
+      "- **Unrelated 403 Scope Expansion**: `forbidden` (if `npm install` fails with HTTP 403 on an unrelated package, stop and report `REGISTRY_BLOCKED_UNRELATED`).",
+    );
+  } else if (options.allowUnrelated403Overrides === true) {
+    lines.push(
+      "- **Unrelated 403 Scope Expansion**: `allowed` (follow the ownership-aware HTTP 403 guidance below).",
+    );
+  }
   if (options.detectedScripts && options.detectedScripts.length > 0) {
     lines.push(
       `- **Verification Scripts**: ${options.detectedScripts.map((s) => `\`npm run ${s}\``).join(", ")}`,

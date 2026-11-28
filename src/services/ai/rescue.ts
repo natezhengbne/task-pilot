@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { runCommand } from "../../shared/exec.ts";
+import { isRunCancelledError, runCommand } from "../../shared/exec.ts";
 import { saveRunArtifact } from "../../shared/runs.ts";
 import {
   classifyCopilotCliFailure,
@@ -421,6 +421,9 @@ export async function runGenericAiRescue(
   try {
     res = await exec(cmd, { cwd, timeoutMs });
   } catch (err) {
+    if (isRunCancelledError(err)) {
+      throw err;
+    }
     const durationMs = Math.round(performance.now() - start);
     const msg = err instanceof Error ? err.message : String(err);
     if (persist) {

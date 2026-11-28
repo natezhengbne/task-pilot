@@ -365,6 +365,7 @@ export class RunsStore {
   private readonly listeners = new Map<string, Set<RunSnapshotListener>>();
   private readonly allListeners = new Set<RunsListListener>();
   private readonly activeRunCounts = new Map<string, number>();
+  private readonly runControllers = new Map<string, Set<AbortController>>();
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     if (dbPath !== ":memory:") {
@@ -524,7 +525,110 @@ export class RunsStore {
     this.listeners.clear();
     this.allListeners.clear();
     this.activeRunCounts.clear();
+    for (const controllers of this.runControllers.values()) {
+      for (const ctrl of controllers) {
+        if (!ctrl.signal.aborted) {
+          ctrl.abort(new Error("RunsStore closed"));
+        }
+      }
+    }
+    this.runControllers.clear();
     this.db.close();
+  }
+
+  /**
+   * Returns true if the given run has already been marked `cancelled` in SQLite.
+   */
+  isRunCancelled(runId: string): boolean {
+    const row = this.db
+      .query("SELECT status FROM runs WHERE run_id = ?")
+      .get(runId) as { status: string } | null;
+    return row?.status === "cancelled";
+  }
+
+  /**
+   * Registers an AbortController for an in-flight request belonging to `runId`.
+   * The returned `signal` aborts when either:
+   * - `cancelRun(runId)` / `abortRunControllers(runId)` is called,
+   * - the run is already marked `cancelled` in SQLite, or
+   * - the optional upstream HTTP `requestSignal` aborts (e.g. Dagu / client disconnect).
+   */
+  createRunAbortSignal(
+    runId: string,
+    requestSignal?: AbortSignal,
+  ): { signal: AbortSignal; cleanup: () => void } {
+    const controller = new AbortController();
+    let set = this.runControllers.get(runId);
+    if (!set) {
+      set = new Set();
+      this.runControllers.set(runId, set);
+    }
+    set.add(controller);
+
+    const onRequestAbort = () => {
+      if (!controller.signal.aborted) {
+        if (process.env.NODE_ENV !== "test") {
+          process.stderr.write(
+            `[cancel] HTTP client disconnected for run ${runId}; aborting active tasks\n`,
+          );
+        }
+        controller.abort(
+          requestSignal?.reason ?? new Error("Client disconnected"),
+        );
+      }
+    };
+
+    if (this.isRunCancelled(runId)) {
+      controller.abort(new Error("Run already cancelled"));
+    } else if (requestSignal) {
+      if (requestSignal.aborted) {
+        onRequestAbort();
+      } else {
+        requestSignal.addEventListener("abort", onRequestAbort, { once: true });
+      }
+    }
+
+    let cleaned = false;
+    return {
+      signal: controller.signal,
+      cleanup: () => {
+        if (cleaned) return;
+        cleaned = true;
+        if (requestSignal) {
+          requestSignal.removeEventListener("abort", onRequestAbort);
+        }
+        const current = this.runControllers.get(runId);
+        if (current) {
+          current.delete(controller);
+          if (current.size === 0) {
+            this.runControllers.delete(runId);
+          }
+        }
+      },
+    };
+  }
+
+  /**
+   * Aborts all in-flight AbortControllers registered for `runId`.
+   * Returns the number of active controllers that were aborted.
+   */
+  abortRunControllers(runId: string, reason = "Run cancelled"): number {
+    const controllers = this.runControllers.get(runId);
+    if (!controllers || controllers.size === 0) return 0;
+    let abortedCount = 0;
+    const err = new Error(reason);
+    for (const ctrl of [...controllers]) {
+      if (!ctrl.signal.aborted) {
+        ctrl.abort(err);
+        abortedCount++;
+      }
+    }
+    if (abortedCount > 0 && process.env.NODE_ENV !== "test") {
+      process.stderr.write(
+        `[cancel] Aborted ${abortedCount} active task(s) for run ${runId} (${reason})\n`,
+      );
+    }
+    return abortedCount;
   }
 
   /**
@@ -1046,13 +1150,15 @@ export class RunsStore {
       status?: "cancelled" | "failed" | "partial_failed";
     } = {},
   ): boolean {
+    const reason = opts.reason?.trim() || "Run manually stopped";
+    const abortedCount = this.abortRunControllers(runId, reason);
+
     const existing = this.db
       .query("SELECT status FROM runs WHERE run_id = ?")
       .get(runId) as { status: string } | null;
-    if (!existing) return false;
-    if (existing.status !== "running") return false;
+    if (!existing) return abortedCount > 0;
+    if (existing.status !== "running") return abortedCount > 0;
 
-    const reason = opts.reason?.trim() || "Run manually stopped";
     this.finalizeRun(runId, {
       status: opts.status ?? "cancelled",
       error: reason,

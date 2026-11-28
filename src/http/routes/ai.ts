@@ -5,7 +5,7 @@ import {
   type RunGenericAiRescueInput,
 } from "../../services/ai/rescue.ts";
 import type { CommandRunner } from "../../services/remediation/workspace.ts";
-import { runCommand } from "../../shared/exec.ts";
+import { bindExecSignal, isRunCancelledError, runCommand } from "../../shared/exec.ts";
 import { resolveRunId } from "../../shared/runs.ts";
 
 export interface AiRouteDeps {
@@ -137,26 +137,54 @@ export function createAiRoute(deps: AiRouteDeps = {}): Hono {
       persist: typeof body.persist === "boolean" ? body.persist : true,
     };
 
-    const result = await runGenericAiRescue(input, exec);
+    const runAbort = runsStore?.createRunAbortSignal(runId, c.req.raw.signal);
+    const execWithSignal = runAbort ? bindExecSignal(exec, runAbort.signal) : exec;
+    const releaseActivity = runsStore?.trackRunActivity(runId);
 
-    const targetRepo =
-      typeof body.targetRepo === "string" && body.targetRepo.trim()
-        ? body.targetRepo.trim()
-        : null;
-    if (runsStore && targetRepo && result.creditsSpent > 0) {
-      const mappedStage: RunStage = VALID_RUN_STAGES.has(stage as RunStage)
-        ? (stage as RunStage)
-        : "patch";
-      runsStore.recordEvent(runId, {
-        targetRepo,
-        stage: mappedStage,
-        status: result.outcome === "RECOVERED" ? "succeeded" : "info",
-        durationMs: result.durationMs,
-        message: `[AI Rescue:${domain}/${stage}] ${result.outcome} (${result.creditsSpent} cr): ${result.summary}`,
-      });
+    try {
+      const result = await runGenericAiRescue(input, execWithSignal);
+
+      const targetRepo =
+        typeof body.targetRepo === "string" && body.targetRepo.trim()
+          ? body.targetRepo.trim()
+          : null;
+      if (runsStore && targetRepo && result.creditsSpent > 0) {
+        const mappedStage: RunStage = VALID_RUN_STAGES.has(stage as RunStage)
+          ? (stage as RunStage)
+          : "patch";
+        runsStore.recordEvent(runId, {
+          targetRepo,
+          stage: mappedStage,
+          status: result.outcome === "RECOVERED" ? "succeeded" : "info",
+          durationMs: result.durationMs,
+          message: `[AI Rescue:${domain}/${stage}] ${result.outcome} (${result.creditsSpent} cr): ${result.summary}`,
+        });
+      }
+
+      return c.json(result, result.budgetExceeded ? 429 : 200);
+    } catch (err) {
+      if (isRunCancelledError(err)) {
+        if (c.req.raw.signal.aborted && runsStore && !runsStore.isRunCancelled(runId)) {
+          runsStore.cancelRun(runId, {
+            reason: "Request aborted by client/orchestrator",
+          });
+        }
+        return c.json(
+          {
+            ok: false,
+            cancelled: true,
+            runId,
+            status: "cancelled",
+            error: err.message,
+          },
+          409,
+        );
+      }
+      throw err;
+    } finally {
+      runAbort?.cleanup();
+      releaseActivity?.();
     }
-
-    return c.json(result, result.budgetExceeded ? 429 : 200);
   });
 
   return route;

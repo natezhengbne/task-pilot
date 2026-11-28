@@ -5,6 +5,7 @@ import {
   type GitHubRepoClient,
 } from "../services/github/client.ts";
 import { createAiRoute } from "./routes/ai.ts";
+import { createCancelRoute } from "./routes/cancel.ts";
 import { createDashboardRoute } from "./routes/dashboard.ts";
 import { createGitHubRoute } from "./routes/github.ts";
 import { createPreflightRoute } from "./routes/preflight.ts";
@@ -12,6 +13,7 @@ import { createRemediationRoute } from "./routes/remediation.ts";
 import { createUploadsRoute } from "./routes/uploads.ts";
 import { createVulnerabilitiesRoute } from "./routes/vulnerabilities.ts";
 import type { CommandRunner } from "../services/remediation/workspace.ts";
+import { isRunCancelledError } from "../shared/exec.ts";
 
 export interface AppConfig {
   apiToken?: string;
@@ -190,6 +192,7 @@ export function createApp(config: AppConfig = {}): Hono {
   });
 
   app.route("/api/ai", createAiRoute({ exec: config.exec, runsStore }));
+  app.route("/api/cancel", createCancelRoute({ runsStore }));
   app.route("/api/github", createGitHubRoute());
   app.route("/api/preflight", createPreflightRoute({ exec: config.exec }));
   app.route(
@@ -213,6 +216,18 @@ export function createApp(config: AppConfig = {}): Hono {
   });
 
   app.onError((err, c) => {
+    if (isRunCancelledError(err)) {
+      return c.json(
+        {
+          ok: false,
+          cancelled: true,
+          code: err.code,
+          error: err.message,
+        },
+        409,
+      );
+    }
+
     if (err instanceof GitHubClientError) {
       return c.json(
         {

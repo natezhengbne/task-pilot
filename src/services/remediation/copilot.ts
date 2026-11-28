@@ -6,7 +6,7 @@ import {
   type ImpactScope,
   type StructuredRemediationOutput,
 } from "../../domain/remediation.ts";
-import { runCommand } from "../../shared/exec.ts";
+import { isRunCancelledError, runCommand } from "../../shared/exec.ts";
 import { saveRunArtifact } from "../../shared/runs.ts";
 import {
   getWorkspaceGitChanges,
@@ -420,9 +420,10 @@ export async function runCopilotRemediationPatch(
   } catch (err) {
     stdoutLogger?.flush();
     stderrLogger?.flush();
-    stdoutLogger?.flush();
-  stderrLogger?.flush();
-  const durationMs = Math.round(performance.now() - start);
+    if (isRunCancelledError(err)) {
+      throw err;
+    }
+    const durationMs = Math.round(performance.now() - start);
     const msg = err instanceof Error ? err.message : String(err);
     const error = `Failed to launch Copilot CLI '${binary}': ${msg}.`;
     const hint =

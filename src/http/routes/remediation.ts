@@ -32,7 +32,12 @@ import {
   type PrepareWorkspaceResult,
   type PrepareWorkspacesBatchInput,
 } from "../../services/remediation/workspace.ts";
-import { runCommand } from "../../shared/exec.ts";
+import {
+  bindExecSignal,
+  isRunCancelledError,
+  RunCancelledError,
+  runCommand,
+} from "../../shared/exec.ts";
 import {
   readRunArtifactJson,
   resolveRunId,
@@ -83,6 +88,31 @@ export function createRemediationRoute(
   const route = new Hono();
   const exec = deps.exec ?? runCommand;
   const runsStore = deps.runsStore;
+
+  const createAbortScope = (runId: string, requestSignal?: AbortSignal) => {
+    const scope = runsStore?.createRunAbortSignal(runId, requestSignal);
+    const signal = scope?.signal ?? requestSignal;
+    const scopedExec = signal ? bindExecSignal(exec, signal) : exec;
+    const throwIfCancelled = () => {
+      if (signal?.aborted || runsStore?.isRunCancelled(runId)) {
+        throw new RunCancelledError(signal?.reason ?? "Run was cancelled");
+      }
+    };
+    const markCancelledIfClientAborted = () => {
+      if (requestSignal?.aborted && runsStore && !runsStore.isRunCancelled(runId)) {
+        runsStore.cancelRun(runId, {
+          reason: "Request aborted by client/orchestrator",
+        });
+      }
+    };
+    return {
+      signal,
+      exec: scopedExec,
+      throwIfCancelled,
+      markCancelledIfClientAborted,
+      cleanup: () => scope?.cleanup(),
+    };
+  };
 
   /**
    * POST /api/remediation/workspace/prepare
@@ -135,6 +165,7 @@ export function createRemediationRoute(
 
     const startMs = performance.now();
     const releaseActivity = runsStore?.trackRunActivity(runId);
+    const abortScope = createAbortScope(runId, c.req.raw.signal);
     runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
       status: "preparing",
@@ -149,7 +180,9 @@ export function createRemediationRoute(
     });
 
     try {
-      const result = await prepareRemediationWorkspace(input, exec);
+      abortScope.throwIfCancelled();
+      const result = await prepareRemediationWorkspace(input, abortScope.exec);
+      abortScope.throwIfCancelled();
       runsStore?.updateRepo(runId, plan.targetRepo, {
         plan,
         status: "prepared",
@@ -175,6 +208,19 @@ export function createRemediationRoute(
         plan,
       });
     } catch (err) {
+      if (isRunCancelledError(err)) {
+        abortScope.markCancelledIfClientAborted();
+        return c.json(
+          {
+            ok: false,
+            cancelled: true,
+            runId,
+            status: "cancelled",
+            error: err.message,
+          },
+          409,
+        );
+      }
       const msg = err instanceof Error ? err.message : String(err);
       runsStore?.updateRepo(runId, plan.targetRepo, {
         plan,
@@ -192,6 +238,7 @@ export function createRemediationRoute(
       });
       throw err;
     } finally {
+      abortScope.cleanup();
       releaseActivity?.();
     }
   });
@@ -263,7 +310,9 @@ export function createRemediationRoute(
     };
 
     const releaseActivity = runsStore?.trackRunActivity(runId);
+    const abortScope = createAbortScope(runId, c.req.raw.signal);
     try {
+      abortScope.throwIfCancelled();
       if (runsStore && plans.length > 0) {
         for (const plan of plans) {
           runsStore.updateRepo(runId, plan.targetRepo, {
@@ -274,7 +323,7 @@ export function createRemediationRoute(
       }
 
       const repoStartTimes = new Map<string, number>();
-      const result = await prepareRemediationWorkspacesBatch(input, exec, {
+      const result = await prepareRemediationWorkspacesBatch(input, abortScope.exec, {
         onRepoStart: (plan, index, total) => {
           repoStartTimes.set(plan.targetRepo, performance.now());
           runsStore?.updateRepo(runId, plan.targetRepo, {
@@ -309,6 +358,9 @@ export function createRemediationRoute(
           });
         },
         onRepoError: (plan, err, index, total) => {
+          if (isRunCancelledError(err)) {
+            throw err;
+          }
           const started = repoStartTimes.get(plan.targetRepo);
           const durationMs = started ? Math.round(performance.now() - started) : null;
           const msg = err instanceof Error ? err.message : String(err);
@@ -327,6 +379,8 @@ export function createRemediationRoute(
           });
         },
       });
+
+      abortScope.throwIfCancelled();
 
       if (plans.length > 0 && result.workspaces.length === 0) {
         runsStore?.finalizeRun(runId, {
@@ -349,7 +403,23 @@ export function createRemediationRoute(
         targetRepos: result.workspaces.map((w) => w.targetRepo),
         ...result,
       });
+    } catch (err) {
+      if (isRunCancelledError(err)) {
+        abortScope.markCancelledIfClientAborted();
+        return c.json(
+          {
+            ok: false,
+            cancelled: true,
+            runId,
+            status: "cancelled",
+            error: err.message,
+          },
+          409,
+        );
+      }
+      throw err;
     } finally {
+      abortScope.cleanup();
       releaseActivity?.();
     }
   });
@@ -414,6 +484,7 @@ export function createRemediationRoute(
     const attempt = input.attempt ?? 1;
     const startMs = performance.now();
     const releaseActivity = runsStore?.trackRunActivity(runId);
+    const abortScope = createAbortScope(runId, c.req.raw.signal);
     runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
       status: "patching",
@@ -433,7 +504,9 @@ export function createRemediationRoute(
     });
 
     try {
-      const result = await runCopilotRemediationPatch(input, exec);
+      abortScope.throwIfCancelled();
+      const result = await runCopilotRemediationPatch(input, abortScope.exec);
+      abortScope.throwIfCancelled();
       const durationMs = Math.round(performance.now() - startMs);
       const httpStatus = getCopilotPatchHttpStatus(result);
       const isTerminalFailure = !result.ok && httpStatus >= 400;
@@ -463,6 +536,19 @@ export function createRemediationRoute(
 
       return c.json(result, httpStatus);
     } catch (err) {
+      if (isRunCancelledError(err)) {
+        abortScope.markCancelledIfClientAborted();
+        return c.json(
+          {
+            ok: false,
+            cancelled: true,
+            runId,
+            status: "cancelled",
+            error: err.message,
+          },
+          409,
+        );
+      }
       const msg = err instanceof Error ? err.message : String(err);
       runsStore?.updateRepo(runId, plan.targetRepo, {
         plan,
@@ -481,6 +567,7 @@ export function createRemediationRoute(
       });
       throw err;
     } finally {
+      abortScope.cleanup();
       releaseActivity?.();
     }
   });
@@ -539,6 +626,7 @@ export function createRemediationRoute(
 
     const startMs = performance.now();
     const releaseActivity = runsStore?.trackRunActivity(runId);
+    const abortScope = createAbortScope(runId, c.req.raw.signal);
     runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
       status: "verifying",
@@ -552,7 +640,9 @@ export function createRemediationRoute(
     });
 
     try {
-      const result = await verifyRemediationWorkspace(input, exec);
+      abortScope.throwIfCancelled();
+      const result = await verifyRemediationWorkspace(input, abortScope.exec);
+      abortScope.throwIfCancelled();
       const durationMs = Math.round(performance.now() - startMs);
       const isFallback = result.nextAction === "fallback_to_consumers";
       const fallbackTargets = (result.fallbackPlans ?? [])
@@ -588,6 +678,19 @@ export function createRemediationRoute(
         ...result,
       });
     } catch (err) {
+      if (isRunCancelledError(err)) {
+        abortScope.markCancelledIfClientAborted();
+        return c.json(
+          {
+            ok: false,
+            cancelled: true,
+            runId,
+            status: "cancelled",
+            error: err.message,
+          },
+          409,
+        );
+      }
       const msg = err instanceof Error ? err.message : String(err);
       runsStore?.updateRepo(runId, plan.targetRepo, {
         plan,
@@ -605,6 +708,7 @@ export function createRemediationRoute(
       });
       throw err;
     } finally {
+      abortScope.cleanup();
       releaseActivity?.();
     }
   });
@@ -691,6 +795,7 @@ export function createRemediationRoute(
 
     const startMs = performance.now();
     const releaseActivity = runsStore?.trackRunActivity(runId);
+    const abortScope = createAbortScope(runId, c.req.raw.signal);
     runsStore?.updateRepo(runId, plan.targetRepo, {
       plan,
       status: "creating_pr",
@@ -708,7 +813,9 @@ export function createRemediationRoute(
     });
 
     try {
-      const result = await createRemediationDraftPr(input, exec);
+      abortScope.throwIfCancelled();
+      const result = await createRemediationDraftPr(input, abortScope.exec);
+      abortScope.throwIfCancelled();
       const durationMs = Math.round(performance.now() - startMs);
       runsStore?.updateRepo(runId, plan.targetRepo, {
         plan,
@@ -734,6 +841,19 @@ export function createRemediationRoute(
       });
       return c.json(result);
     } catch (err) {
+      if (isRunCancelledError(err)) {
+        abortScope.markCancelledIfClientAborted();
+        return c.json(
+          {
+            ok: false,
+            cancelled: true,
+            runId,
+            status: "cancelled",
+            error: err.message,
+          },
+          409,
+        );
+      }
       const msg = err instanceof Error ? err.message : String(err);
       runsStore?.updateRepo(runId, plan.targetRepo, {
         plan,
@@ -751,6 +871,7 @@ export function createRemediationRoute(
       });
       throw err;
     } finally {
+      abortScope.cleanup();
       releaseActivity?.();
     }
   });
@@ -831,7 +952,7 @@ export function createRemediationRoute(
       typeof body.creditBudget === "number" && body.creditBudget > 0
         ? Math.floor(body.creditBudget)
         : 30;
-    const policy403: "forbidden" | "escalate_on_retry" | "allowed" =
+    const policy403: "auto" | "forbidden" | "escalate_on_retry" | "allowed" =
       body.unrelated403Policy === "allowed" ||
       body.unrelated403Policy === "forbidden" ||
       body.unrelated403Policy === "escalate_on_retry"
@@ -840,7 +961,7 @@ export function createRemediationRoute(
           ? "allowed"
           : body.allowUnrelated403Overrides === false
             ? "forbidden"
-            : "allowed";
+            : "auto";
     const enableAiRescue =
       typeof body.enableAiRescue === "boolean" ? body.enableAiRescue : true;
     const rescueCreditBudget =
@@ -851,6 +972,9 @@ export function createRemediationRoute(
     const persist = typeof body.persist === "boolean" ? body.persist : true;
     const workspacesRoot =
       typeof body.workspacesRoot === "string" ? body.workspacesRoot : undefined;
+
+    const releaseActivity = runsStore?.trackRunActivity(runId);
+    const abortScope = createAbortScope(runId, c.req.raw.signal);
 
     const executeSingleWorkspace = async (
       ws: StoredWorkspace,
@@ -864,7 +988,12 @@ export function createRemediationRoute(
       let attempt = 1;
       let creditsUsed = ws.rescueCreditsSpent ?? 0;
       let previousError: string | null = null;
-      let allowUnrelated403Overrides = policy403 === "allowed";
+      let allowUnrelated403Overrides: boolean | undefined =
+        policy403 === "allowed"
+          ? true
+          : policy403 === "forbidden" || policy403 === "escalate_on_retry"
+            ? false
+            : undefined;
       let verifyRescueUsed = false;
       const mergedExtraInstructions = [
         opts.extraInstructions?.trim(),
@@ -876,6 +1005,7 @@ export function createRemediationRoute(
         .join("\n\n");
 
       while (true) {
+        abortScope.throwIfCancelled();
         const patchStartMs = performance.now();
         runsStore?.updateRepo(runId, ws.plan.targetRepo, {
           plan: ws.plan,
@@ -910,8 +1040,9 @@ export function createRemediationRoute(
             extraInstructions: mergedExtraInstructions || undefined,
             persist,
           },
-          exec,
+          abortScope.exec,
         );
+        abortScope.throwIfCancelled();
         const patchDurationMs = Math.round(performance.now() - patchStartMs);
         runsStore?.updateRepo(runId, ws.plan.targetRepo, {
           plan: ws.plan,
@@ -935,6 +1066,7 @@ export function createRemediationRoute(
           },
         });
 
+        abortScope.throwIfCancelled();
         const verifyStartMs = performance.now();
         runsStore?.updateRepo(runId, ws.plan.targetRepo, {
           plan: ws.plan,
@@ -958,8 +1090,9 @@ export function createRemediationRoute(
             copilotStructuredOutput: patch.structuredOutput ?? undefined,
             persist,
           },
-          exec,
+          abortScope.exec,
         );
+        abortScope.throwIfCancelled();
         const verifyDurationMs = Math.round(performance.now() - verifyStartMs);
         const fallbackPlans = Array.isArray(verify.fallbackPlans)
           ? verify.fallbackPlans
@@ -986,6 +1119,7 @@ export function createRemediationRoute(
           currentCredits < creditBudget;
 
         if (canRunVerifyRescue) {
+          abortScope.throwIfCancelled();
           verifyRescueUsed = true;
           runsStore?.recordEvent(runId, {
             targetRepo: ws.plan.targetRepo,
@@ -1008,8 +1142,9 @@ export function createRemediationRoute(
               creditsUsed: currentCredits,
               persist,
             },
-            exec,
+            abortScope.exec,
           );
+          abortScope.throwIfCancelled();
           currentCredits = rescue.creditsUsed;
           creditsUsed = rescue.creditsUsed;
           runsStore?.updateRepo(runId, ws.plan.targetRepo, {
@@ -1028,6 +1163,7 @@ export function createRemediationRoute(
           });
 
           if (rescue.outcome === "RECOVERED") {
+            abortScope.throwIfCancelled();
             verify = await verifyRemediationWorkspace(
               {
                 runId,
@@ -1038,8 +1174,9 @@ export function createRemediationRoute(
                 copilotStructuredOutput: patch.structuredOutput ?? undefined,
                 persist,
               },
-              exec,
+              abortScope.exec,
             );
+            abortScope.throwIfCancelled();
           }
         }
 
@@ -1067,6 +1204,7 @@ export function createRemediationRoute(
         });
 
         if (verify.passed) {
+          abortScope.throwIfCancelled();
           const prStartMs = performance.now();
           runsStore?.updateRepo(runId, ws.plan.targetRepo, {
             plan: ws.plan,
@@ -1089,8 +1227,9 @@ export function createRemediationRoute(
               dryRun,
               persist,
             },
-            exec,
+            abortScope.exec,
           );
+          abortScope.throwIfCancelled();
           runsStore?.updateRepo(runId, ws.plan.targetRepo, {
             plan: ws.plan,
             status: "completed",
@@ -1115,6 +1254,7 @@ export function createRemediationRoute(
         }
 
         if (isFallback) {
+          abortScope.throwIfCancelled();
           const fallbackBatch = await prepareRemediationWorkspacesBatch(
             {
               runId,
@@ -1123,8 +1263,9 @@ export function createRemediationRoute(
               installDeps: false,
               workspacesRoot,
             },
-            exec,
+            abortScope.exec,
           );
+          abortScope.throwIfCancelled();
           const upstreamNote = `Upstream owned-library (${ws.targetRepo}) fallback (${verify.copilotStatus || "fallback_to_consumers"}): ${verify.fallbackReason || "Refresh consumer lockfile or apply consumer-scoped fix."}`;
           const upstreamContext: UpstreamTriageContext = {
             repository: ws.targetRepo,
@@ -1135,6 +1276,7 @@ export function createRemediationRoute(
 
           const consumerResults: Record<string, unknown>[] = [];
           for (const consumerWs of fallbackBatch.workspaces) {
+            abortScope.throwIfCancelled();
             const sub = await executeSingleWorkspace(consumerWs, {
               allowConsumerFallback: false,
               verifyDownstream: false,
@@ -1200,8 +1342,8 @@ export function createRemediationRoute(
       }
     };
 
-    const releaseActivity = runsStore?.trackRunActivity(runId);
     try {
+      abortScope.throwIfCancelled();
       const results = await executeSingleWorkspace(workspace, {
         allowConsumerFallback: true,
         verifyDownstream,
@@ -1221,7 +1363,25 @@ export function createRemediationRoute(
         },
         ok ? 200 : 422,
       );
+    } catch (err) {
+      if (isRunCancelledError(err)) {
+        abortScope.markCancelledIfClientAborted();
+        return c.json(
+          {
+            ok: false,
+            cancelled: true,
+            runId,
+            targetRepo: workspace.targetRepo,
+            status: "cancelled",
+            dashboardUrl: `/runs/${encodeURIComponent(runId)}`,
+            error: err.message,
+          },
+          409,
+        );
+      }
+      throw err;
     } finally {
+      abortScope.cleanup();
       releaseActivity?.();
     }
   });
@@ -1285,24 +1445,48 @@ export function createRemediationRoute(
       persist: typeof body.persist === "boolean" ? body.persist : true,
     };
 
-    const result = await runAiRescueHook(input, exec);
-    if (runsStore && result.creditsSpent > 0) {
-      runsStore.updateRepo(runId, plan.targetRepo, {
-        plan,
-        creditsUsed: result.creditsUsed,
-        creditBudget: result.totalCreditBudget,
-        currentStage: stage,
-      });
-      runsStore.recordEvent(runId, {
-        targetRepo: plan.targetRepo,
-        stage,
-        status: result.outcome === "RECOVERED" ? "succeeded" : "info",
-        durationMs: result.durationMs,
-        message: `[AI Rescue] ${stage} rescue ${result.outcome} (${result.creditsSpent} cr): ${result.summary}`,
-      });
-    }
+    const releaseActivity = runsStore?.trackRunActivity(runId);
+    const abortScope = createAbortScope(runId, c.req.raw.signal);
+    try {
+      abortScope.throwIfCancelled();
+      const result = await runAiRescueHook(input, abortScope.exec);
+      abortScope.throwIfCancelled();
+      if (runsStore && result.creditsSpent > 0) {
+        runsStore.updateRepo(runId, plan.targetRepo, {
+          plan,
+          creditsUsed: result.creditsUsed,
+          creditBudget: result.totalCreditBudget,
+          currentStage: stage,
+        });
+        runsStore.recordEvent(runId, {
+          targetRepo: plan.targetRepo,
+          stage,
+          status: result.outcome === "RECOVERED" ? "succeeded" : "info",
+          durationMs: result.durationMs,
+          message: `[AI Rescue] ${stage} rescue ${result.outcome} (${result.creditsSpent} cr): ${result.summary}`,
+        });
+      }
 
-    return c.json(result, result.budgetExceeded ? 429 : 200);
+      return c.json(result, result.budgetExceeded ? 429 : 200);
+    } catch (err) {
+      if (isRunCancelledError(err)) {
+        abortScope.markCancelledIfClientAborted();
+        return c.json(
+          {
+            ok: false,
+            cancelled: true,
+            runId,
+            status: "cancelled",
+            error: err.message,
+          },
+          409,
+        );
+      }
+      throw err;
+    } finally {
+      abortScope.cleanup();
+      releaseActivity?.();
+    }
   });
 
   /**

@@ -117,16 +117,15 @@ describe("domain/remediation", () => {
     expect(prompt).toContain("`npm run typecheck`");
     expect(prompt).toContain("**Impact Scope**: `PUBLISHED_RUNTIME`");
     expect(prompt).toContain("**Install Mode**: `deferred`");
-    expect(prompt).toContain("**Unrelated 403 Scope Expansion**: `forbidden`");
+    expect(prompt).not.toContain("**Unrelated 403 Scope Expansion**");
     expect(prompt).toContain("npm install --package-lock-only --no-audit --no-fund");
-    expect(prompt).toContain("minimal compliant version");
+    expect(prompt).toContain("minimal registry-compliant version");
+    expect(prompt).toContain("Introduced by an owned library");
     expect(prompt).toContain("scoped `overrides`");
     expect(prompt).toContain("Additional Registry-Blocked Dependencies Upgraded");
-    expect(prompt).toContain("npm view <parent> versions --json");
-    expect(prompt).toContain("evaluateOwnedLibraryPackageJsonChange");
-    expect(prompt).toContain("no phantom direct dependencies");
+    expect(prompt).toContain("Upgrade the upstream/direct parent dependency");
+    expect(prompt).toContain("Refresh the lockfile");
     expect(prompt).toContain("NO_UPSTREAM_FIX_AVAILABLE");
-    expect(prompt).toContain("range triage & parent-upgrade evidence");
     expect(prompt).toContain('"prReady": true');
   });
 
@@ -179,7 +178,7 @@ describe("domain/remediation", () => {
 
     expect(consumerPrompt).toContain("**Ownership Role**: `consumer-repo`");
     expect(consumerPrompt).toContain("**Impact Scope**: `UNKNOWN`");
-    expect(consumerPrompt).toContain("npm view <parent> versions --json");
+    expect(consumerPrompt).toContain("Upgrade the upstream/direct parent dependency");
     expect(consumerPrompt).toContain("RANGE_ALREADY_SATISFIED");
   });
 
