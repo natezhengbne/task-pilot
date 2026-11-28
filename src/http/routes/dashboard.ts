@@ -158,6 +158,31 @@ a:hover { text-decoration: underline; }
   background: var(--blue);
   box-shadow: 0 0 12px var(--blue);
 }
+.nav-tabs {
+  display: inline-flex;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 4px;
+}
+.nav-tab {
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  text-decoration: none;
+}
+.nav-tab:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+.nav-tab.active {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+}
 h1 {
   margin: 0;
   font-size: 20px;
@@ -1011,6 +1036,10 @@ function renderRunsListPage(runs: RunListItem[]): string {
           <span id="live-dot" class="live-dot"></span>
           <span id="live-label">Connecting</span>
         </div>
+        <nav class="nav-tabs" aria-label="Primary">
+          <a class="nav-tab active" href="/runs">Runs</a>
+          <a class="nav-tab" href="/uploads">Uploads</a>
+        </nav>
       </div>
     </div>
     <div id="runs-card" class="card table-wrap">

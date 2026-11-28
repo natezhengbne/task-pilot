@@ -9,6 +9,7 @@ import { createDashboardRoute } from "./routes/dashboard.ts";
 import { createGitHubRoute } from "./routes/github.ts";
 import { createPreflightRoute } from "./routes/preflight.ts";
 import { createRemediationRoute } from "./routes/remediation.ts";
+import { createUploadsRoute } from "./routes/uploads.ts";
 import { createVulnerabilitiesRoute } from "./routes/vulnerabilities.ts";
 import type { CommandRunner } from "../services/remediation/workspace.ts";
 
@@ -18,6 +19,7 @@ export interface AppConfig {
   exec?: CommandRunner;
   runsStore?: RunsStore;
   runsDbPath?: string;
+  uploadsDir?: string;
   /** Enables request/response logging to stderr (defaults to true outside tests). */
   enableLogging?: boolean;
   /**
@@ -122,11 +124,16 @@ export function createApp(config: AppConfig = {}): Hono {
 
       let reqSummary = "";
       if (method !== "GET" && method !== "HEAD") {
-        try {
-          const cloned = await c.req.raw.clone().text();
-          reqSummary = ` req=${summarizeBody(cloned)}`;
-        } catch {
-          // ignore body clone error
+        const reqContentType = c.req.header("content-type") ?? "";
+        if (reqContentType.includes("multipart/form-data")) {
+          reqSummary = " req=(multipart)";
+        } else {
+          try {
+            const cloned = await c.req.raw.clone().text();
+            reqSummary = ` req=${summarizeBody(cloned)}`;
+          } catch {
+            // ignore body clone error
+          }
         }
       }
 
@@ -168,6 +175,9 @@ export function createApp(config: AppConfig = {}): Hono {
   // Unauthenticated Run Status Dashboard (/runs, /runs/:runId, /runs/:runId/stream)
   app.route("/runs", createDashboardRoute({ runsStore }));
 
+  // Unauthenticated File Uploads UI & API (/uploads, /uploads/files)
+  app.route("/uploads", createUploadsRoute({ uploadsDir: config.uploadsDir }));
+
   // Optional Bearer token guard for /api/* when TASKPILOT_API_TOKEN is configured
   app.use("/api/*", async (c, next) => {
     if (apiToken) {
@@ -191,6 +201,7 @@ export function createApp(config: AppConfig = {}): Hono {
     createVulnerabilitiesRoute({
       createGitHubClient: config.createGitHubClient,
       runsStore,
+      uploadsDir: config.uploadsDir,
     }),
   );
 

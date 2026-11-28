@@ -6,7 +6,7 @@ description: >-
 params:
   - name: report_path
     type: string
-    description: Local path to the vulnerability export JSON file on the TaskPilot host (e.g. F:/path/to/wiz.json)
+    description: Filename uploaded to TaskPilot /uploads (stored in .runs/_uploads/, e.g. 202611.25.json)
   - name: source
     type: string
     default: wiz-graphql

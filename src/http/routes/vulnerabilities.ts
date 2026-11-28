@@ -28,6 +28,10 @@ import {
   resolveRunId,
   saveRunArtifact,
 } from "../../shared/runs.ts";
+import {
+  DEFAULT_UPLOADS_DIR,
+  resolveUploadPath,
+} from "../../shared/uploads.ts";
 
 interface IngestRequestBody {
   source?: string;
@@ -74,6 +78,7 @@ function normalizeStringList(value: string[] | string | undefined): string[] | u
 export interface VulnerabilitiesRouteDeps {
   createGitHubClient?: () => GitHubRepoClient;
   runsStore?: RunsStore;
+  uploadsDir?: string;
 }
 
 export function createVulnerabilitiesRoute(
@@ -83,6 +88,7 @@ export function createVulnerabilitiesRoute(
   const createGitHubClient =
     deps.createGitHubClient ?? (() => new GhCliRepoClient());
   const runsStore = deps.runsStore;
+  const uploadsDir = deps.uploadsDir ?? DEFAULT_UPLOADS_DIR;
 
   route.get("/sources", (c) => {
     return c.json({
@@ -134,10 +140,20 @@ export function createVulnerabilitiesRoute(
     if (hasEnvelope) {
       payload = body.payload;
     } else if (reportPath) {
-      const file = Bun.file(reportPath);
+      const resolved = resolveUploadPath(reportPath, uploadsDir);
+      if (!resolved) {
+        return c.json(
+          {
+            ok: false,
+            error: `Invalid reportPath "${reportPath}": must be a filename uploaded to /uploads.`,
+          },
+          400,
+        );
+      }
+      const file = Bun.file(resolved.fullPath);
       if (!(await file.exists())) {
         return c.json(
-          { ok: false, error: `Report file not found: ${reportPath}` },
+          { ok: false, error: `Uploaded file not found: ${resolved.name}` },
           400,
         );
       }
@@ -146,7 +162,7 @@ export function createVulnerabilitiesRoute(
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return c.json(
-          { ok: false, error: `Invalid JSON in report file "${reportPath}": ${msg}` },
+          { ok: false, error: `Invalid JSON in uploaded file "${resolved.name}": ${msg}` },
           400,
         );
       }
