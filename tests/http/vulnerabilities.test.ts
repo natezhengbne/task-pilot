@@ -276,5 +276,20 @@ describe("http/vulnerabilities", () => {
     const second = (await secondRes.json()) as { ok: boolean; runId: string };
     expect(second.ok).toBe(true);
     expect(second.runId).toBe("run-2");
+
+    const thirdRes = await app.request("/api/vulnerabilities/ingest", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        runIdPrefix: "dagu",
+        source: "wiz-graphql",
+        persist: false,
+        payload: sampleWizPayload,
+      }),
+    });
+    expect(thirdRes.status).toBe(200);
+    const third = (await thirdRes.json()) as { ok: boolean; runId: string };
+    expect(third.ok).toBe(true);
+    expect(third.runId).toBe("dagu-3");
   });
 });

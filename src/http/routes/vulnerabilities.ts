@@ -36,6 +36,7 @@ import {
 interface IngestRequestBody {
   source?: string;
   runId?: string;
+  runIdPrefix?: string;
   phase?: string;
   persist?: boolean;
   reportPath?: string;
@@ -51,6 +52,7 @@ interface IngestRequestBody {
 
 interface PlanRequestBody {
   runId?: string;
+  runIdPrefix?: string;
   persist?: boolean;
   useGitHub?: boolean;
   strictGitHub?: boolean;
@@ -169,7 +171,9 @@ export function createVulnerabilitiesRoute(
     } else {
       payload = parsedBody;
     }
-    const runId = resolveRunId(body.runId, runsStore);
+    const runIdPrefix =
+      typeof body.runIdPrefix === "string" ? body.runIdPrefix.trim() : undefined;
+    const runId = resolveRunId(body.runId, runsStore, runIdPrefix || undefined);
     const persist = body.persist ?? true;
 
     const defaultRules = await loadDefaultOwnershipRules();
@@ -245,7 +249,9 @@ export function createVulnerabilitiesRoute(
     }
 
     const body = parsedBody as Partial<PlanRequestBody>;
-    const runId = resolveRunId(body.runId, runsStore);
+    const runIdPrefix =
+      typeof body.runIdPrefix === "string" ? body.runIdPrefix.trim() : undefined;
+    const runId = resolveRunId(body.runId, runsStore, runIdPrefix || undefined);
     let findings = body.findings;
     if (findings === undefined && body.runId?.trim()) {
       const stored = await readRunArtifactJson<{

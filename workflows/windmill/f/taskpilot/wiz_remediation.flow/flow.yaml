@@ -74,6 +74,7 @@ value:
               method: "POST",
               headers: buildHeaders(),
               body: JSON.stringify({
+                runIdPrefix: "windmill",
                 source: source || "wiz-graphql",
                 phase: phase || "Phase 3 - Full Remediation + Draft PR",
                 policy,

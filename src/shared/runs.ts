@@ -26,7 +26,11 @@ export function resolveRunId(
   if (typeof explicitRunId === "string" && explicitRunId.trim()) {
     return explicitRunId.trim();
   }
-  return allocator ? allocator.allocateRunId(prefix) : createRunId(prefix);
+  const safePrefix =
+    typeof prefix === "string"
+      ? prefix.replace(/[^a-zA-Z0-9_-]/g, "").trim() || "run"
+      : "run";
+  return allocator ? allocator.allocateRunId(safePrefix) : createRunId(safePrefix);
 }
 
 export async function ensureRunDir(runId: string): Promise<string> {

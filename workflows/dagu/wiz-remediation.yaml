@@ -73,11 +73,13 @@ steps:
       method: POST
       url: "${API_URL}/api/vulnerabilities/ingest"
       timeout: 30
+      silent: true
       headers:
         Content-Type: application/json
         Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
       body: |
         {
+          "runIdPrefix": "dagu",
           "source": "${params.source}",
           "phase": "${params.phase}",
           "reportPath": "${params.report_path}",
@@ -95,6 +97,7 @@ steps:
       method: POST
       url: "${API_URL}/api/vulnerabilities/plan"
       timeout: 120
+      silent: true
       headers:
         Content-Type: application/json
         Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
@@ -133,6 +136,7 @@ steps:
       method: POST
       url: "${API_URL}/api/remediation/workspaces/prepare"
       timeout: 900
+      silent: true
       headers:
         Content-Type: application/json
         Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
@@ -177,6 +181,7 @@ steps:
       method: POST
       url: "${API_URL}/api/remediation/finalize"
       timeout: 15
+      silent: true
       headers:
         Content-Type: application/json
         Authorization: "Bearer ${TASKPILOT_API_TOKEN}"
