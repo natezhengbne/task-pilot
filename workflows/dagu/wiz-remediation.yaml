@@ -59,7 +59,7 @@ env:
   - API_URL: "${TASKPILOT_API_URL:-http://127.0.0.1:3456}"
 
 handler_on:
-  cancel:
+  abort:
     action: http.request
     with:
       method: POST
@@ -231,7 +231,7 @@ env:
   - API_URL: "${TASKPILOT_API_URL:-http://127.0.0.1:3456}"
 
 handler_on:
-  cancel:
+  abort:
     action: http.request
     with:
       method: POST
